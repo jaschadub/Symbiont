@@ -1,0 +1,94 @@
+name: Test
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo test --workspace
+      - name: Lint Cedar policies
+        run: |
+          files=$(git ls-files '*.cedar' 2>/dev/null || true)
+          if [ -n "$files" ]; then
+            python3 scripts/lint-cedar-policies.py $files
+          else
+            echo "No .cedar files tracked — skipping lint."
+          fi
+      # Feature combination tests — verify minimal and no-default builds compile
+      - name: Test minimal build (no default features)
+        run: cargo check -p symbi-runtime --no-default-features
+      - name: Test without vector backends
+        run: cargo test -p symbi-runtime --no-default-features --features keychain
+      - name: Test with all features
+        run: cargo check -p symbi-runtime --all-features
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
+      # Pin nightly to avoid str::as_str() breakage in shellexpand 3.1.1
+      # (rust-lang/rust#152961). Unpin once revert #152963 lands in nightly.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-02-21
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Fuzz (short CI run)
+        run: |
+          cd tools/fuzz
+          for target in \
+            policy_parser \
+            fail_closed_tool_invocation \
+            tofu_key_substitution \
+            slack_signature_verification \
+            enforcement_policy_matrix \
+            dsl_lexer_parser \
+            schema_verification_garbage \
+            sensitive_arg_masking \
+            tool_substitution_detection \
+            dsl_structure_aware \
+            sse_jsonrpc_parsing \
+            schemapin_keystore_roundtrip \
+            dsl_evaluator \
+            mattermost_signature_verification \
+            crypto_roundtrip \
+            webhook_verify_generic \
+            api_key_store \
+            policy_evaluation \
+            comm_policy_evaluate \
+            messaging_request_json \
+            remote_envelope \
+            secure_message_pipeline; do
+            echo "--- Fuzzing $target (15s) ---"
+            cargo fuzz run --fuzz-dir . "$target" -- -max_total_time=15 || exit 1
+          done

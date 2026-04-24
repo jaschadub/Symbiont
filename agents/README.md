@@ -1,6 +1,6 @@
 # Symbiont Example Agents
 
-This directory contains eight reusable agent examples that demonstrate core Symbiont capabilities and common use cases. These agents serve as both learning resources and production-ready templates for building your own intelligent automation workflows.
+This directory contains ten reusable agent examples that demonstrate core Symbiont capabilities and common use cases. These agents serve as both learning resources and production-ready templates for building your own intelligent automation workflows.
 
 ## 📋 Overview
 
@@ -11,9 +11,31 @@ This directory contains eight reusable agent examples that demonstrate core Symb
 | [Format Converter](#format-converter) | File format transformation | Multi-format support, error handling, metadata preservation |
 | [API Aggregator](#api-aggregator) | External service integration | Multi-source data collection, response normalization |
 | [Security Scanner](#security-scanner) | Security assessment | Vulnerability detection, compliance checking, risk scoring |
-| [Webhook Handler](#webhook-handler) | HTTP webhook processing | Event filtering, security alerts, topic publishing |
+| [Webhook Handler](#webhook-handler) | HTTP webhook processing | Webhook block, provider presets, event filtering |
 | [Workflow Orchestrator](#workflow-orchestrator) | Process automation | Multi-step workflows, dependency management, error recovery |
 | [Notification Router](#notification-router) | Event-driven messaging | Multi-channel notifications, routing rules, rate limiting |
+| [Knowledge Curator](#knowledge-curator) | Persistent knowledge base | Memory block, hybrid search, fact extraction |
+| [Incident Tracker](#incident-tracker) | DevOps incident response | Webhook + memory blocks, deduplication, alert routing |
+| [Threat Hunter](#threat-hunter) | Sandbox & policy validation | Simulates AgentNull/VectorSmuggle attacks to prove defenses work |
+| [SchemaPin Researcher](#schemapin-researcher) | Supply-chain secure research | Only executes cryptographically verified tools and sources |
+| [HITL DevOps](#hitl-devops) | Human-in-the-loop infra | Read-only with cryptographic approval for privilege escalation |
+| [Code Review Pipeline](#code-review-pipeline) | Multi-agent trust boundary | Untrusted developer + AgentPin-authenticated reviewer |
+
+### v1.8.0 Governance Examples
+
+Four new agents demonstrate Symbiont's governance capabilities:
+
+- **Threat Hunter** — Intentionally attempts unauthorized actions (policy self-modification, sandbox downgrade, data exfiltration) to validate that Cedar policies and sandbox isolation block them. Run it to audit your security posture.
+- **SchemaPin Researcher** — Only executes tools with valid cryptographic signatures. Demonstrates supply-chain security where unsigned or tampered MCP tools are rejected before execution.
+- **HITL DevOps** — Read-only infrastructure agent that gathers diagnostics freely but requires a cryptographically signed human approval token before restarting services or deploying. Approval tokens expire after 5 minutes and are single-use.
+- **Code Review Pipeline** — Two-agent setup: an untrusted developer in a Tier2 (gVisor) sandbox performs static analysis, then passes findings to an AgentPin-authenticated reviewer who can run tests and sign approved code. The CommunicationPolicyGate prevents the untrusted agent from bypassing the reviewer.
+
+### v1.4.0 DSL Features
+
+Two new top-level blocks were added in v1.4.0:
+
+- **`memory` block** — Persistent markdown-backed storage with hybrid search (vector + keyword). See [Knowledge Curator](#knowledge-curator) and [Incident Tracker](#incident-tracker).
+- **`webhook` block** — First-class webhook ingestion with provider presets (GitHub, Stripe, Slack, Custom) and JSON path filtering. See [Webhook Handler](#webhook-handler) and [Incident Tracker](#incident-tracker).
 
 ## 🚀 Quick Start
 
@@ -382,11 +404,29 @@ echo '{
 
 ## 🪝 Webhook Handler
 
-**Purpose**: Process incoming HTTP webhooks with intelligent filtering and event routing.
+**Purpose**: Process incoming HTTP webhooks with intelligent filtering and event routing. Updated in v1.4.0 with a first-class `webhook` block.
+
+### v1.4.0 Features Demonstrated
+
+- **`webhook` block** — Top-level `webhook slack_alerts` with Slack provider preset and JSON path event filter
+
+```
+webhook slack_alerts {
+    path     "/hooks/slack"
+    provider slack
+    secret   "vault://webhooks/slack/secret"
+    agent    webhook_handler
+    filter {
+        json_path "$.type"
+        equals    "security_alert"
+    }
+}
+```
 
 ### Features
-- HTTP webhook ingestion
-- Event type filtering
+- First-class webhook block with provider presets
+- HMAC-SHA256 signature verification
+- Event type filtering via JSON path
 - Security alert processing
 - Topic-based publishing
 - Source validation
@@ -617,6 +657,137 @@ echo '{
 
 ---
 
+## 🧠 Knowledge Curator
+
+**Purpose**: Persistent knowledge base agent with hybrid search powered by the v1.4.0 `memory` block.
+
+### v1.4.0 Features Demonstrated
+
+- **`memory` block** — Top-level `memory knowledge_store` with markdown store, 365-day retention, and hybrid search weights
+- **Hybrid search** — Configurable vector (0.6) and keyword (0.4) weighting for retrieval
+- **Intent classification** — Routes queries to store, search, or summarize paths
+
+### DSL Highlights
+
+```
+memory knowledge_store {
+    store     markdown
+    path      "data/knowledge"
+    retention 365d
+    search {
+        vector_weight  0.6
+        keyword_weight 0.4
+    }
+}
+```
+
+### Usage Example
+
+```bash
+# Store a document
+echo '{
+  "query": "Store this architecture decision",
+  "context": {
+    "document": "We chose PostgreSQL for the primary datastore...",
+    "source": "adr-001",
+    "user": {"name": "alice", "role": "editor"}
+  }
+}' | cargo run --example basic_agent -- --agent agents/knowledge_curator.dsl
+
+# Search the knowledge base
+echo '{
+  "query": "What database did we choose?",
+  "context": {"user": {"name": "bob", "role": "viewer"}}
+}' | cargo run --example basic_agent -- --agent agents/knowledge_curator.dsl
+```
+
+### Use Cases
+- Architecture decision records
+- Onboarding knowledge bases
+- Research paper indexing
+- Team runbook management
+
+---
+
+## 🚨 Incident Tracker
+
+**Purpose**: DevOps incident tracking combining webhook ingestion with persistent memory for history, deduplication, and resolution hints. Demonstrates both v1.4.0 features together.
+
+### v1.4.0 Features Demonstrated
+
+- **`memory` block** — Persistent incident history with 2-year retention and balanced hybrid search
+- **`webhook` block** — Multiple webhook endpoints (GitHub, Stripe) with provider presets and JSON path filters
+- **Deduplication** — Searches memory for existing incidents before creating new ones
+- **Resolution hints** — Retrieves similar past incidents to suggest fixes
+
+### DSL Highlights
+
+```
+memory incident_history {
+    store     markdown
+    path      "data/incidents"
+    retention 730d
+    search {
+        vector_weight  0.5
+        keyword_weight 0.5
+    }
+}
+
+webhook github_incidents {
+    path     "/hooks/github"
+    provider github
+    secret   "vault://webhooks/github/secret"
+    agent    incident_tracker
+    filter {
+        json_path "$.action"
+        equals    "created"
+    }
+}
+
+webhook stripe_failures {
+    path     "/hooks/stripe"
+    provider stripe
+    secret   "vault://webhooks/stripe/secret"
+    agent    incident_tracker
+    filter {
+        json_path "$.type"
+        contains  "failed"
+    }
+}
+```
+
+### Usage Example
+
+```bash
+# Process a GitHub security advisory
+echo '{
+  "source": "github",
+  "action": "created",
+  "verified": true,
+  "summary": "Critical dependency vulnerability in lodash",
+  "severity": "critical"
+}' | cargo run --example basic_agent -- --agent agents/incident_tracker.dsl
+```
+
+### Expected Output
+```json
+{
+  "status": "created",
+  "incident_id": "inc_20260215_001",
+  "severity": "critical",
+  "similar_past_incidents": 2,
+  "resolution_hints": ["Upgrade lodash to 4.17.21", "Run npm audit fix"]
+}
+```
+
+### Use Cases
+- Security advisory tracking
+- Payment failure monitoring
+- Deployment failure correlation
+- On-call incident management
+
+---
+
 ## 🛠️ Configuration
 
 ### Global Configuration
@@ -715,4 +886,4 @@ Use these examples as templates:
 
 ## 📄 License
 
-These example agents are provided under the MIT License. See [LICENSE](../LICENSE) for details.
+These example agents are provided under the Apache License 2.0. See [LICENSE](../LICENSE) for details.

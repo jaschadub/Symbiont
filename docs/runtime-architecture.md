@@ -1,28 +1,8 @@
----
-layout: default
-title: Runtime Architecture
-nav_order: 4
-description: "Symbiont runtime system architecture and components"
----
-
 # Runtime Architecture
-{: .no_toc }
-
-## 🌐 Other Languages
-{: .no_toc}
-
-**English** | [中文简体](runtime-architecture.zh-cn.md) | [Español](runtime-architecture.es.md) | [Português](runtime-architecture.pt.md) | [日本語](runtime-architecture.ja.md) | [Deutsch](runtime-architecture.de.md)
-
----
 
 Understanding the Symbi runtime system architecture and core components.
-{: .fs-6 .fw-300 }
 
-## Table of contents
-{: .no_toc .text-delta }
 
-1. TOC
-{:toc}
 
 ---
 
@@ -51,38 +31,53 @@ graph TB
         ACB[Agent Communication Bus]
         AEH[Agent Error Handler]
     end
-    
-    subgraph "Context & Knowledge"
+
+    subgraph "Reasoning Loop"
+        RL[ReasoningLoopRunner]
+        IP[Inference Provider]
+        PG[Policy Gate]
+        AE[Action Executor]
+        KBR[Knowledge Bridge]
+    end
+
+    subgraph "Context and Knowledge"
         ACM[Agent Context Manager]
         VDB[Vector Database]
         RAG[RAG Engine]
         KB[Knowledge Base]
     end
-    
-    subgraph "Security & Policy"
+
+    subgraph "Security and Policy"
         PE[Policy Engine]
         AT[Audit Trail]
         SO[Sandbox Orchestrator]
         CRYPTO[Crypto Operations]
     end
-    
+
     subgraph "External Integration"
         MCP[MCP Client]
         TV[Tool Verification]
         API[HTTP API]
     end
-    
+
     subgraph "Sandbox Tiers"
         T1[Tier 1: Docker]
         T2[Tier 2: gVisor]
     end
-    
+
     ARS --> ACM
     ARS --> PE
+    ARS --> RL
     ALC --> SO
     ACB --> CRYPTO
     ACM --> VDB
     ACM --> RAG
+    RL --> IP
+    RL --> PG
+    RL --> AE
+    KBR --> ACM
+    KBR --> RL
+    PG --> PE
     SO --> T1
     SO --> T2
     MCP --> TV
@@ -95,19 +90,44 @@ graph TB
 
 ### Agent Runtime Scheduler
 
-The central orchestrator responsible for managing agent execution.
+The central orchestrator responsible for managing agent execution with real task execution and graceful shutdown capabilities.
 
 **Key Responsibilities:**
 - **Task Scheduling**: Priority-based scheduling with resource awareness
+- **Real Task Execution**: Actual process spawning and monitoring with comprehensive metrics
 - **Load Balancing**: Distribution across available resources
 - **Resource Allocation**: Memory, CPU, and I/O assignment
 - **Policy Coordination**: Integration with policy enforcement
+- **Graceful Shutdown**: Coordinated shutdown with resource cleanup
+
+**Execution Modes:**
+- **Ephemeral**: Run-once tasks that terminate after completion
+- **Persistent**: Long-running agents with continuous monitoring
+- **Scheduled**: Interval-based execution with automatic rescheduling
+- **Event-Driven**: Triggered execution based on system events
 
 **Performance Characteristics:**
-- Support for 10,000+ concurrent agents
+- Support for 10,000+ logical agents in memory (concurrent sandbox executions depend on host resources and sandbox tier — Docker containers require more resources than in-process agents)
 - Sub-millisecond scheduling decisions
 - Priority-based preemption
 - Resource-aware placement
+- Real-time process monitoring and health checks
+- Graceful shutdown with 30-second timeout before force termination
+
+**Real Task Execution Features:**
+- Process spawning with secure execution environments
+- Resource monitoring (memory, CPU usage) every 5 seconds
+- Task timeout enforcement with configurable limits
+- Comprehensive execution metrics and statistics
+- Process health monitoring and automatic failure detection
+
+**Graceful Shutdown Process:**
+1. **Stop New Tasks**: Prevent new agent scheduling
+2. **Graceful Termination**: Attempt graceful shutdown of running agents (30s timeout)
+3. **Force Termination**: Force-kill remaining processes if needed
+4. **Metrics Flush**: Save performance and usage statistics
+5. **Resource Cleanup**: Release allocated resources and cleanup state
+6. **Queue Cleanup**: Clear pending agent queue
 
 ```rust
 pub struct AgentScheduler {
@@ -115,11 +135,14 @@ pub struct AgentScheduler {
     resource_pool: ResourcePool,
     policy_engine: Arc<PolicyEngine>,
     load_balancer: LoadBalancer,
+    task_manager: Arc<TaskManager>,
 }
 
 impl AgentScheduler {
     pub async fn schedule_agent(&self, config: AgentConfig) -> Result<AgentId>;
+    pub async fn shutdown_agent(&self, agent_id: AgentId) -> Result<()>;
     pub async fn get_system_status(&self) -> SystemStatus;
+    pub async fn shutdown(&self) -> Result<()>;
 }
 ```
 
@@ -197,27 +220,6 @@ The runtime implements two security tiers based on operation risk:
 
 > **Note**: Additional isolation tiers are available in Enterprise editions for maximum security requirements.
 
-### Risk Assessment
-
-The system automatically determines the appropriate security tier:
-
-```rust
-pub fn assess_security_tier(agent_config: &AgentConfig) -> SecurityTier {
-    let risk_factors = RiskAssessment {
-        data_sensitivity: assess_data_sensitivity(&agent_config.inputs),
-        code_trust_level: assess_code_trust(&agent_config.source),
-        network_access: agent_config.requires_network,
-        file_system_access: agent_config.requires_filesystem,
-        external_integrations: !agent_config.external_apis.is_empty(),
-    };
-    
-    match calculate_risk_score(risk_factors) {
-        score if score < 0.5 => SecurityTier::Tier1,
-        _ => SecurityTier::Tier2,
-    }
-}
-```
-
 ---
 
 ## Communication System
@@ -267,25 +269,85 @@ pub struct SecureMessage {
 }
 ```
 
+### Communication Policy Gate
+
+The `CommunicationPolicyGate` sits between the DSL builtins and the CommunicationBus. All five inter-agent builtins (`ask`, `delegate`, `send_to`, `parallel`, `race`) are routed through it:
+
+1. **Policy evaluation** — Cedar-style rules checked before any message is sent
+2. **Message creation** — `SecureMessage` with Ed25519 signature and AES-256-GCM encryption
+3. **Delivery tracking** — message status and audit trail via the CommunicationBus
+4. **Response logging** — request/response pairs tracked with `RequestId` correlation
+
+When the policy gate is not configured (e.g., standalone REPL), builtins behave identically to their original implementation — no policy check, no message tracking. This preserves backward compatibility.
+
+The `ReasoningBuiltinContext` carries three optional fields:
+- `sender_agent_id` — identity of the calling agent
+- `comm_bus` — reference to the CommunicationBus for message routing
+- `comm_policy` — reference to the CommunicationPolicyGate for authorization
+
 ---
 
 ## Context & Knowledge Systems
 
 ### Agent Context Manager
 
-Provides persistent memory and knowledge management for agents.
+Provides sophisticated persistent memory and knowledge management for agents with comprehensive search capabilities and access control.
 
 **Context Types:**
 - **Short-term Memory**: Recent interactions and immediate context
-- **Long-term Memory**: Persistent knowledge and learned patterns  
+- **Long-term Memory**: Persistent knowledge and learned patterns
 - **Working Memory**: Active processing and temporary state
-- **Shared Knowledge**: Cross-agent knowledge sharing
+- **Episodic Memory**: Structured experiences with events and outcomes
+- **Semantic Memory**: Concepts, relationships, and structured knowledge
+- **Shared Knowledge**: Cross-agent knowledge sharing with access control
+
+**Advanced Search Modes:**
+- **Keyword Search**: Text-based search with relevance scoring
+- **Temporal Search**: Time-range based queries with recency factors
+- **Similarity Search**: Vector-based semantic similarity using embeddings
+- **Hybrid Search**: Combined keyword and similarity search with weighted scoring
+
+**Access Control & Policy Integration:**
+- **Policy Engine Integration**: Connected to resource access policies
+- **Agent-Scoped Access**: Isolated contexts per agent with secure boundaries
+- **Knowledge Sharing Controls**: Granular permissions for cross-agent knowledge access
+- **Access Level Management**: Public, Restricted, Confidential, and Secret classifications
+
+**Importance Calculation Algorithm:**
+- **Multi-Factor Scoring**: Base importance, access frequency, recency, and user feedback
+- **Memory Type Weighting**: Different importance multipliers per memory type
+- **Age Decay**: Exponential decay with configurable half-life per memory type
+- **Access Pattern Analysis**: Logarithmic scaling for frequently accessed items
+
+**Context Archiving & Retention:**
+- **Automatic Archiving**: Policy-driven archiving of old memory items
+- **Retention Policies**: Configurable retention periods per data type
+- **Compressed Storage**: Gzip compression for archived data
+- **Incremental Cleanup**: Background cleanup with retention statistics
+
+**Context Statistics & Monitoring:**
+- **Memory Usage Tracking**: Accurate byte-level memory calculations
+- **Retention Analytics**: Items eligible for archiving and deletion
+- **Performance Metrics**: Context retrieval latency and throughput
+- **Health Monitoring**: Context manager health checks and status
+
+**Knowledge Search Fallback:**
+- **Primary Vector Search**: Semantic search via vector database when available
+- **Fallback Keyword Search**: Text-based search when vector DB unavailable
+- **Relevance Scoring**: Sophisticated scoring combining multiple factors
+- **Trust Score Calculation**: Trust metrics for shared knowledge items
 
 ```rust
 pub trait ContextManager {
     async fn store_context(&self, agent_id: AgentId, context: AgentContext) -> Result<ContextId>;
-    async fn retrieve_context(&self, agent_id: AgentId, query: ContextQuery) -> Result<Vec<ContextItem>>;
-    async fn search_knowledge(&self, agent_id: AgentId, query: &str) -> Result<Vec<KnowledgeItem>>;
+    async fn retrieve_context(&self, agent_id: AgentId, session_id: Option<SessionId>) -> Result<Option<AgentContext>>;
+    async fn query_context(&self, agent_id: AgentId, query: ContextQuery) -> Result<Vec<ContextItem>>;
+    async fn update_memory(&self, agent_id: AgentId, updates: Vec<MemoryUpdate>) -> Result<()>;
+    async fn search_knowledge(&self, agent_id: AgentId, query: &str, limit: usize) -> Result<Vec<KnowledgeItem>>;
+    async fn share_knowledge(&self, from_agent: AgentId, to_agent: AgentId, knowledge_id: KnowledgeId, access_level: AccessLevel) -> Result<()>;
+    async fn archive_context(&self, agent_id: AgentId, before: SystemTime) -> Result<u32>;
+    async fn get_context_stats(&self, agent_id: AgentId) -> Result<ContextStats>;
+    async fn shutdown(&self) -> Result<()>;
 }
 ```
 
@@ -311,16 +373,126 @@ pub trait ContextManager {
 - **Batch Operations**: Efficient bulk operations
 - **Real-time Updates**: Dynamic knowledge base updates
 
-**Integration with Qdrant:**
+**Vector Database Abstraction:**
+
+Symbi uses a pluggable vector database backend. **LanceDB** is the zero-config default (embedded, no external service required). **Qdrant** is available as an optional backend behind the `vector-qdrant` feature flag.
+
+| Backend | Feature Flag | Config Required | Use Case |
+|---------|-------------|-----------------|----------|
+| LanceDB (default) | _built-in_ | None (zero-config) | Development, single-node, embedded deployments |
+| Qdrant | `vector-qdrant` | `SYMBIONT_VECTOR_HOST` | Distributed production clusters |
+
 ```rust
 pub struct VectorConfig {
-    pub dimension: usize,           // 1536 for OpenAI embeddings
+    pub backend: VectorBackend,       // LanceDB (default) or Qdrant
+    pub dimension: usize,             // 1536 for OpenAI embeddings
     pub distance_metric: DistanceMetric::Cosine,
     pub index_type: IndexType::HNSW,
-    pub ef_construct: 200,
-    pub m: 16,
+    pub data_path: PathBuf,           // LanceDB storage path
 }
 ```
+
+---
+
+## Agentic Reasoning Loop
+
+The reasoning loop implements an **Observe-Reason-Gate-Act (ORGA)** cycle that drives autonomous agent behavior. It unifies LLM inference, policy enforcement, tool execution, and knowledge management into a single, type-safe loop.
+
+For a complete guide, see the [Reasoning Loop Guide](reasoning-loop.md).
+
+### Architecture Overview
+
+```mermaid
+graph LR
+    subgraph "ORGA Cycle"
+        R[Reasoning\nLLM Inference] --> P[Policy Check\nGate Evaluation]
+        P --> D[Tool Dispatching\nAction Execution]
+        D --> O[Observing\nResult Collection]
+        O --> R
+    end
+
+    subgraph "Knowledge Bridge"
+        KB[Knowledge\nContext Manager]
+        KT[recall_knowledge\nstore_knowledge]
+    end
+
+    subgraph "Infrastructure"
+        CB[Circuit Breakers]
+        J[Durable Journal]
+        M[Metrics and Tracing]
+    end
+
+    KB -->|inject context| R
+    KT -->|tool calls| D
+    CB --> D
+    J --> R
+    J --> P
+    J --> D
+    M --> R
+```
+
+### Typestate-Enforced Phase Transitions
+
+Phase transitions are enforced at compile time using zero-sized type markers. Invalid transitions (e.g., dispatching tools without reasoning first) are structurally impossible:
+
+```
+AgentLoop<Reasoning> → AgentLoop<PolicyCheck> → AgentLoop<ToolDispatching> → AgentLoop<Observing>
+         ↑                                                                          │
+         └──────────────────────── LoopContinuation::Continue ──────────────────────┘
+```
+
+Each phase consumes `self` and produces the next phase, making skipping phases a compile error.
+
+### ReasoningLoopRunner
+
+The main entry point wires together all components:
+
+```rust
+pub struct ReasoningLoopRunner {
+    pub provider: Arc<dyn InferenceProvider>,      // Cloud or SLM inference
+    pub policy_gate: Arc<dyn ReasoningPolicyGate>, // Action evaluation
+    pub executor: Arc<dyn ActionExecutor>,          // Tool dispatch
+    pub context_manager: Arc<dyn ContextManager>,   // Token budget
+    pub circuit_breakers: Arc<CircuitBreakerRegistry>,
+    pub journal: Arc<dyn JournalWriter>,            // Durable event log
+    pub knowledge_bridge: Option<Arc<KnowledgeBridge>>, // Optional knowledge integration
+}
+```
+
+### Knowledge-Reasoning Bridge
+
+When a `KnowledgeBridge` is provided, the reasoning loop gains access to the agent's knowledge store:
+
+- **Before each reasoning step**: Relevant knowledge is retrieved and injected as a system message
+- **During tool dispatch**: `recall_knowledge` and `store_knowledge` tool calls are intercepted by `KnowledgeAwareExecutor`
+- **After loop completion**: Conversation learnings are persisted as episodic memory
+
+The bridge is fully opt-in — without it, the loop behaves identically to before.
+
+### Loop Phases
+
+| Phase | Module | Description |
+|-------|--------|-------------|
+| **Reasoning** | `phases.rs` | LLM inference produces proposed actions (tool calls or text response) |
+| **Policy Check** | `policy_bridge.rs` | Each action evaluated: Allow, Deny, or Modify |
+| **Tool Dispatching** | `executor.rs` | Approved actions executed in parallel with circuit breakers |
+| **Observing** | `phases.rs` | Results collected, loop continues or terminates |
+
+### Supporting Infrastructure
+
+| Component | Module | Description |
+|-----------|--------|-------------|
+| Circuit Breakers | `circuit_breaker.rs` | Failure thresholds, recovery timeouts, half-open probing |
+| Durable Journal | `loop_types.rs` | Sequenced event log for replay and debugging |
+| Human Critic | `human_critic.rs` | Human-in-the-loop approval for sensitive actions |
+| Cedar Gate | `cedar_gate.rs` | Cedar policy engine integration for fine-grained authorization |
+| Saga Pattern | `saga.rs` | Multi-step distributed operations with checkpoint/rollback |
+| Agent Registry | `agent_registry.rs` | Persistent agent metadata with lifecycle management |
+| Tracing | `tracing_spans.rs` | OpenTelemetry distributed tracing for each loop phase |
+| Metrics | `metrics.rs` | Iteration counts, token usage, latency histograms |
+| Tool Profile | `tool_profile.rs` | Glob-based tool filtering before LLM sees them (`orga-adaptive`) |
+| Progress Tracker | `progress_tracker.rs` | Per-step reattempt limits with stuck-loop detection (`orga-adaptive`) |
+| Pre-Hydration | `pre_hydrate.rs` | Deterministic context pre-fetch from task references (`orga-adaptive`) |
 
 ---
 
@@ -346,7 +518,7 @@ sequenceDiagram
     participant Verifier as Tool Verifier
     
     Agent->>MCP: Request Tools
-    MCP->>Server: Connect & List Tools
+    MCP->>Server: Connect and List Tools
     Server-->>MCP: Tool Definitions
     MCP->>Verifier: Verify Tool Schemas
     Verifier-->>MCP: Verification Results
@@ -466,7 +638,7 @@ pub struct AuditEvent {
 ### Scalability Metrics
 
 **Agent Management:**
-- **Concurrent Agents**: 10,000+ simultaneous agents
+- **Concurrent Agents**: 10,000+ logical agents (in-process); sandboxed agents scale with host resources
 - **Agent Startup**: <1s for standard agents
 - **Memory Usage**: 1-5MB per agent (varies by configuration)
 - **CPU Overhead**: <5% system overhead for runtime
@@ -517,10 +689,16 @@ audit_enabled = true
 crypto_provider = "ring"
 
 [context]
-vector_db_url = "http://localhost:6333"
+vector_backend = "lancedb"            # "lancedb" (default) or "qdrant"
+vector_data_path = "./data/vectors"   # LanceDB storage path
 embedding_dimension = 1536
 context_cache_size = "1GB"
 knowledge_retention_days = 365
+
+# Optional: only needed when vector_backend = "qdrant"
+# [context.qdrant]
+# host = "localhost"
+# port = 6334
 
 [mcp]
 discovery_enabled = true
@@ -541,8 +719,15 @@ export SYMBI_CONFIG_PATH=/etc/symbi/config.toml
 export SYMBI_CRYPTO_PROVIDER=ring
 export SYMBI_AUDIT_STORAGE=/var/log/symbi/audit
 
+# Vector database (LanceDB is the zero-config default)
+export SYMBIONT_VECTOR_BACKEND=lancedb          # or "qdrant"
+export SYMBIONT_VECTOR_DATA_PATH=./data/vectors # LanceDB storage path
+
+# Optional: only needed when using Qdrant backend
+# export SYMBIONT_VECTOR_HOST=localhost
+# export SYMBIONT_VECTOR_PORT=6334
+
 # External dependencies
-export QDRANT_URL=http://localhost:6333
 export OPENAI_API_KEY=your_api_key_here
 export MCP_SERVER_DISCOVERY=enabled
 ```
@@ -646,8 +831,8 @@ spec:
 ### Local Development
 
 ```bash
-# Start dependencies
-docker-compose up -d qdrant redis postgres
+# Start dependencies (LanceDB is embedded — no external service needed)
+docker-compose up -d redis postgres
 
 # Run in development mode
 RUST_LOG=debug cargo run --example full_system
@@ -680,6 +865,7 @@ cargo test --features security-tests
 
 ## Next Steps
 
+- **[Reasoning Loop Guide](/reasoning-loop)** - Complete guide to the agentic reasoning loop
 - **[Security Model](/security-model)** - Deep dive into security implementation
 - **[Contributing](/contributing)** - Development and contribution guidelines
 - **[API Reference](/api-reference)** - Complete API documentation

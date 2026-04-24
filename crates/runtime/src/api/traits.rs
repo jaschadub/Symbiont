@@ -7,10 +7,21 @@
 use async_trait::async_trait;
 
 #[cfg(feature = "http-api")]
-use crate::types::{AgentId, RuntimeError};
+use crate::types::{AgentId, AgentState, RuntimeError};
 
 #[cfg(feature = "http-api")]
-use super::types::{AgentStatusResponse, CreateAgentRequest, CreateAgentResponse, DeleteAgentResponse, ExecuteAgentRequest, ExecuteAgentResponse, GetAgentHistoryResponse, UpdateAgentRequest, UpdateAgentResponse, WorkflowExecutionRequest};
+use super::types::{
+    AddIdentityMappingRequest, AgentStatusResponse, AgentSummary, ChannelActionResponse,
+    ChannelAuditResponse, ChannelDetail, ChannelHealthResponse, ChannelSummary, CreateAgentRequest,
+    CreateAgentResponse, CreateScheduleRequest, CreateScheduleResponse, DeleteAgentResponse,
+    DeleteChannelResponse, DeleteScheduleResponse, ExecuteAgentRequest, ExecuteAgentResponse,
+    GetAgentHistoryResponse, HeartbeatRequest, IdentityMappingEntry, MessageStatusResponse,
+    NextRunsResponse, PushEventRequest, ReceiveMessagesResponse, RegisterChannelRequest,
+    RegisterChannelResponse, ScheduleActionResponse, ScheduleDetail, ScheduleHistoryResponse,
+    ScheduleSummary, SchedulerHealthResponse, SendMessageRequest, SendMessageResponse,
+    UpdateAgentRequest, UpdateAgentResponse, UpdateChannelRequest, UpdateScheduleRequest,
+    WorkflowExecutionRequest,
+};
 
 /// Trait providing API access to core runtime functionalities
 #[cfg(feature = "http-api")]
@@ -31,8 +42,22 @@ pub trait RuntimeApiProvider: Send + Sync {
     /// Get system health information
     async fn get_system_health(&self) -> Result<serde_json::Value, RuntimeError>;
 
-    /// List all active agents
+    /// List all active agents (IDs only — use list_agents_detailed for names)
     async fn list_agents(&self) -> Result<Vec<AgentId>, RuntimeError>;
+
+    /// List all agents with name and state
+    async fn list_agents_detailed(&self) -> Result<Vec<AgentSummary>, RuntimeError> {
+        // Default: fall back to list_agents with unknown names
+        let ids = self.list_agents().await?;
+        Ok(ids
+            .into_iter()
+            .map(|id| AgentSummary {
+                id,
+                name: String::new(),
+                state: AgentState::Created,
+            })
+            .collect())
+    }
 
     /// Shutdown an agent gracefully
     async fn shutdown_agent(&self, agent_id: AgentId) -> Result<(), RuntimeError>;
@@ -49,26 +74,175 @@ pub trait RuntimeApiProvider: Send + Sync {
     /// Update an existing agent with the given configuration
     async fn update_agent(
         &self,
-        agent_id: String,
+        agent_id: AgentId,
         request: UpdateAgentRequest,
     ) -> Result<UpdateAgentResponse, RuntimeError>;
 
     /// Delete an existing agent
-    async fn delete_agent(
-        &self,
-        agent_id: String,
-    ) -> Result<DeleteAgentResponse, RuntimeError>;
+    async fn delete_agent(&self, agent_id: AgentId) -> Result<DeleteAgentResponse, RuntimeError>;
 
     /// Execute an agent with the given request
     async fn execute_agent(
         &self,
-        agent_id: String,
+        agent_id: AgentId,
         request: ExecuteAgentRequest,
     ) -> Result<ExecuteAgentResponse, RuntimeError>;
 
     /// Get execution history for an agent
     async fn get_agent_history(
         &self,
-        agent_id: String,
+        agent_id: AgentId,
     ) -> Result<GetAgentHistoryResponse, RuntimeError>;
+
+    // ── Schedule endpoints ──────────────────────────────────────────
+
+    /// List all scheduled jobs.
+    async fn list_schedules(&self) -> Result<Vec<ScheduleSummary>, RuntimeError>;
+
+    /// Create a new scheduled job.
+    async fn create_schedule(
+        &self,
+        request: CreateScheduleRequest,
+    ) -> Result<CreateScheduleResponse, RuntimeError>;
+
+    /// Get details of a scheduled job.
+    async fn get_schedule(&self, job_id: &str) -> Result<ScheduleDetail, RuntimeError>;
+
+    /// Update a scheduled job.
+    async fn update_schedule(
+        &self,
+        job_id: &str,
+        request: UpdateScheduleRequest,
+    ) -> Result<ScheduleDetail, RuntimeError>;
+
+    /// Delete a scheduled job.
+    async fn delete_schedule(&self, job_id: &str) -> Result<DeleteScheduleResponse, RuntimeError>;
+
+    /// Pause a scheduled job.
+    async fn pause_schedule(&self, job_id: &str) -> Result<ScheduleActionResponse, RuntimeError>;
+
+    /// Resume a paused scheduled job.
+    async fn resume_schedule(&self, job_id: &str) -> Result<ScheduleActionResponse, RuntimeError>;
+
+    /// Force-trigger a scheduled job immediately.
+    async fn trigger_schedule(&self, job_id: &str) -> Result<ScheduleActionResponse, RuntimeError>;
+
+    /// Get run history for a scheduled job.
+    async fn get_schedule_history(
+        &self,
+        job_id: &str,
+        limit: usize,
+    ) -> Result<ScheduleHistoryResponse, RuntimeError>;
+
+    /// Get next N computed run times for a job.
+    async fn get_schedule_next_runs(
+        &self,
+        job_id: &str,
+        count: usize,
+    ) -> Result<NextRunsResponse, RuntimeError>;
+
+    /// Get scheduler health and metrics.
+    async fn get_scheduler_health(&self) -> Result<SchedulerHealthResponse, RuntimeError>;
+
+    // ── Channel endpoints ──────────────────────────────────────────
+
+    /// List all registered channel adapters.
+    async fn list_channels(&self) -> Result<Vec<ChannelSummary>, RuntimeError>;
+
+    /// Register a new channel adapter.
+    async fn register_channel(
+        &self,
+        request: RegisterChannelRequest,
+    ) -> Result<RegisterChannelResponse, RuntimeError>;
+
+    /// Get details of a channel adapter.
+    async fn get_channel(&self, id: &str) -> Result<ChannelDetail, RuntimeError>;
+
+    /// Update a channel adapter configuration.
+    async fn update_channel(
+        &self,
+        id: &str,
+        request: UpdateChannelRequest,
+    ) -> Result<ChannelDetail, RuntimeError>;
+
+    /// Delete a channel adapter.
+    async fn delete_channel(&self, id: &str) -> Result<DeleteChannelResponse, RuntimeError>;
+
+    /// Start a channel adapter.
+    async fn start_channel(&self, id: &str) -> Result<ChannelActionResponse, RuntimeError>;
+
+    /// Stop a channel adapter.
+    async fn stop_channel(&self, id: &str) -> Result<ChannelActionResponse, RuntimeError>;
+
+    /// Get health and connectivity info for a channel adapter.
+    async fn get_channel_health(&self, id: &str) -> Result<ChannelHealthResponse, RuntimeError>;
+
+    // ── Channel enterprise endpoints (return NotImplemented for community) ──
+
+    /// List identity mappings for a channel.
+    async fn list_channel_mappings(
+        &self,
+        id: &str,
+    ) -> Result<Vec<IdentityMappingEntry>, RuntimeError>;
+
+    /// Add an identity mapping to a channel.
+    async fn add_channel_mapping(
+        &self,
+        id: &str,
+        request: AddIdentityMappingRequest,
+    ) -> Result<IdentityMappingEntry, RuntimeError>;
+
+    /// Remove an identity mapping from a channel.
+    async fn remove_channel_mapping(&self, id: &str, user_id: &str) -> Result<(), RuntimeError>;
+
+    /// Get audit log entries for a channel.
+    async fn get_channel_audit(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> Result<ChannelAuditResponse, RuntimeError>;
+
+    // ── External agent endpoints ─────────────────────────────────────
+
+    /// Update heartbeat for an external agent.
+    async fn update_agent_heartbeat(
+        &self,
+        agent_id: AgentId,
+        heartbeat: HeartbeatRequest,
+    ) -> Result<(), RuntimeError>;
+
+    /// Push an event for an external agent.
+    async fn push_agent_event(
+        &self,
+        agent_id: AgentId,
+        event: PushEventRequest,
+    ) -> Result<(), RuntimeError>;
+
+    /// Check external agents for unreachable status. Default: no-op.
+    async fn check_unreachable_agents(&self) {}
+
+    // ── Inter-agent messaging ────────────────────────────────────────
+
+    /// Send a message to an agent through the communication bus.
+    ///
+    /// The target agent may be local (in this runtime instance) or the
+    /// request may be routed via this runtime on behalf of a caller.
+    /// Returns the message ID and current delivery status.
+    async fn send_agent_message(
+        &self,
+        recipient: AgentId,
+        request: SendMessageRequest,
+    ) -> Result<SendMessageResponse, RuntimeError>;
+
+    /// Receive (and consume) all pending messages for an agent.
+    async fn receive_agent_messages(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<ReceiveMessagesResponse, RuntimeError>;
+
+    /// Get the current delivery status of a specific message.
+    async fn get_message_status(
+        &self,
+        message_id: &str,
+    ) -> Result<MessageStatusResponse, RuntimeError>;
 }

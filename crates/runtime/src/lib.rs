@@ -4,24 +4,51 @@
 //! responsible for managing the complete lifecycle of autonomous agents.
 
 pub mod communication;
+pub mod config;
 pub mod context;
 pub mod crypto;
+pub mod env;
 pub mod error_handler;
 pub mod integrations;
 pub mod lifecycle;
+pub mod logging;
+pub mod metrics;
+pub mod models;
+pub mod net_guard;
 pub mod rag;
+pub mod reasoning;
 pub mod resource;
+pub mod routing;
+pub mod sandbox;
 pub mod scheduler;
 pub mod secrets;
+pub mod skills;
+pub mod toolclad;
 pub mod types;
+
+pub mod prelude;
+
+#[cfg(feature = "cli-executor")]
+pub mod cli_executor;
 
 #[cfg(feature = "http-api")]
 pub mod api;
 
 #[cfg(feature = "http-api")]
-use api::types::{AgentExecutionRecord, AgentStatusResponse, CreateAgentRequest, CreateAgentResponse, DeleteAgentResponse, ExecuteAgentRequest, ExecuteAgentResponse, GetAgentHistoryResponse, UpdateAgentRequest, UpdateAgentResponse, WorkflowExecutionRequest};
-#[cfg(feature = "http-api")]
 use api::traits::RuntimeApiProvider;
+#[cfg(all(feature = "http-api", feature = "cron"))]
+use api::types::ScheduleRunEntry;
+#[cfg(feature = "http-api")]
+use api::types::{
+    AddIdentityMappingRequest, AgentExecutionRecord, AgentStatusResponse, ChannelActionResponse,
+    ChannelAuditResponse, ChannelDetail, ChannelHealthResponse, ChannelSummary, CreateAgentRequest,
+    CreateAgentResponse, CreateScheduleRequest, CreateScheduleResponse, DeleteAgentResponse,
+    DeleteChannelResponse, DeleteScheduleResponse, ExecuteAgentRequest, ExecuteAgentResponse,
+    GetAgentHistoryResponse, IdentityMappingEntry, NextRunsResponse, RegisterChannelRequest,
+    RegisterChannelResponse, ScheduleActionResponse, ScheduleDetail, ScheduleHistoryResponse,
+    ScheduleSummary, UpdateAgentRequest, UpdateAgentResponse, UpdateChannelRequest,
+    UpdateScheduleRequest, WorkflowExecutionRequest,
+};
 #[cfg(feature = "http-api")]
 use async_trait::async_trait;
 
@@ -30,14 +57,101 @@ pub mod http_input;
 
 // Re-export commonly used types
 pub use communication::{CommunicationBus, CommunicationConfig, DefaultCommunicationBus};
+pub use config::SecurityConfig;
+pub use context::{ContextManager, ContextManagerConfig, StandardContextManager};
 pub use error_handler::{DefaultErrorHandler, ErrorHandler, ErrorHandlerConfig};
 pub use lifecycle::{DefaultLifecycleController, LifecycleConfig, LifecycleController};
+pub use logging::{LoggingConfig, ModelInteractionType, ModelLogger, RequestData, ResponseData};
+pub use models::{ModelCatalog, ModelCatalogError, SlmRunner, SlmRunnerError};
 pub use resource::{DefaultResourceManager, ResourceManager, ResourceManagerConfig};
+pub use routing::{
+    DefaultRoutingEngine, RouteDecision, RoutingConfig, RoutingContext, RoutingEngine, TaskType,
+};
+pub use sandbox::{E2BSandbox, ExecutionResult, SandboxRunner, SandboxTier};
+#[cfg(feature = "cron")]
+pub use scheduler::{
+    cron_scheduler::{
+        CronMetrics, CronScheduler, CronSchedulerConfig, CronSchedulerError, CronSchedulerHealth,
+    },
+    cron_types::{
+        AuditLevel, CronJobDefinition, CronJobId, CronJobStatus, DeliveryChannel, DeliveryConfig,
+        DeliveryReceipt, JobRunRecord, JobRunStatus,
+    },
+    delivery::{CustomDeliveryHandler, DefaultDeliveryRouter, DeliveryResult, DeliveryRouter},
+    heartbeat::{
+        HeartbeatAssessment, HeartbeatConfig, HeartbeatContextMode, HeartbeatSeverity,
+        HeartbeatState,
+    },
+    job_store::{JobStore, JobStoreError, SqliteJobStore},
+    policy_gate::{
+        PolicyGate, ScheduleContext, SchedulePolicyCondition, SchedulePolicyDecision,
+        SchedulePolicyEffect, SchedulePolicyRule,
+    },
+};
 pub use scheduler::{AgentScheduler, DefaultAgentScheduler, SchedulerConfig};
+pub use secrets::{SecretStore, SecretsConfig};
 pub use types::*;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Bounded in-memory execution log for agent history tracking.
+///
+/// Stores execution records in a thread-safe ring buffer. When the buffer
+/// reaches capacity, oldest entries are evicted. All operations are O(1)
+/// amortized except `get_history` which is O(n) in the number of records
+/// for the requested agent.
+#[cfg(feature = "http-api")]
+pub struct ExecutionLog {
+    entries: parking_lot::RwLock<std::collections::VecDeque<ExecutionEntry>>,
+    capacity: usize,
+}
+
+#[cfg(feature = "http-api")]
+#[derive(Debug, Clone)]
+struct ExecutionEntry {
+    agent_id: AgentId,
+    execution_id: String,
+    status: String,
+    timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(feature = "http-api")]
+impl ExecutionLog {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: parking_lot::RwLock::new(std::collections::VecDeque::with_capacity(capacity)),
+            capacity,
+        }
+    }
+
+    /// Record an execution event for an agent.
+    fn record(&self, agent_id: AgentId, execution_id: &str, status: &str) {
+        let entry = ExecutionEntry {
+            agent_id,
+            execution_id: execution_id.to_string(),
+            status: status.to_string(),
+            timestamp: chrono::Utc::now(),
+        };
+        let mut entries = self.entries.write();
+        if entries.len() >= self.capacity {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
+    }
+
+    /// Retrieve execution history for a specific agent, most recent first.
+    fn get_history(&self, agent_id: AgentId, limit: usize) -> Vec<ExecutionEntry> {
+        let entries = self.entries.read();
+        entries
+            .iter()
+            .rev()
+            .filter(|e| e.agent_id == agent_id)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+}
 
 /// Main Agent Runtime System
 #[derive(Clone)]
@@ -47,7 +161,25 @@ pub struct AgentRuntime {
     pub resource_manager: Arc<dyn resource::ResourceManager + Send + Sync>,
     pub communication: Arc<dyn communication::CommunicationBus + Send + Sync>,
     pub error_handler: Arc<dyn error_handler::ErrorHandler + Send + Sync>,
+    pub context_manager: Arc<dyn context::ContextManager + Send + Sync>,
+    pub model_logger: Option<Arc<logging::ModelLogger>>,
+    pub model_catalog: Option<Arc<models::ModelCatalog>>,
+    /// Stable identity for system-originated messages (API calls, HTTP input).
+    /// Created once at runtime startup and reused for all internal messages
+    /// so audit trails can consistently attribute system actions.
+    pub system_agent_id: AgentId,
+    /// Optional AgentPin verifier, constructed when
+    /// `RuntimeConfig.agentpin.enabled == true`. When present, the HTTP
+    /// ingress paths (inter-agent messaging, heartbeat, push-event) and
+    /// the cron scheduler require a valid AgentPin JWT whose `sub`/agent
+    /// claims cover the acting agent.
+    pub agentpin_verifier: Option<Arc<dyn integrations::AgentPinVerifier>>,
+    #[cfg(feature = "cron")]
+    cron_scheduler: Option<Arc<scheduler::cron_scheduler::CronScheduler>>,
     config: Arc<RwLock<RuntimeConfig>>,
+    /// In-memory execution log for agent history tracking.
+    #[cfg(feature = "http-api")]
+    execution_log: Arc<ExecutionLog>,
 }
 
 impl AgentRuntime {
@@ -86,14 +218,122 @@ impl AgentRuntime {
         let lifecycle =
             Arc::new(lifecycle::DefaultLifecycleController::new(lifecycle_config).await?);
 
+        let context_manager = Arc::new(
+            context::StandardContextManager::new(
+                config.read().await.context_manager.clone(),
+                "runtime-system",
+            )
+            .await
+            .map_err(|e| {
+                RuntimeError::Internal(format!("Failed to create context manager: {}", e))
+            })?,
+        );
+
+        // Initialize context manager
+        context_manager.initialize().await.map_err(|e| {
+            RuntimeError::Internal(format!("Failed to initialize context manager: {}", e))
+        })?;
+
+        // Initialize model logger if enabled
+        let model_logger = if config.read().await.logging.enabled {
+            // For now, initialize without secret store to avoid type conversion issues
+            match logging::ModelLogger::new(config.read().await.logging.clone(), None) {
+                Ok(logger) => {
+                    tracing::info!("Model logging initialized successfully");
+                    Some(Arc::new(logger))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize model logger: {}", e);
+                    None
+                }
+            }
+        } else {
+            tracing::info!("Model logging is disabled");
+            None
+        };
+
+        // Initialize model catalog if SLM is enabled
+        let model_catalog = if let Some(ref slm_config) = config.read().await.slm {
+            if slm_config.enabled {
+                match models::ModelCatalog::new(slm_config.clone()) {
+                    Ok(catalog) => {
+                        tracing::info!(
+                            "Model catalog initialized with {} models",
+                            catalog.list_models().len()
+                        );
+                        Some(Arc::new(catalog))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to initialize model catalog: {}", e);
+                        None
+                    }
+                }
+            } else {
+                tracing::info!("SLM support is disabled");
+                None
+            }
+        } else {
+            tracing::info!("No SLM configuration provided");
+            None
+        };
+
+        // Initialize AgentPin verifier if enabled in config. Failing to
+        // build the verifier is NOT fail-open: we return the error so the
+        // operator sees the misconfiguration at startup rather than
+        // silently running without identity checks.
+        let agentpin_verifier: Option<Arc<dyn integrations::AgentPinVerifier>> = {
+            let cfg = config.read().await;
+            match cfg.agentpin.as_ref() {
+                Some(ap_cfg) if ap_cfg.enabled => {
+                    let verifier = integrations::DefaultAgentPinVerifier::new(ap_cfg.clone())
+                        .map_err(|e| {
+                            RuntimeError::Internal(format!(
+                                "Failed to construct AgentPin verifier: {}",
+                                e
+                            ))
+                        })?;
+                    tracing::info!(
+                        "AgentPin verifier enabled (discovery_mode={:?}, audience={:?})",
+                        ap_cfg.discovery_mode,
+                        ap_cfg.audience
+                    );
+                    Some(Arc::new(verifier) as Arc<dyn integrations::AgentPinVerifier>)
+                }
+                Some(_) => {
+                    tracing::info!("AgentPin configured but disabled; identity checks skipped");
+                    None
+                }
+                None => None,
+            }
+        };
+
         Ok(Self {
             scheduler,
             lifecycle,
             resource_manager,
             communication,
             error_handler,
+            context_manager,
+            model_logger,
+            model_catalog,
+            system_agent_id: AgentId::new(),
+            agentpin_verifier,
+            #[cfg(feature = "cron")]
+            cron_scheduler: None,
             config,
+            #[cfg(feature = "http-api")]
+            execution_log: Arc::new(ExecutionLog::new(10_000)),
         })
+    }
+
+    /// Attach a CronScheduler to the runtime so schedule APIs become functional.
+    #[cfg(feature = "cron")]
+    pub fn with_cron_scheduler(
+        mut self,
+        cron: Arc<scheduler::cron_scheduler::CronScheduler>,
+    ) -> Self {
+        self.cron_scheduler = Some(cron);
+        self
     }
 
     /// Get the current runtime configuration
@@ -107,8 +347,59 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Verify that `jwt` is a valid AgentPin credential covering `agent_id`.
+    ///
+    /// Returns `Ok(())` when no AgentPin verifier is configured on this
+    /// runtime. When a verifier IS configured, `jwt` must be present and
+    /// its `sub` must equal the target agent's UUID string. Used by
+    /// heartbeat, push-event, and any other per-agent ingress path.
+    pub async fn verify_agentpin_for_agent(
+        &self,
+        jwt: Option<&str>,
+        agent_id: AgentId,
+    ) -> Result<(), RuntimeError> {
+        let Some(verifier) = self.agentpin_verifier.as_ref() else {
+            if jwt.is_some() {
+                tracing::warn!("AgentPin JWT supplied but verifier is disabled on this runtime");
+            }
+            return Ok(());
+        };
+        let jwt = jwt.ok_or_else(|| {
+            RuntimeError::Authentication(
+                "AgentPin verification is enabled; agentpin_jwt is required".to_string(),
+            )
+        })?;
+        let result = verifier
+            .verify_credential(jwt)
+            .await
+            .map_err(|e| RuntimeError::Authentication(format!("AgentPin: {}", e)))?;
+        if !result.valid {
+            return Err(RuntimeError::Authentication(format!(
+                "AgentPin credential invalid: {}",
+                result
+                    .error_message
+                    .unwrap_or_else(|| "no reason".to_string())
+            )));
+        }
+        let expected = agent_id.0.to_string();
+        let sub_matches = result
+            .agent_id
+            .as_deref()
+            .map(|sub| sub == expected)
+            .unwrap_or(false);
+        if !sub_matches {
+            return Err(RuntimeError::Authentication(format!(
+                "AgentPin JWT does not cover agent {}: sub={:?}",
+                expected, result.agent_id
+            )));
+        }
+        Ok(())
+    }
+
     /// Shutdown the runtime system gracefully
     pub async fn shutdown(&self) -> Result<(), RuntimeError> {
+        tracing::info!("Starting Agent Runtime shutdown sequence");
+
         // Shutdown components in reverse order of initialization
         self.lifecycle
             .shutdown()
@@ -131,6 +422,12 @@ impl AgentRuntime {
             .await
             .map_err(RuntimeError::ErrorHandler)?;
 
+        // Shutdown context manager last to ensure all contexts are saved
+        self.context_manager.shutdown().await.map_err(|e| {
+            RuntimeError::Internal(format!("Context manager shutdown failed: {}", e))
+        })?;
+
+        tracing::info!("Agent Runtime shutdown completed successfully");
         Ok(())
     }
 
@@ -146,80 +443,317 @@ pub struct RuntimeConfig {
     pub scheduler: scheduler::SchedulerConfig,
     pub resource_manager: resource::ResourceManagerConfig,
     pub communication: communication::CommunicationConfig,
+    pub context_manager: context::ContextManagerConfig,
     pub security: SecurityConfig,
     pub audit: AuditConfig,
     pub error_handler: error_handler::ErrorHandlerConfig,
+    pub logging: logging::LoggingConfig,
+    pub slm: Option<config::Slm>,
+    pub routing: Option<routing::RoutingConfig>,
+    /// Optional AgentPin configuration. When `enabled = true`, every
+    /// inter-agent messaging / heartbeat / cron-trigger path requires a
+    /// valid AgentPin JWT whose `sub` covers the acting agent.
+    pub agentpin: Option<crate::integrations::AgentPinConfig>,
 }
 
 /// Implementation of RuntimeApiProvider for AgentRuntime
 #[cfg(feature = "http-api")]
 #[async_trait]
+#[allow(unused_variables)] // Params used inside #[cfg(feature = "cron")] blocks
 impl RuntimeApiProvider for AgentRuntime {
     async fn execute_workflow(
         &self,
-        _request: WorkflowExecutionRequest,
+        request: WorkflowExecutionRequest,
     ) -> Result<serde_json::Value, RuntimeError> {
-        // Placeholder implementation
-        Ok(serde_json::json!({
+        tracing::info!("Executing workflow: {}", request.workflow_id);
+
+        // Step 1: Parse the workflow DSL and extract metadata (before any await)
+        let workflow_dsl = &request.workflow_id; // For now, treat workflow_id as DSL source
+        let (metadata, agent_config) = {
+            let parsed_tree = dsl::parse_dsl(workflow_dsl)
+                .map_err(|e| RuntimeError::Internal(format!("DSL parsing failed: {}", e)))?;
+
+            // Extract metadata from the parsed workflow
+            let metadata = dsl::extract_metadata(&parsed_tree, workflow_dsl);
+
+            // Check for parsing errors
+            let root_node = parsed_tree.root_node();
+            if root_node.has_error() {
+                return Err(RuntimeError::Internal(
+                    "DSL contains syntax errors".to_string(),
+                ));
+            }
+
+            // Create agent configuration from the workflow
+            let agent_id = request.agent_id.unwrap_or_default();
+            let agent_config = AgentConfig {
+                id: agent_id,
+                name: metadata
+                    .get("name")
+                    .cloned()
+                    .unwrap_or_else(|| "workflow_agent".to_string()),
+                dsl_source: workflow_dsl.to_string(),
+                execution_mode: ExecutionMode::Ephemeral,
+                security_tier: SecurityTier::Tier1,
+                resource_limits: ResourceLimits::default(),
+                capabilities: vec![Capability::Computation], // Basic capability for workflow execution
+                policies: vec![],
+                metadata: metadata.clone(),
+                priority: Priority::Normal,
+            };
+
+            (metadata, agent_config)
+        };
+
+        // Step 2: Schedule the agent for execution
+        let scheduled_agent_id = self
+            .scheduler
+            .schedule_agent(agent_config)
+            .await
+            .map_err(RuntimeError::Scheduler)?;
+
+        // Step 3: Wait briefly and check initial status (simple implementation)
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Step 4: Collect basic execution information
+        let system_status = self.scheduler.get_system_status().await;
+
+        // Step 5: Prepare and return result
+        let mut result = serde_json::json!({
             "status": "success",
-            "message": "Workflow execution not yet implemented"
-        }))
+            "workflow_id": request.workflow_id,
+            "agent_id": scheduled_agent_id.to_string(),
+            "execution_started": true,
+            "metadata": metadata,
+            "system_status": {
+                "total_agents": system_status.total_agents,
+                "running_agents": system_status.running_agents,
+                "resource_utilization": {
+                    "memory_used": system_status.resource_utilization.memory_used,
+                    "cpu_utilization": system_status.resource_utilization.cpu_utilization,
+                    "disk_io_rate": system_status.resource_utilization.disk_io_rate,
+                    "network_io_rate": system_status.resource_utilization.network_io_rate
+                }
+            }
+        });
+
+        // Add parameters if provided
+        if !request.parameters.is_null() {
+            result["parameters"] = request.parameters;
+        }
+
+        // Record execution in history log
+        self.execution_log.record(
+            scheduled_agent_id,
+            &scheduled_agent_id.to_string(),
+            "workflow_started",
+        );
+
+        tracing::info!(
+            "Workflow execution initiated for agent: {}",
+            scheduled_agent_id
+        );
+        Ok(result)
     }
 
     async fn get_agent_status(
         &self,
-        _agent_id: AgentId,
+        agent_id: AgentId,
     ) -> Result<AgentStatusResponse, RuntimeError> {
-        // Placeholder implementation
-        use crate::types::AgentState;
-        Ok(AgentStatusResponse {
-            agent_id: AgentId::new(),
-            state: AgentState::Running,
-            last_activity: chrono::Utc::now(),
-            resource_usage: api::types::ResourceUsage {
-                memory_bytes: 0,
-                cpu_percent: 0.0,
-                active_tasks: 0,
-            },
-        })
+        let external_state = self.scheduler.get_external_agent_state(agent_id);
+        let agent_config = self.scheduler.get_agent_config(agent_id);
+
+        match self.scheduler.get_agent_status(agent_id).await {
+            Ok(agent_status) => {
+                // Convert SystemTime to DateTime<Utc>
+                let last_activity =
+                    chrono::DateTime::<chrono::Utc>::from(agent_status.last_activity);
+
+                let execution_mode_label = agent_config.as_ref().map(|c| match &c.execution_mode {
+                    crate::types::agent::ExecutionMode::External { .. } => "External".to_string(),
+                    crate::types::agent::ExecutionMode::Persistent => "Persistent".to_string(),
+                    crate::types::agent::ExecutionMode::Ephemeral => "Ephemeral".to_string(),
+                    crate::types::agent::ExecutionMode::Scheduled { .. } => "Scheduled".to_string(),
+                    crate::types::agent::ExecutionMode::CronScheduled { .. } => {
+                        "CronScheduled".to_string()
+                    }
+                    crate::types::agent::ExecutionMode::EventDriven => "EventDriven".to_string(),
+                });
+
+                let (metadata, last_result, recent_events) = if let Some(ref ext) = external_state {
+                    (
+                        Some(ext.metadata.clone()),
+                        ext.last_result.clone(),
+                        Some(ext.events.iter().cloned().collect::<Vec<_>>()),
+                    )
+                } else {
+                    (None, None, None)
+                };
+
+                Ok(AgentStatusResponse {
+                    agent_id: agent_status.agent_id,
+                    state: agent_status.state,
+                    last_activity,
+                    resource_usage: api::types::ResourceUsage {
+                        memory_bytes: agent_status.memory_usage,
+                        cpu_percent: agent_status.cpu_usage,
+                        active_tasks: agent_status.active_tasks,
+                    },
+                    metadata,
+                    last_result,
+                    recent_events,
+                    execution_mode: execution_mode_label,
+                })
+            }
+            Err(scheduler_error) => {
+                tracing::warn!(
+                    "Failed to get agent status for {}: {}",
+                    agent_id,
+                    scheduler_error
+                );
+                Err(RuntimeError::Internal(format!(
+                    "Agent {} not found",
+                    agent_id
+                )))
+            }
+        }
     }
 
     async fn get_system_health(&self) -> Result<serde_json::Value, RuntimeError> {
-        // Placeholder implementation
+        // Check health of all components
+        let scheduler_health =
+            self.scheduler.check_health().await.map_err(|e| {
+                RuntimeError::Internal(format!("Scheduler health check failed: {}", e))
+            })?;
+
+        let lifecycle_health =
+            self.lifecycle.check_health().await.map_err(|e| {
+                RuntimeError::Internal(format!("Lifecycle health check failed: {}", e))
+            })?;
+
+        let resource_health = self.resource_manager.check_health().await.map_err(|e| {
+            RuntimeError::Internal(format!("Resource manager health check failed: {}", e))
+        })?;
+
+        let communication_health = self.communication.check_health().await.map_err(|e| {
+            RuntimeError::Internal(format!("Communication health check failed: {}", e))
+        })?;
+
+        // Determine overall system status
+        let component_healths = vec![
+            ("scheduler", &scheduler_health),
+            ("lifecycle", &lifecycle_health),
+            ("resource_manager", &resource_health),
+            ("communication", &communication_health),
+        ];
+
+        let overall_status = if component_healths
+            .iter()
+            .all(|(_, h)| h.status == HealthStatus::Healthy)
+        {
+            "healthy"
+        } else if component_healths
+            .iter()
+            .any(|(_, h)| h.status == HealthStatus::Unhealthy)
+        {
+            "unhealthy"
+        } else {
+            "degraded"
+        };
+
+        // Build response with detailed component information
+        let mut components = serde_json::Map::new();
+        for (name, health) in component_healths {
+            let component_info = serde_json::json!({
+                "status": match health.status {
+                    HealthStatus::Healthy => "healthy",
+                    HealthStatus::Degraded => "degraded",
+                    HealthStatus::Unhealthy => "unhealthy",
+                },
+                "message": health.message,
+                "last_check": health.last_check
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                "uptime_seconds": health.uptime.as_secs(),
+                "metrics": health.metrics
+            });
+            components.insert(name.to_string(), component_info);
+        }
+
         Ok(serde_json::json!({
-            "status": "healthy",
-            "components": {
-                "scheduler": "healthy",
-                "lifecycle": "healthy",
-                "resource_manager": "healthy",
-                "communication": "healthy"
-            }
+            "status": overall_status,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            "components": components
         }))
     }
 
     async fn list_agents(&self) -> Result<Vec<AgentId>, RuntimeError> {
-        // Placeholder implementation - return empty list for now
-        Ok(vec![])
+        Ok(self.scheduler.list_agents().await)
     }
 
-    async fn shutdown_agent(&self, _agent_id: AgentId) -> Result<(), RuntimeError> {
-        // Placeholder implementation
-        Ok(())
+    async fn list_agents_detailed(
+        &self,
+    ) -> Result<Vec<crate::api::types::AgentSummary>, RuntimeError> {
+        let ids = self.scheduler.list_agents().await;
+        let mut summaries = Vec::new();
+        for id in ids {
+            let name = self
+                .scheduler
+                .get_agent_config(id)
+                .map(|c| c.name)
+                .unwrap_or_default();
+            let state = self
+                .scheduler
+                .get_agent_status(id)
+                .await
+                .map(|s| s.state)
+                .unwrap_or(AgentState::Created);
+            summaries.push(crate::api::types::AgentSummary { id, name, state });
+        }
+        Ok(summaries)
+    }
+
+    async fn shutdown_agent(&self, agent_id: AgentId) -> Result<(), RuntimeError> {
+        self.scheduler
+            .shutdown_agent(agent_id)
+            .await
+            .map_err(RuntimeError::Scheduler)
     }
 
     async fn get_metrics(&self) -> Result<serde_json::Value, RuntimeError> {
-        // Placeholder implementation
+        let status = self.get_status().await;
+
+        // Count agents in error/failed state by checking each agent's status
+        let agent_ids = self.scheduler.list_agents().await;
+        let mut error_count: usize = 0;
+        for aid in &agent_ids {
+            if let Ok(agent_status) = self.scheduler.get_agent_status(*aid).await {
+                if agent_status.state == AgentState::Failed {
+                    error_count += 1;
+                }
+            }
+        }
+
+        let idle = status
+            .total_agents
+            .saturating_sub(status.running_agents)
+            .saturating_sub(error_count);
+
         Ok(serde_json::json!({
             "agents": {
-                "total": 0,
-                "running": 0,
-                "idle": 0,
-                "error": 0
+                "total": status.total_agents,
+                "running": status.running_agents,
+                "idle": idle,
+                "error": error_count
             },
             "system": {
-                "uptime": 0,
-                "memory_usage": 0,
-                "cpu_usage": 0.0
+                "uptime_seconds": status.uptime.as_secs(),
+                "memory_usage": status.resource_utilization.memory_used,
+                "cpu_usage": status.resource_utilization.cpu_utilization
             }
         }))
     }
@@ -228,120 +762,851 @@ impl RuntimeApiProvider for AgentRuntime {
         &self,
         request: CreateAgentRequest,
     ) -> Result<CreateAgentResponse, RuntimeError> {
-        // Placeholder implementation - generate a UUID and return success
-        use uuid::Uuid;
-        
-        // For now, just validate that we have the required fields
+        // Validate input
         if request.name.is_empty() {
-            return Err(RuntimeError::Internal("Agent name cannot be empty".to_string()));
-        }
-        
-        if request.dsl.is_empty() {
-            return Err(RuntimeError::Internal("Agent DSL cannot be empty".to_string()));
+            return Err(RuntimeError::Internal(
+                "Agent name cannot be empty".to_string(),
+            ));
         }
 
+        let execution_mode = request.execution_mode.clone().unwrap_or_default();
+
+        let dsl_source = match &execution_mode {
+            crate::types::agent::ExecutionMode::External { .. } => {
+                request.dsl.clone().unwrap_or_default()
+            }
+            _ => {
+                let dsl = request.dsl.as_deref().unwrap_or("");
+                if dsl.is_empty() {
+                    return Err(RuntimeError::Internal(
+                        "Agent DSL cannot be empty for non-external agents".to_string(),
+                    ));
+                }
+                dsl.to_string()
+            }
+        };
+
+        // Create agent configuration
+        let agent_id = AgentId::new();
+        let agent_config = AgentConfig {
+            id: agent_id,
+            name: request.name,
+            dsl_source,
+            execution_mode,
+            security_tier: SecurityTier::Tier1,
+            resource_limits: ResourceLimits::default(),
+            capabilities: request
+                .capabilities
+                .unwrap_or_default()
+                .into_iter()
+                .map(Capability::Custom)
+                .collect(),
+            policies: vec![],
+            metadata: request.metadata.unwrap_or_default(),
+            priority: Priority::Normal,
+        };
+
+        // Schedule the agent for execution
+        let scheduled_agent_id = self
+            .scheduler
+            .schedule_agent(agent_config)
+            .await
+            .map_err(RuntimeError::Scheduler)?;
+
+        tracing::info!("Created and scheduled agent: {}", scheduled_agent_id);
+
+        // Record creation in execution log
+        self.execution_log.record(
+            scheduled_agent_id,
+            &scheduled_agent_id.to_string(),
+            "created",
+        );
+
         Ok(CreateAgentResponse {
-            id: Uuid::new_v4().to_string(),
-            status: "created".to_string(),
+            id: scheduled_agent_id.to_string(),
+            status: "scheduled".to_string(),
         })
     }
 
     async fn update_agent(
         &self,
-        agent_id: String,
+        agent_id: AgentId,
         request: UpdateAgentRequest,
     ) -> Result<UpdateAgentResponse, RuntimeError> {
-        // Placeholder implementation - validate input and return success
-        
         // Validate that at least one field is provided for update
         if request.name.is_none() && request.dsl.is_none() {
-            return Err(RuntimeError::Internal("At least one field (name or dsl) must be provided for update".to_string()));
+            return Err(RuntimeError::Internal(
+                "At least one field (name or dsl) must be provided for update".to_string(),
+            ));
         }
-        
-        // Validate agent_id is not empty
-        if agent_id.is_empty() {
-            return Err(RuntimeError::Internal("Agent ID cannot be empty".to_string()));
-        }
-        
+
         // Validate optional fields if provided
         if let Some(ref name) = request.name {
             if name.is_empty() {
-                return Err(RuntimeError::Internal("Agent name cannot be empty".to_string()));
-            }
-        }
-        
-        if let Some(ref dsl) = request.dsl {
-            if dsl.is_empty() {
-                return Err(RuntimeError::Internal("Agent DSL cannot be empty".to_string()));
+                return Err(RuntimeError::Internal(
+                    "Agent name cannot be empty".to_string(),
+                ));
             }
         }
 
+        if let Some(ref dsl) = request.dsl {
+            if dsl.is_empty() {
+                return Err(RuntimeError::Internal(
+                    "Agent DSL cannot be empty".to_string(),
+                ));
+            }
+        }
+
+        // Call the scheduler to update the agent
+        self.scheduler
+            .update_agent(agent_id, request)
+            .await
+            .map_err(RuntimeError::Scheduler)?;
+
+        tracing::info!("Successfully updated agent: {}", agent_id);
+
         Ok(UpdateAgentResponse {
-            id: agent_id,
+            id: agent_id.to_string(),
             status: "updated".to_string(),
         })
     }
 
-    async fn delete_agent(
-        &self,
-        agent_id: String,
-    ) -> Result<DeleteAgentResponse, RuntimeError> {
-        // Placeholder implementation - validate input and return success
-        
-        // Validate agent_id is not empty
-        if agent_id.is_empty() {
-            return Err(RuntimeError::Internal("Agent ID cannot be empty".to_string()));
-        }
+    async fn delete_agent(&self, agent_id: AgentId) -> Result<DeleteAgentResponse, RuntimeError> {
+        self.scheduler
+            .delete_agent(agent_id)
+            .await
+            .map_err(RuntimeError::Scheduler)?;
 
         Ok(DeleteAgentResponse {
-            id: agent_id,
+            id: agent_id.to_string(),
             status: "deleted".to_string(),
         })
     }
 
     async fn execute_agent(
         &self,
-        agent_id: String,
-        _request: ExecuteAgentRequest,
+        agent_id: AgentId,
+        request: ExecuteAgentRequest,
     ) -> Result<ExecuteAgentResponse, RuntimeError> {
-        // Placeholder implementation - validate input and return dummy response
-        
-        // Validate agent_id is not empty
-        if agent_id.is_empty() {
-            return Err(RuntimeError::Internal("Agent ID cannot be empty".to_string()));
+        // Ensure the agent exists in the registry
+        if !self.scheduler.has_agent(agent_id) {
+            return Err(RuntimeError::Internal(format!(
+                "Agent {} not found",
+                agent_id
+            )));
         }
 
-        // Generate a dummy execution ID
-        use uuid::Uuid;
-        
+        // Re-schedule from stored config if the agent isn't currently active
+        let status = self.get_agent_status(agent_id).await?;
+        if status.state == AgentState::Completed {
+            if let Some(config) = self.scheduler.get_agent_config(agent_id) {
+                self.scheduler
+                    .schedule_agent(config)
+                    .await
+                    .map_err(RuntimeError::Scheduler)?;
+            }
+        } else if status.state != AgentState::Running {
+            self.lifecycle
+                .start_agent(agent_id)
+                .await
+                .map_err(RuntimeError::Lifecycle)?;
+        }
+        let execution_id = uuid::Uuid::new_v4().to_string();
+        let payload_data: bytes::Bytes = serde_json::to_vec(&request)
+            .map_err(|e| RuntimeError::Internal(e.to_string()))?
+            .into();
+        let message = self.communication.create_internal_message(
+            self.system_agent_id,
+            agent_id,
+            payload_data,
+            types::MessageType::Direct(agent_id),
+            std::time::Duration::from_secs(300),
+        );
+        self.communication
+            .send_message(message)
+            .await
+            .map_err(RuntimeError::Communication)?;
+
+        // Record execution in the history log
+        #[cfg(feature = "http-api")]
+        self.execution_log
+            .record(agent_id, &execution_id, "execution_started");
+
         Ok(ExecuteAgentResponse {
-            execution_id: Uuid::new_v4().to_string(),
+            execution_id,
             status: "execution_started".to_string(),
         })
     }
 
     async fn get_agent_history(
         &self,
-        agent_id: String,
+        agent_id: AgentId,
     ) -> Result<GetAgentHistoryResponse, RuntimeError> {
-        // Placeholder implementation - validate input and return dummy response
-        
-        // Validate agent_id is not empty
-        if agent_id.is_empty() {
-            return Err(RuntimeError::Internal("Agent ID cannot be empty".to_string()));
+        let entries = self.execution_log.get_history(agent_id, 100);
+        let history = entries
+            .into_iter()
+            .map(|e| AgentExecutionRecord {
+                execution_id: e.execution_id,
+                status: e.status,
+                timestamp: e.timestamp.to_rfc3339(),
+            })
+            .collect();
+        Ok(GetAgentHistoryResponse { history })
+    }
+
+    // ── Schedule endpoints ──────────────────────────────────────────
+
+    async fn list_schedules(&self) -> Result<Vec<ScheduleSummary>, RuntimeError> {
+        #[cfg(feature = "cron")]
+        if let Some(ref cron) = self.cron_scheduler {
+            let jobs = cron
+                .list_jobs()
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            return Ok(jobs
+                .into_iter()
+                .map(|j| ScheduleSummary {
+                    job_id: j.job_id.to_string(),
+                    name: j.name,
+                    cron_expression: j.cron_expression,
+                    timezone: j.timezone,
+                    status: format!("{:?}", j.status),
+                    enabled: j.enabled,
+                    next_run: j.next_run.map(|t| t.to_rfc3339()),
+                    run_count: j.run_count,
+                })
+                .collect());
+        }
+        Ok(vec![])
+    }
+
+    async fn create_schedule(
+        &self,
+        request: CreateScheduleRequest,
+    ) -> Result<CreateScheduleResponse, RuntimeError> {
+        #[cfg(feature = "cron")]
+        if let Some(ref cron) = self.cron_scheduler {
+            use scheduler::cron_types::{CronJobDefinition, CronJobId};
+            let now = chrono::Utc::now();
+            let tz = if request.timezone.is_empty() {
+                "UTC".to_string()
+            } else {
+                request.timezone
+            };
+            let agent_config = types::AgentConfig {
+                id: types::AgentId::new(),
+                name: request.agent_name,
+                dsl_source: String::new(),
+                execution_mode: Default::default(),
+                security_tier: Default::default(),
+                resource_limits: Default::default(),
+                capabilities: Vec::new(),
+                policies: Vec::new(),
+                metadata: Default::default(),
+                priority: Default::default(),
+            };
+            let job = CronJobDefinition {
+                job_id: CronJobId::new(),
+                name: request.name,
+                cron_expression: request.cron_expression,
+                timezone: tz,
+                agent_config,
+                policy_ids: request.policy_ids,
+                audit_level: Default::default(),
+                status: scheduler::cron_types::CronJobStatus::Active,
+                enabled: true,
+                one_shot: request.one_shot,
+                created_at: now,
+                updated_at: now,
+                last_run: None,
+                next_run: None,
+                run_count: 0,
+                failure_count: 0,
+                max_retries: 3,
+                max_concurrent: 1,
+                delivery_config: None,
+                jitter_max_secs: 0,
+                session_mode: Default::default(),
+                agentpin_jwt: None,
+            };
+            let job_id = cron
+                .add_job(job)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            // Retrieve the saved job to get the computed next_run.
+            let saved = cron
+                .get_job(job_id)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            return Ok(CreateScheduleResponse {
+                job_id: job_id.to_string(),
+                next_run: saved.next_run.map(|t| t.to_rfc3339()),
+                status: "created".to_string(),
+            });
+        }
+        Err(RuntimeError::Internal(
+            "Schedule API requires a running CronScheduler".to_string(),
+        ))
+    }
+
+    async fn get_schedule(&self, job_id: &str) -> Result<ScheduleDetail, RuntimeError> {
+        #[cfg(feature = "cron")]
+        if let Some(ref cron) = self.cron_scheduler {
+            let id: scheduler::cron_types::CronJobId = job_id
+                .parse()
+                .map_err(|_| RuntimeError::Internal(format!("Invalid job ID: {}", job_id)))?;
+            let j = cron
+                .get_job(id)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            return Ok(ScheduleDetail {
+                job_id: j.job_id.to_string(),
+                name: j.name,
+                cron_expression: j.cron_expression,
+                timezone: j.timezone,
+                status: format!("{:?}", j.status),
+                enabled: j.enabled,
+                one_shot: j.one_shot,
+                next_run: j.next_run.map(|t| t.to_rfc3339()),
+                last_run: j.last_run.map(|t| t.to_rfc3339()),
+                run_count: j.run_count,
+                failure_count: j.failure_count,
+                created_at: j.created_at.to_rfc3339(),
+                updated_at: j.updated_at.to_rfc3339(),
+            });
+        }
+        Err(RuntimeError::Internal(
+            "Schedule API requires a running CronScheduler".to_string(),
+        ))
+    }
+
+    async fn update_schedule(
+        &self,
+        job_id: &str,
+        request: UpdateScheduleRequest,
+    ) -> Result<ScheduleDetail, RuntimeError> {
+        #[cfg(feature = "cron")]
+        if let Some(ref cron) = self.cron_scheduler {
+            let id: scheduler::cron_types::CronJobId = job_id
+                .parse()
+                .map_err(|_| RuntimeError::Internal(format!("Invalid job ID: {}", job_id)))?;
+            let mut job = cron
+                .get_job(id)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            if let Some(expr) = request.cron_expression {
+                job.cron_expression = expr;
+            }
+            if let Some(tz) = request.timezone {
+                job.timezone = tz;
+            }
+            if let Some(pids) = request.policy_ids {
+                job.policy_ids = pids;
+            }
+            if let Some(one_shot) = request.one_shot {
+                job.one_shot = one_shot;
+            }
+            cron.update_job(job)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            return self.get_schedule(job_id).await;
+        }
+        Err(RuntimeError::Internal(
+            "Schedule API requires a running CronScheduler".to_string(),
+        ))
+    }
+
+    async fn delete_schedule(&self, job_id: &str) -> Result<DeleteScheduleResponse, RuntimeError> {
+        #[cfg(feature = "cron")]
+        if let Some(ref cron) = self.cron_scheduler {
+            let id: scheduler::cron_types::CronJobId = job_id
+                .parse()
+                .map_err(|_| RuntimeError::Internal(format!("Invalid job ID: {}", job_id)))?;
+            cron.remove_job(id)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            return Ok(DeleteScheduleResponse {
+                job_id: job_id.to_string(),
+                deleted: true,
+            });
+        }
+        Err(RuntimeError::Internal(
+            "Schedule API requires a running CronScheduler".to_string(),
+        ))
+    }
+
+    async fn pause_schedule(&self, job_id: &str) -> Result<ScheduleActionResponse, RuntimeError> {
+        #[cfg(feature = "cron")]
+        if let Some(ref cron) = self.cron_scheduler {
+            let id: scheduler::cron_types::CronJobId = job_id
+                .parse()
+                .map_err(|_| RuntimeError::Internal(format!("Invalid job ID: {}", job_id)))?;
+            cron.pause_job(id)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            return Ok(ScheduleActionResponse {
+                job_id: job_id.to_string(),
+                action: "pause".to_string(),
+                status: "paused".to_string(),
+            });
+        }
+        Err(RuntimeError::Internal(
+            "Schedule API requires a running CronScheduler".to_string(),
+        ))
+    }
+
+    async fn resume_schedule(&self, job_id: &str) -> Result<ScheduleActionResponse, RuntimeError> {
+        #[cfg(feature = "cron")]
+        if let Some(ref cron) = self.cron_scheduler {
+            let id: scheduler::cron_types::CronJobId = job_id
+                .parse()
+                .map_err(|_| RuntimeError::Internal(format!("Invalid job ID: {}", job_id)))?;
+            cron.resume_job(id)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            return Ok(ScheduleActionResponse {
+                job_id: job_id.to_string(),
+                action: "resume".to_string(),
+                status: "active".to_string(),
+            });
+        }
+        Err(RuntimeError::Internal(
+            "Schedule API requires a running CronScheduler".to_string(),
+        ))
+    }
+
+    async fn trigger_schedule(&self, job_id: &str) -> Result<ScheduleActionResponse, RuntimeError> {
+        #[cfg(feature = "cron")]
+        if let Some(ref cron) = self.cron_scheduler {
+            let id: scheduler::cron_types::CronJobId = job_id
+                .parse()
+                .map_err(|_| RuntimeError::Internal(format!("Invalid job ID: {}", job_id)))?;
+            cron.trigger_now(id)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            return Ok(ScheduleActionResponse {
+                job_id: job_id.to_string(),
+                action: "trigger".to_string(),
+                status: "triggered".to_string(),
+            });
+        }
+        Err(RuntimeError::Internal(
+            "Schedule API requires a running CronScheduler".to_string(),
+        ))
+    }
+
+    async fn get_schedule_history(
+        &self,
+        job_id: &str,
+        limit: usize,
+    ) -> Result<ScheduleHistoryResponse, RuntimeError> {
+        #[cfg(feature = "cron")]
+        if let Some(ref cron) = self.cron_scheduler {
+            let id: scheduler::cron_types::CronJobId = job_id
+                .parse()
+                .map_err(|_| RuntimeError::Internal(format!("Invalid job ID: {}", job_id)))?;
+            let runs = cron
+                .get_run_history(id, limit)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            return Ok(ScheduleHistoryResponse {
+                job_id: job_id.to_string(),
+                history: runs
+                    .into_iter()
+                    .map(|r| ScheduleRunEntry {
+                        run_id: r.run_id.to_string(),
+                        started_at: r.started_at.to_rfc3339(),
+                        completed_at: r.completed_at.map(|t| t.to_rfc3339()),
+                        status: format!("{:?}", r.status),
+                        error: r.error,
+                        execution_time_ms: r.execution_time_ms,
+                    })
+                    .collect(),
+            });
+        }
+        Err(RuntimeError::Internal(
+            "Schedule API requires a running CronScheduler".to_string(),
+        ))
+    }
+
+    async fn get_schedule_next_runs(
+        &self,
+        job_id: &str,
+        count: usize,
+    ) -> Result<NextRunsResponse, RuntimeError> {
+        #[cfg(feature = "cron")]
+        if let Some(ref cron) = self.cron_scheduler {
+            let id: scheduler::cron_types::CronJobId = job_id
+                .parse()
+                .map_err(|_| RuntimeError::Internal(format!("Invalid job ID: {}", job_id)))?;
+            let job = cron
+                .get_job(id)
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            let runs = cron
+                .get_next_runs(&job.cron_expression, &job.timezone, count)
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            return Ok(NextRunsResponse {
+                job_id: job_id.to_string(),
+                next_runs: runs.into_iter().map(|t| t.to_rfc3339()).collect(),
+            });
+        }
+        Err(RuntimeError::Internal(
+            "Schedule API requires a running CronScheduler".to_string(),
+        ))
+    }
+
+    async fn get_scheduler_health(
+        &self,
+    ) -> Result<api::types::SchedulerHealthResponse, RuntimeError> {
+        #[cfg(feature = "cron")]
+        if let Some(ref cron) = self.cron_scheduler {
+            let h = cron
+                .check_health()
+                .await
+                .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+            let m = cron.metrics();
+            return Ok(api::types::SchedulerHealthResponse {
+                is_running: h.is_running,
+                store_accessible: h.store_accessible,
+                jobs_total: h.jobs_total,
+                jobs_active: h.jobs_active,
+                jobs_paused: h.jobs_paused,
+                jobs_dead_letter: h.jobs_dead_letter,
+                global_active_runs: h.global_active_runs,
+                max_concurrent: h.max_concurrent,
+                runs_total: m.runs_total,
+                runs_succeeded: m.runs_succeeded,
+                runs_failed: m.runs_failed,
+                average_execution_time_ms: m.average_execution_time_ms,
+                longest_run_ms: m.longest_run_ms,
+            });
+        }
+        // No CronScheduler — return a minimal response.
+        Ok(api::types::SchedulerHealthResponse {
+            is_running: false,
+            store_accessible: false,
+            jobs_total: 0,
+            jobs_active: 0,
+            jobs_paused: 0,
+            jobs_dead_letter: 0,
+            global_active_runs: 0,
+            max_concurrent: 0,
+            runs_total: 0,
+            runs_succeeded: 0,
+            runs_failed: 0,
+            average_execution_time_ms: 0.0,
+            longest_run_ms: 0,
+        })
+    }
+
+    // ── Channel endpoints ──────────────────────────────────────────
+
+    async fn list_channels(&self) -> Result<Vec<ChannelSummary>, RuntimeError> {
+        // No ChannelAdapterManager — return empty list so dashboard renders gracefully
+        Ok(vec![])
+    }
+
+    async fn register_channel(
+        &self,
+        _request: RegisterChannelRequest,
+    ) -> Result<RegisterChannelResponse, RuntimeError> {
+        Err(RuntimeError::Internal(
+            "Channel API requires a running ChannelAdapterManager".to_string(),
+        ))
+    }
+
+    async fn get_channel(&self, _id: &str) -> Result<ChannelDetail, RuntimeError> {
+        Err(RuntimeError::Internal(
+            "Channel API requires a running ChannelAdapterManager".to_string(),
+        ))
+    }
+
+    async fn update_channel(
+        &self,
+        _id: &str,
+        _request: UpdateChannelRequest,
+    ) -> Result<ChannelDetail, RuntimeError> {
+        Err(RuntimeError::Internal(
+            "Channel API requires a running ChannelAdapterManager".to_string(),
+        ))
+    }
+
+    async fn delete_channel(&self, _id: &str) -> Result<DeleteChannelResponse, RuntimeError> {
+        Err(RuntimeError::Internal(
+            "Channel API requires a running ChannelAdapterManager".to_string(),
+        ))
+    }
+
+    async fn start_channel(&self, _id: &str) -> Result<ChannelActionResponse, RuntimeError> {
+        Err(RuntimeError::Internal(
+            "Channel API requires a running ChannelAdapterManager".to_string(),
+        ))
+    }
+
+    async fn stop_channel(&self, _id: &str) -> Result<ChannelActionResponse, RuntimeError> {
+        Err(RuntimeError::Internal(
+            "Channel API requires a running ChannelAdapterManager".to_string(),
+        ))
+    }
+
+    async fn get_channel_health(&self, _id: &str) -> Result<ChannelHealthResponse, RuntimeError> {
+        Err(RuntimeError::Internal(
+            "Channel API requires a running ChannelAdapterManager".to_string(),
+        ))
+    }
+
+    async fn list_channel_mappings(
+        &self,
+        _id: &str,
+    ) -> Result<Vec<IdentityMappingEntry>, RuntimeError> {
+        Err(RuntimeError::Internal(
+            "Channel identity mappings require enterprise edition".to_string(),
+        ))
+    }
+
+    async fn add_channel_mapping(
+        &self,
+        _id: &str,
+        _request: AddIdentityMappingRequest,
+    ) -> Result<IdentityMappingEntry, RuntimeError> {
+        Err(RuntimeError::Internal(
+            "Channel identity mappings require enterprise edition".to_string(),
+        ))
+    }
+
+    async fn remove_channel_mapping(&self, _id: &str, _user_id: &str) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Internal(
+            "Channel identity mappings require enterprise edition".to_string(),
+        ))
+    }
+
+    async fn get_channel_audit(
+        &self,
+        _id: &str,
+        _limit: usize,
+    ) -> Result<ChannelAuditResponse, RuntimeError> {
+        Err(RuntimeError::Internal(
+            "Channel audit log requires enterprise edition".to_string(),
+        ))
+    }
+
+    // ── External agent endpoints ─────────────────────────────────────
+
+    async fn update_agent_heartbeat(
+        &self,
+        agent_id: AgentId,
+        heartbeat: api::types::HeartbeatRequest,
+    ) -> Result<(), RuntimeError> {
+        // AP-4: gate external heartbeats on AgentPin when enabled.
+        self.verify_agentpin_for_agent(heartbeat.agentpin_jwt.as_deref(), agent_id)
+            .await?;
+
+        let ext_agents = self.scheduler.external_agents();
+        let mut entry = ext_agents.get_mut(&agent_id).ok_or_else(|| {
+            RuntimeError::Internal(format!("Agent {} is not an external agent", agent_id))
+        })?;
+
+        entry.last_heartbeat = Some(chrono::Utc::now());
+        entry.reported_state = heartbeat.state;
+
+        if let Some(metadata) = heartbeat.metadata {
+            entry.metadata.extend(metadata);
+        }
+        if let Some(last_result) = heartbeat.last_result {
+            entry.last_result = Some(last_result);
         }
 
-        // Return a dummy history with one sample record
-        use uuid::Uuid;
-        
-        let sample_record = AgentExecutionRecord {
-            execution_id: Uuid::new_v4().to_string(),
-            status: "completed".to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        };
+        Ok(())
+    }
 
-        Ok(GetAgentHistoryResponse {
-            history: vec![sample_record],
+    async fn push_agent_event(
+        &self,
+        agent_id: AgentId,
+        event: api::types::PushEventRequest,
+    ) -> Result<(), RuntimeError> {
+        // AP-4: gate external agent events on AgentPin when enabled.
+        self.verify_agentpin_for_agent(event.agentpin_jwt.as_deref(), agent_id)
+            .await?;
+
+        let ext_agents = self.scheduler.external_agents();
+        let mut entry = ext_agents.get_mut(&agent_id).ok_or_else(|| {
+            RuntimeError::Internal(format!("Agent {} is not an external agent", agent_id))
+        })?;
+
+        entry.push_event(api::types::AgentEvent {
+            event_type: event.event_type,
+            payload: event.payload,
+            timestamp: chrono::Utc::now(),
+        });
+
+        Ok(())
+    }
+
+    async fn check_unreachable_agents(&self) {
+        self.scheduler.check_unreachable_agents();
+    }
+
+    async fn send_agent_message(
+        &self,
+        recipient: crate::types::AgentId,
+        request: api::types::SendMessageRequest,
+    ) -> Result<api::types::SendMessageResponse, crate::types::RuntimeError> {
+        // AgentPin identity check (AP-1): reuse the shared helper so
+        // every per-agent ingress path (messaging, heartbeat, push_event)
+        // enforces the same rule.
+        self.verify_agentpin_for_agent(request.agentpin_jwt.as_deref(), request.sender)
+            .await?;
+
+        // Trust-boundary note (H-5 / M-1):
+        // The `request` arrives from an HTTP caller (potentially another
+        // runtime via RemoteCommunicationBus). We deliberately build a fresh
+        // SecureMessage here via `create_internal_message` so it is signed
+        // by THIS bus's Ed25519 key. The local bus then rejects any message
+        // whose signature doesn't verify against its own key (see
+        // DefaultCommunicationBus::verify_message_signature), which means
+        // untrusted wire bytes — including SignatureAlgorithm::None or
+        // EncryptionAlgorithm::None from a remote shim — can never survive
+        // ingress without being re-wrapped here.
+        //
+        // Clamp TTL: bound by the bus's configured `message_ttl` so a caller
+        // cannot pin queued messages beyond operator intent, and by a hard
+        // safety cap so a misconfigured config can't allow forever-TTLs.
+        const MAX_TTL_SECS: u64 = 24 * 3600;
+        const DEFAULT_TTL_SECS: u64 = 300;
+        let requested_secs = request.ttl_seconds.unwrap_or(DEFAULT_TTL_SECS);
+        let configured_secs = self.config.read().await.communication.message_ttl.as_secs();
+        let ttl_secs = requested_secs.min(configured_secs).clamp(1, MAX_TTL_SECS);
+        let ttl = std::time::Duration::from_secs(ttl_secs);
+
+        // Decide message type: topic = publish, otherwise direct
+        if let Some(ref topic) = request.topic {
+            let msg = self.communication.create_internal_message(
+                request.sender,
+                recipient,
+                bytes::Bytes::from(request.payload.into_bytes()),
+                crate::types::communication::MessageType::Publish(topic.clone()),
+                ttl,
+            );
+            let message_id = msg.id;
+            self.communication
+                .publish(topic.clone(), msg)
+                .await
+                .map_err(crate::types::RuntimeError::Communication)?;
+            Ok(api::types::SendMessageResponse {
+                message_id: message_id.0.to_string(),
+                status: "pending".to_string(),
+            })
+        } else {
+            let msg = self.communication.create_internal_message(
+                request.sender,
+                recipient,
+                bytes::Bytes::from(request.payload.into_bytes()),
+                crate::types::communication::MessageType::Direct(recipient),
+                ttl,
+            );
+            let message_id = self
+                .communication
+                .send_message(msg)
+                .await
+                .map_err(crate::types::RuntimeError::Communication)?;
+            Ok(api::types::SendMessageResponse {
+                message_id: message_id.0.to_string(),
+                status: "pending".to_string(),
+            })
+        }
+    }
+
+    async fn receive_agent_messages(
+        &self,
+        agent_id: crate::types::AgentId,
+    ) -> Result<api::types::ReceiveMessagesResponse, crate::types::RuntimeError> {
+        let messages = self
+            .communication
+            .receive_messages(agent_id)
+            .await
+            .map_err(crate::types::RuntimeError::Communication)?;
+
+        let envelopes = messages
+            .into_iter()
+            .map(|m| {
+                let timestamp_secs = m
+                    .timestamp
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d: std::time::Duration| d.as_secs())
+                    .unwrap_or(0);
+                let ttl_seconds = m.ttl.as_secs();
+                let (message_type, topic) = match &m.message_type {
+                    crate::types::communication::MessageType::Direct(_) => {
+                        ("direct".to_string(), None)
+                    }
+                    crate::types::communication::MessageType::Publish(t) => {
+                        ("publish".to_string(), Some(t.clone()))
+                    }
+                    crate::types::communication::MessageType::Subscribe(t) => {
+                        ("subscribe".to_string(), Some(t.clone()))
+                    }
+                    crate::types::communication::MessageType::Broadcast => {
+                        ("broadcast".to_string(), None)
+                    }
+                    crate::types::communication::MessageType::Request(_) => {
+                        ("request".to_string(), None)
+                    }
+                    crate::types::communication::MessageType::Response(_) => {
+                        ("response".to_string(), None)
+                    }
+                };
+                // Payload is encrypted in-flight; for HTTP API return decrypted UTF-8 bytes.
+                // The bus uses AES-256-GCM internally — the HTTP layer treats the payload
+                // as opaque bytes that the receiver should decrypt if needed. For the
+                // default bus (in-process), encryption is symmetric so callers see the
+                // raw bytes they put in.
+                let payload = String::from_utf8_lossy(&m.payload.data).to_string();
+                api::types::MessageEnvelope {
+                    message_id: m.id.0.to_string(),
+                    sender: m.sender,
+                    recipient: m.recipient,
+                    topic,
+                    payload,
+                    message_type,
+                    timestamp_secs,
+                    ttl_seconds,
+                }
+            })
+            .collect();
+
+        Ok(api::types::ReceiveMessagesResponse {
+            messages: envelopes,
+        })
+    }
+
+    async fn get_message_status(
+        &self,
+        message_id: &str,
+    ) -> Result<api::types::MessageStatusResponse, crate::types::RuntimeError> {
+        let uuid = uuid::Uuid::parse_str(message_id).map_err(|_| {
+            crate::types::RuntimeError::Communication(
+                crate::types::CommunicationError::InvalidFormat(format!(
+                    "Invalid message ID: {}",
+                    message_id
+                )),
+            )
+        })?;
+        let mid = crate::types::MessageId(uuid);
+        let status = self
+            .communication
+            .get_delivery_status(mid)
+            .await
+            .map_err(crate::types::RuntimeError::Communication)?;
+        let status_str = match status {
+            crate::communication::DeliveryStatus::Pending => "pending",
+            crate::communication::DeliveryStatus::Delivered => "delivered",
+            crate::communication::DeliveryStatus::Failed => "failed",
+            crate::communication::DeliveryStatus::Expired => "expired",
+        };
+        Ok(api::types::MessageStatusResponse {
+            message_id: message_id.to_string(),
+            status: status_str.to_string(),
         })
     }
 }

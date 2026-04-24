@@ -1,0 +1,75 @@
+[licenses]
+# List of explicitly allowed licenses
+# SPDX 2.1 license list - https://spdx.org/licenses/
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause", 
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "0BSD",
+]
+
+# List of explicitly disallowed licenses
+deny = []
+
+# Lint level for when multiple versions of the same license requirements are detected
+multiple-versions = "warn"
+# Lint level for when a crate version requirement is '*'
+wildcards = "allow"
+# The confidence threshold for detecting a license from a license text.
+# Possible values are any number between 0.0 and 1.0.
+confidence-threshold = 0.8
+# Allow 1 or more licenses on a per-crate basis, so that particular licenses
+# aren't accepted for every possible crate as with the normal allow list
+exceptions = []
+
+[bans]
+# Lint level for when multiple versions of the same crate are detected
+multiple-versions = "warn"
+# Lint level for when a crate version requirement is '*'
+wildcards = "allow"
+# Fail the build if any of these known-bad transitive versions ever come back
+# via a dep bump. lz4_flex 0.11.5 / 0.12.0 were yanked under RUSTSEC-2026-0041;
+# we bumped past them and want to stay there.
+deny = [
+    { name = "lz4_flex", version = "=0.11.5" },
+    { name = "lz4_flex", version = "=0.12.0" },
+]
+skip = []
+skip-tree = []
+
+[advisories]
+# The path where the advisory database is cloned/fetched into
+db-path = "~/.cargo/advisory-db"
+# The url(s) of the advisory databases to use
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Ignored advisories are still reported as an info line but don't fail CI.
+# Each entry must carry a justification + a revisit trigger in a comment.
+ignore = [
+    # RSA Marvin Attack — timing side-channel on PKCS#1 v1.5 decryption.
+    # Pulled in transitively via `vaultrs` (secret-store backend). Upstream
+    # `rsa` crate has no fixed release yet; tracking
+    # https://rustsec.org/advisories/RUSTSEC-2023-0071 .
+    # Exposure only materialises when the operator configures Vault auth
+    # paths that decrypt RSA-PKCS1v1.5 ciphertexts; default deployments do
+    # not. Revisit when `rsa` cuts a fixed release.
+    "RUSTSEC-2023-0071",
+]
+
+[sources]
+# Lint level for what to happen when a crate from a crate registry that is
+# not in the allow list is encountered
+unknown-registry = "warn"
+# Lint level for what to happen when a crate from a git repository that is not
+# in the allow list is encountered
+unknown-git = "warn"
+# List of URLs for allowed crate registries. Defaults to the crates.io index
+# if not specified. If it is specified but empty, no registries are allowed.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# List of URLs for allowed Git repositories
+allow-git = []

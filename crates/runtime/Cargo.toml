@@ -1,10 +1,10 @@
 [package]
 name = "symbi-runtime"
-version = "0.1.2"
+version = "1.10.0"
 edition = "2021"
 authors = ["Jascha Wanger / ThirdKey.ai"]
 description = "Agent Runtime System for the Symbi platform"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/thirdkeyai/symbiont"
 keywords = ["agent", "runtime", "ai", "symbiont", "automation"]
 categories = ["development-tools", "api-bindings"]
@@ -21,7 +21,13 @@ path = "examples/full_system.rs"
 [[bin]]
 name = "symbi-mcp"
 path = "src/bin/symbiont_mcp.rs"
+
+[[bin]]
+name = "symbi-eval"
+path = "src/bin/symbi_eval.rs"
+required-features = ["cloud-llm"]
 [dependencies]
+symbi-dsl = { path = "../dsl", version = "1.10.0" }
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -32,10 +38,11 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 async-trait = "0.1"
+arc-swap = "1"
 dashmap = "5.0"
 parking_lot = "0.12"
 crossbeam = "0.8"
-ed25519-dalek = { version = "1.0", features = ["serde"] }
+ed25519-dalek = { version = "2.1", features = ["serde"] }
 aes-gcm = "0.10"
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
@@ -43,58 +50,116 @@ dirs = "5.0"
 futures = "0.3"
 bytes = { version = "1.0", features = ["serde"] }
 tempfile = "3.0"
-qdrant-client = "1.14.0"
+# Vector backends (all optional)
+lancedb = { version = "0.26", optional = true }
+arrow-array = { version = "57", optional = true }
+arrow-schema = { version = "57", optional = true }
+qdrant-client = { version = ">=1.14.0, <1.16.0", optional = true }
 flate2 = "1.0"
-candle-core = { version = "0.3", optional = true }
-candle-nn = { version = "0.3", optional = true }
-candle-transformers = { version = "0.3", optional = true }
+candle-core = { version = "0.9.1", optional = true }
+candle-nn = { version = "0.9.1", optional = true }
+candle-transformers = { version = "0.9.1", optional = true }
 tokenizers = { version = "0.15", optional = true }
+tiktoken-rs = "0.6"
 hf-hub = { version = "0.3", optional = true }
+cron = { version = "0.15", optional = true }
+chrono-tz = { version = "0.10", optional = true }
+rusqlite = { version = "0.31", features = ["bundled", "serde_json"], optional = true }
 regex = "1.0"
+humantime-serde = "1.1"
 clap = { version = "4.0", features = ["derive"] }
-reqwest = { version = "0.11", features = ["json"] }
-git2 = "0.18"
-octocrab = "0.34"
+reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }
+git2 = "0.20"
+octocrab = "0.49"
 toml = "0.8"
 url = "2.4"
 base64 = "0.21"
-base64ct = "=1.6.0"  # Force exact compatible version that doesn't require edition2024
-schemapin = "1.1.4"
+base64ct = "1"
+schemapin = "1.3.0"
+agentpin = { version = "0.2.0", features = ["fetch"] }
+jsonschema = "0.28"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 argon2 = "0.5"
+subtle = "2.5"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
 vaultrs = "0.7"
+sysinfo = "0.30"
+rlimit = { version = "0.10", optional = true }
+libc = { version = "0.2", optional = true }
+dotenvy = "0.15"
+fd-lock = "4.0"
+pty-process = { version = "0.4", optional = true }
 # OS keychain access dependencies
 keyring = { version = "2.0", optional = true }
-security-framework = { version = "2.9", optional = true }
-secret-service = { version = "3.0", optional = true }
-winapi = { version = "0.3", features = ["wincred"], optional = true }
+
+# Static OpenSSL linking for release binaries
+openssl = { version = "0.10", features = ["vendored"], optional = true }
+
+# Cedar policy engine (optional)
+cedar-policy = { version = "4", optional = true }
 
 # HTTP API dependencies (optional)
-axum = { version = "0.7", optional = true }
+axum = { version = "0.7", features = ["ws"], optional = true }
 tower = { version = "0.4", optional = true }
 tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
+jsonwebtoken = { version = "10", optional = true }
 tokio-tungstenite = { version = "0.21", optional = true }
+governor = { version = "0.10", optional = true }
+utoipa = { version = "4.2", features = ["axum_extras", "chrono"], optional = true }
+utoipa-swagger-ui = { version = "6.0", features = ["axum"], optional = true }
+
+# Metrics/telemetry dependencies (optional)
+opentelemetry = { version = "0.31", optional = true }
+opentelemetry_sdk = { version = "0.31", features = ["metrics"], optional = true }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["metrics", "grpc-tonic", "http-proto", "http-json"], optional = true }
 
 # Enterprise features removed for OSS build
 
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.0"
-criterion = "0.5"
+criterion = { version = "0.5", features = ["async_tokio"] }
+serial_test = "3.0"
+filetime = "0.2"
 
 [features]
-default = ["vector-db", "keychain"]
-vector-db = []
+default = ["keychain", "vector-lancedb"]
+vector-lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
+vector-qdrant = ["dep:qdrant-client"]
 embedding-models = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
-http-api = ["axum", "tower", "tower-http", "tokio-tungstenite"]
-http-input = ["axum", "tower", "tower-http"]
-keychain = ["keyring", "security-framework", "secret-service", "winapi"]
-enterprise = []  # Enterprise feature for conditional compilation
-full = ["vector-db", "embedding-models", "http-api", "http-input", "keychain"]
-minimal = ["vector-db"]  # Minimal build for faster CI
+http-api = ["axum", "tower", "tower-http", "tokio-tungstenite", "governor", "utoipa", "utoipa-swagger-ui"]
+http-input = ["axum", "tower", "tower-http", "dep:jsonwebtoken"]
+keychain = ["keyring"]
+cron = ["dep:cron", "dep:chrono-tz", "dep:rusqlite"]
+native-sandbox = ["rlimit", "libc"]
+cli-executor = ["libc"]
+toolclad-session = ["dep:pty-process"]
+metrics = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+cedar = ["dep:cedar-policy"]  # Cedar policy engine for formal authorization
+composio = []  # Composio MCP integration — uses reqwest (already required) for SSE
+orga-adaptive = []  # Advanced reasoning loop primitives (tool curation, stuck-loop detection, pre-hydration, scoped conventions)
+cloud-llm = ["http-input"]  # Cloud LLM inference (Anthropic, OpenAI) — gates CloudInferenceProvider
+standalone-agent = ["cloud-llm", "composio"]  # One-liner for standalone cloud agents
+enterprise = []  # Enterprise sandbox variants (gVisor, Firecracker)
+enterprise-compaction = []  # Enterprise compaction tiers (Tier 2: semantic, Tier 3: vector)
+vendored-openssl = ["openssl"]
+full = ["vector-lancedb", "vector-qdrant", "embedding-models", "http-api", "http-input", "keychain", "cron", "metrics", "composio", "cedar", "cloud-llm", "toolclad-session"]
+minimal = []  # Minimal build for faster CI
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "2.9", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "3.0", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "0.3", features = ["wincred"], optional = true }
+
+[[bench]]
+name = "performance_claims"
+harness = false
 
 [lib]
 name = "symbi_runtime"

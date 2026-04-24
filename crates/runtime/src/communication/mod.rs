@@ -2,6 +2,11 @@
 //!
 //! Secure messaging system for inter-agent communication
 
+pub mod policy_gate;
+pub mod remote;
+
+pub use remote::RemoteCommunicationBus;
+
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -10,7 +15,11 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::{interval, timeout};
 
+use crate::crypto::Aes256GcmCrypto;
 use crate::types::*;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use rand::rngs::OsRng;
+use rand::RngCore;
 
 /// Communication bus trait
 #[async_trait]
@@ -60,6 +69,19 @@ pub trait CommunicationBus {
 
     /// Shutdown the communication bus
     async fn shutdown(&self) -> Result<(), CommunicationError>;
+
+    /// Check the health of the communication bus
+    async fn check_health(&self) -> Result<ComponentHealth, CommunicationError>;
+
+    /// Create a properly signed internal message with real crypto
+    fn create_internal_message(
+        &self,
+        sender: AgentId,
+        recipient: AgentId,
+        payload_data: bytes::Bytes,
+        message_type: MessageType,
+        ttl: std::time::Duration,
+    ) -> SecureMessage;
 }
 
 /// Communication bus configuration
@@ -101,6 +123,11 @@ pub struct DefaultCommunicationBus {
     event_sender: mpsc::UnboundedSender<CommunicationEvent>,
     shutdown_notify: Arc<Notify>,
     is_running: Arc<RwLock<bool>>,
+    signing_key: SigningKey,
+    verifying_key: VerifyingKey,
+    system_agent_id: AgentId,
+    #[allow(dead_code)]
+    crypto: Aes256GcmCrypto,
 }
 
 impl DefaultCommunicationBus {
@@ -117,6 +144,17 @@ impl DefaultCommunicationBus {
         let shutdown_notify = Arc::new(Notify::new());
         let is_running = Arc::new(RwLock::new(true));
 
+        // Generate cryptographic keys for the communication bus
+        let mut secret_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut secret_bytes);
+        let signing_key = SigningKey::from_bytes(&secret_bytes);
+        let verifying_key = signing_key.verifying_key();
+
+        // Create a system agent ID for the communication bus
+        let system_agent_id = AgentId::new();
+
+        let crypto = Aes256GcmCrypto::new();
+
         let bus = Self {
             config,
             message_queues,
@@ -127,6 +165,10 @@ impl DefaultCommunicationBus {
             event_sender,
             shutdown_notify,
             is_running,
+            signing_key,
+            verifying_key,
+            system_agent_id,
+            crypto,
         };
 
         // Start background tasks
@@ -224,25 +266,30 @@ impl DefaultCommunicationBus {
                     if let Some(sender) = pending_requests.write().remove(request_id) {
                         // Send response payload to waiting request
                         let _ = sender.send(message.payload.data.clone());
-                        tracing::debug!("Response {} sent for request {:?}", message_id, request_id);
+                        tracing::debug!(
+                            "Response {} sent for request {:?}",
+                            message_id,
+                            request_id
+                        );
                         return;
                     }
                 }
 
-                // Add to message tracker
-                message_tracker
-                    .write()
-                    .insert(message_id, MessageTracker::new(message.clone()));
+                // Acquire all locks once in consistent order to prevent deadlocks:
+                // message_tracker → message_queues → dead_letter_queue
+                let mut tracker_map = message_tracker.write();
+                let mut queues = message_queues.write();
+
+                tracker_map.insert(message_id, MessageTracker::new(message.clone()));
 
                 // Try to deliver the message
-                let mut queues = message_queues.write();
                 if let Some(recipient_id) = recipient {
                     if let Some(queue) = queues.get_mut(&recipient_id) {
                         if queue.can_accept_message(config) {
                             queue.add_message(message);
 
                             // Update delivery status
-                            if let Some(tracker) = message_tracker.write().get_mut(&message_id) {
+                            if let Some(tracker) = tracker_map.get_mut(&message_id) {
                                 tracker.status = DeliveryStatus::Delivered;
                                 tracker.delivered_at = Some(SystemTime::now());
                             }
@@ -258,7 +305,7 @@ impl DefaultCommunicationBus {
                                 .write()
                                 .add_message(message, DeadLetterReason::QueueFull);
 
-                            if let Some(tracker) = message_tracker.write().get_mut(&message_id) {
+                            if let Some(tracker) = tracker_map.get_mut(&message_id) {
                                 tracker.status = DeliveryStatus::Failed;
                                 tracker.failure_reason = Some("Queue full".to_string());
                             }
@@ -275,7 +322,7 @@ impl DefaultCommunicationBus {
                             .write()
                             .add_message(message, DeadLetterReason::AgentNotFound);
 
-                        if let Some(tracker) = message_tracker.write().get_mut(&message_id) {
+                        if let Some(tracker) = tracker_map.get_mut(&message_id) {
                             tracker.status = DeliveryStatus::Failed;
                             tracker.failure_reason = Some("Agent not registered".to_string());
                         }
@@ -442,8 +489,93 @@ impl DefaultCommunicationBus {
         self.event_sender
             .send(event)
             .map_err(|_| CommunicationError::EventProcessingFailed {
-                reason: "Failed to send communication event".to_string(),
+                reason: "Failed to send communication event".into(),
             })
+    }
+
+    /// Generate a proper nonce for encryption
+    fn generate_nonce() -> Vec<u8> {
+        use aes_gcm::{aead::AeadCore, Aes256Gcm};
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        nonce.to_vec()
+    }
+
+    /// Sign message data using Ed25519
+    fn sign_message_data(&self, data: &[u8]) -> MessageSignature {
+        use ed25519_dalek::Signer;
+
+        let signature = self.signing_key.sign(data);
+        MessageSignature {
+            signature: signature.to_bytes().to_vec(),
+            algorithm: SignatureAlgorithm::Ed25519,
+            public_key: self.verifying_key.to_bytes().to_vec(),
+        }
+    }
+
+    /// Verify a message's Ed25519 signature using THIS bus's verifying key.
+    ///
+    /// The wire's `signature.public_key` is **ignored on purpose** — accepting
+    /// it would let a tamperer mint a new keypair, re-sign a modified message,
+    /// and pass verification. The local bus only trusts its own key; any
+    /// cross-instance ingress must be re-wrapped (re-signed) by the HTTP
+    /// handler before being enqueued.
+    fn verify_message_signature(&self, message: &SecureMessage) -> Result<(), CommunicationError> {
+        use ed25519_dalek::{Signature, Verifier};
+
+        if !matches!(message.signature.algorithm, SignatureAlgorithm::Ed25519) {
+            return Err(CommunicationError::SignatureInvalid {
+                message_id: message.id,
+                reason: format!(
+                    "unsupported signature algorithm {:?}",
+                    message.signature.algorithm
+                )
+                .into_boxed_str(),
+            });
+        }
+
+        let sig_bytes: &[u8; 64] =
+            message
+                .signature
+                .signature
+                .as_slice()
+                .try_into()
+                .map_err(|_| CommunicationError::SignatureInvalid {
+                    message_id: message.id,
+                    reason: format!(
+                        "malformed signature length: expected 64, got {}",
+                        message.signature.signature.len()
+                    )
+                    .into_boxed_str(),
+                })?;
+        let signature = Signature::from_bytes(sig_bytes);
+        let data = [
+            message.payload.data.as_ref(),
+            message.payload.nonce.as_slice(),
+        ]
+        .concat();
+        self.verifying_key.verify(&data, &signature).map_err(|e| {
+            CommunicationError::SignatureInvalid {
+                message_id: message.id,
+                reason: format!("verification failed: {}", e).into_boxed_str(),
+            }
+        })
+    }
+
+    /// Create a properly signed and encrypted message for requests
+    fn create_secure_request_message(
+        &self,
+        target_agent: AgentId,
+        request_id: RequestId,
+        request_payload: bytes::Bytes,
+        timeout_duration: Duration,
+    ) -> Result<SecureMessage, CommunicationError> {
+        Ok(self.create_internal_message(
+            self.system_agent_id,
+            target_agent,
+            request_payload,
+            MessageType::Request(request_id),
+            timeout_duration,
+        ))
     }
 }
 
@@ -461,6 +593,12 @@ impl CommunicationBus for DefaultCommunicationBus {
                 max_size: self.config.max_message_size,
             });
         }
+
+        // Reject messages not signed by THIS bus. Legitimate callers
+        // construct messages via `create_internal_message` which signs with
+        // the bus key; anything else is either forged or came from a
+        // cross-instance path that failed to re-wrap before enqueueing.
+        self.verify_message_signature(&message)?;
 
         let message_id = message.id;
 
@@ -518,6 +656,20 @@ impl CommunicationBus for DefaultCommunicationBus {
             return Err(CommunicationError::ShuttingDown);
         }
 
+        // Match send_message: reject oversized payloads before fan-out so
+        // attackers cannot use publish() as a byte-multiplier against every
+        // subscriber's inbox.
+        if message.payload.data.len() > self.config.max_message_size {
+            return Err(CommunicationError::MessageTooLarge {
+                size: message.payload.data.len(),
+                max_size: self.config.max_message_size,
+            });
+        }
+
+        // Same invariant as send_message: only bus-signed messages can reach
+        // subscriber queues.
+        self.verify_message_signature(&message)?;
+
         self.send_event(CommunicationEvent::TopicPublished { topic, message })?;
         Ok(())
     }
@@ -558,28 +710,17 @@ impl CommunicationBus for DefaultCommunicationBus {
         let (response_sender, response_receiver) = oneshot::channel();
 
         // Store the response sender
-        self.pending_requests.write().insert(request_id, response_sender);
+        self.pending_requests
+            .write()
+            .insert(request_id, response_sender);
 
-        // Create request message
-        let request_message = SecureMessage {
-            id: MessageId::new(),
-            sender: AgentId::new(), // TODO: Should be the actual sender agent ID
-            recipient: Some(target_agent),
-            topic: None,
-            message_type: MessageType::Request(request_id),
-            payload: EncryptedPayload {
-                data: request_payload,
-                nonce: vec![0u8; 12], // TODO: Generate proper nonce
-                encryption_algorithm: EncryptionAlgorithm::Aes256Gcm,
-            },
-            signature: MessageSignature {
-                signature: vec![0u8; 64], // TODO: Generate proper signature
-                algorithm: SignatureAlgorithm::Ed25519,
-                public_key: vec![0u8; 32], // TODO: Use proper public key
-            },
-            ttl: timeout_duration,
-            timestamp: SystemTime::now(),
-        };
+        // Create request message with proper security
+        let request_message = self.create_secure_request_message(
+            target_agent,
+            request_id,
+            request_payload,
+            timeout_duration,
+        )?;
 
         // Send the request
         self.send_message(request_message).await?;
@@ -623,6 +764,97 @@ impl CommunicationBus for DefaultCommunicationBus {
         }
 
         Ok(())
+    }
+
+    async fn check_health(&self) -> Result<ComponentHealth, CommunicationError> {
+        let is_running = *self.is_running.read();
+        if !is_running {
+            return Ok(ComponentHealth::unhealthy(
+                "Communication bus is shut down".to_string(),
+            ));
+        }
+
+        let queue_count = self.message_queues.read().len();
+        let topic_count = self.subscriptions.read().len();
+        let tracker_count = self.message_tracker.read().len();
+        let pending_requests = self.pending_requests.read().len();
+
+        // Check for potential issues
+        let mut total_queued_messages = 0;
+        let mut full_queues = 0;
+
+        {
+            let queues = self.message_queues.read();
+            for queue in queues.values() {
+                total_queued_messages += queue.messages.len();
+                if queue.messages.len() >= self.config.max_queue_size * 9 / 10 {
+                    // 90% full
+                    full_queues += 1;
+                }
+            }
+        }
+
+        let dead_letter_count = self.dead_letter_queue.read().messages.len();
+
+        let status = if dead_letter_count > 100 {
+            ComponentHealth::degraded(format!(
+                "High dead letter queue: {} messages",
+                dead_letter_count
+            ))
+        } else if full_queues > 0 {
+            ComponentHealth::degraded(format!("{} message queues near capacity", full_queues))
+        } else if pending_requests > 50 {
+            ComponentHealth::degraded(format!("Many pending requests: {}", pending_requests))
+        } else {
+            ComponentHealth::healthy(Some(format!(
+                "{} agents registered, {} active topics",
+                queue_count, topic_count
+            )))
+        };
+
+        Ok(status
+            .with_metric("registered_agents".to_string(), queue_count.to_string())
+            .with_metric("active_topics".to_string(), topic_count.to_string())
+            .with_metric(
+                "queued_messages".to_string(),
+                total_queued_messages.to_string(),
+            )
+            .with_metric("pending_requests".to_string(), pending_requests.to_string())
+            .with_metric("dead_letters".to_string(), dead_letter_count.to_string())
+            .with_metric("message_trackers".to_string(), tracker_count.to_string()))
+    }
+
+    fn create_internal_message(
+        &self,
+        sender: AgentId,
+        recipient: AgentId,
+        payload_data: bytes::Bytes,
+        message_type: MessageType,
+        ttl: Duration,
+    ) -> SecureMessage {
+        let nonce = Self::generate_nonce();
+
+        let payload = EncryptedPayload {
+            data: payload_data,
+            nonce,
+            encryption_algorithm: EncryptionAlgorithm::Aes256Gcm,
+        };
+
+        // Sign the payload data concatenated with the nonce
+        let message_data_to_sign = [payload.data.as_ref(), &payload.nonce].concat();
+        let signature = self.sign_message_data(&message_data_to_sign);
+
+        SecureMessage {
+            id: MessageId::new(),
+            sender,
+            recipient: Some(recipient),
+            topic: None,
+            message_type,
+            payload,
+            signature,
+            ttl,
+            timestamp: SystemTime::now(),
+        }
     }
 }
 
@@ -758,6 +990,20 @@ mod tests {
 
     fn create_test_message(sender: AgentId, recipient: AgentId) -> SecureMessage {
         use crate::types::RequestId;
+        use aes_gcm::{aead::AeadCore, Aes256Gcm};
+        use ed25519_dalek::Signer;
+
+        let mut secret_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut secret_bytes);
+        let signing_key = SigningKey::from_bytes(&secret_bytes);
+        let verifying_key = signing_key.verifying_key();
+
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng).to_vec();
+        let data: bytes::Bytes = b"test message".to_vec().into();
+
+        let message_data_to_sign = [data.as_ref(), &nonce].concat();
+        let signature = signing_key.sign(&message_data_to_sign);
+
         SecureMessage {
             id: MessageId::new(),
             sender,
@@ -765,14 +1011,14 @@ mod tests {
             message_type: MessageType::Request(RequestId::new()),
             topic: Some("test".to_string()),
             payload: EncryptedPayload {
-                data: b"test message".to_vec().into(),
-                nonce: [0u8; 12].to_vec(),
+                data,
+                nonce,
                 encryption_algorithm: EncryptionAlgorithm::Aes256Gcm,
             },
             signature: MessageSignature {
-                signature: vec![0u8; 64],
+                signature: signature.to_bytes().to_vec(),
                 algorithm: SignatureAlgorithm::Ed25519,
-                public_key: vec![0u8; 32],
+                public_key: verifying_key.to_bytes().to_vec(),
             },
             ttl: Duration::from_secs(3600),
             timestamp: SystemTime::now(),
@@ -811,8 +1057,14 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Send a message
-        let message = create_test_message(sender, recipient);
+        // Send a message — build via the bus so it's properly signed.
+        let message = bus.create_internal_message(
+            sender,
+            recipient,
+            bytes::Bytes::from_static(b"test message"),
+            MessageType::Request(crate::types::RequestId::new()),
+            Duration::from_secs(60),
+        );
         let message_id = bus.send_message(message).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -848,8 +1100,14 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Publish a message
-        let message = create_test_message(publisher, AgentId::new()); // Recipient will be overridden
+        // Publish a message (recipient overridden during fan-out).
+        let message = bus.create_internal_message(
+            publisher,
+            AgentId::new(),
+            bytes::Bytes::from_static(b"test message"),
+            MessageType::Publish(topic.clone()),
+            Duration::from_secs(60),
+        );
         bus.publish(topic, message).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -878,8 +1136,15 @@ mod tests {
         bus.register_agent(sender).await.unwrap();
         bus.register_agent(recipient).await.unwrap();
 
-        // Create a message that's too large
-        let mut message = create_test_message(sender, recipient);
+        // Create a message that's too large — sign via the bus so we can
+        // reach the size check (size check runs before signature check).
+        let mut message = bus.create_internal_message(
+            sender,
+            recipient,
+            bytes::Bytes::from_static(b"placeholder"),
+            MessageType::Request(crate::types::RequestId::new()),
+            Duration::from_secs(60),
+        );
         message.payload.data = vec![0u8; 200].into(); // Larger than limit
 
         let result = bus.send_message(message).await;
@@ -891,6 +1156,101 @@ mod tests {
         } else {
             panic!("Expected MessageTooLarge error");
         }
+    }
+
+    #[tokio::test]
+    async fn test_send_rejects_foreign_signature() {
+        // A message signed by a key that is not the bus's own key must be
+        // rejected by both send_message and publish, even if the algorithm
+        // is Ed25519 and the payload passes all other checks.
+        let bus = DefaultCommunicationBus::new(CommunicationConfig::default())
+            .await
+            .unwrap();
+        let sender = AgentId::new();
+        let recipient = AgentId::new();
+        bus.register_agent(sender).await.unwrap();
+        bus.register_agent(recipient).await.unwrap();
+
+        let foreign = create_test_message(sender, recipient);
+        let err = bus.send_message(foreign.clone()).await.unwrap_err();
+        assert!(
+            matches!(err, CommunicationError::SignatureInvalid { .. }),
+            "expected SignatureInvalid, got {:?}",
+            err
+        );
+
+        let err = bus.publish("t".to_string(), foreign).await.unwrap_err();
+        assert!(matches!(err, CommunicationError::SignatureInvalid { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_cross_bus_message_requires_rewrap() {
+        // Simulate two runtimes: bus A signs a message with its own key;
+        // bus B must refuse that message and only accept it after re-wrapping.
+        let bus_a = DefaultCommunicationBus::new(CommunicationConfig::default())
+            .await
+            .unwrap();
+        let bus_b = DefaultCommunicationBus::new(CommunicationConfig::default())
+            .await
+            .unwrap();
+
+        let sender = AgentId::new();
+        let recipient = AgentId::new();
+        bus_b.register_agent(recipient).await.unwrap();
+
+        // bus_a signs.
+        let a_signed = bus_a.create_internal_message(
+            sender,
+            recipient,
+            bytes::Bytes::from_static(b"hello"),
+            MessageType::Direct(recipient),
+            Duration::from_secs(60),
+        );
+
+        // bus_b rejects — different key.
+        let err = bus_b.send_message(a_signed.clone()).await.unwrap_err();
+        assert!(
+            matches!(err, CommunicationError::SignatureInvalid { .. }),
+            "cross-bus message must be refused without re-wrap, got {:?}",
+            err
+        );
+
+        // Re-wrap via bus_b (what AgentRuntime::send_agent_message does
+        // on HTTP ingress).
+        let b_signed = bus_b.create_internal_message(
+            a_signed.sender,
+            recipient,
+            a_signed.payload.data.clone(),
+            MessageType::Direct(recipient),
+            Duration::from_secs(60),
+        );
+        bus_b
+            .send_message(b_signed)
+            .await
+            .expect("re-wrapped message must be accepted");
+    }
+
+    #[tokio::test]
+    async fn test_send_rejects_none_signature_algorithm() {
+        let bus = DefaultCommunicationBus::new(CommunicationConfig::default())
+            .await
+            .unwrap();
+        let sender = AgentId::new();
+        let recipient = AgentId::new();
+        bus.register_agent(sender).await.unwrap();
+        bus.register_agent(recipient).await.unwrap();
+
+        let mut msg = bus.create_internal_message(
+            sender,
+            recipient,
+            bytes::Bytes::from_static(b"x"),
+            MessageType::Direct(recipient),
+            Duration::from_secs(60),
+        );
+        msg.signature.algorithm = SignatureAlgorithm::None;
+        msg.signature.signature.clear();
+        let err = bus.send_message(msg).await.unwrap_err();
+        assert!(matches!(err, CommunicationError::SignatureInvalid { .. }));
     }
 
     #[tokio::test]
@@ -930,7 +1290,11 @@ mod tests {
         let result = bus.request(target_agent, request_payload, timeout).await;
         assert!(result.is_err());
 
-        if let Err(CommunicationError::RequestTimeout { request_id: _, timeout: actual_timeout }) = result {
+        if let Err(CommunicationError::RequestTimeout {
+            request_id: _,
+            timeout: actual_timeout,
+        }) = result
+        {
             assert_eq!(actual_timeout, timeout);
         } else {
             panic!("Expected RequestTimeout error");
@@ -957,7 +1321,9 @@ mod tests {
         let bus_clone = Arc::new(bus);
         let request_bus = bus_clone.clone();
         let request_handle = tokio::spawn(async move {
-            request_bus.request(responder, request_payload, Duration::from_secs(5)).await
+            request_bus
+                .request(responder, request_payload, Duration::from_secs(5))
+                .await
         });
 
         // Give request time to be sent
@@ -968,27 +1334,15 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(matches!(messages[0].message_type, MessageType::Request(_)));
 
-        // Extract request ID and send response
+        // Extract request ID and send response using create_internal_message
         if let MessageType::Request(request_id) = &messages[0].message_type {
-            let response_message = SecureMessage {
-                id: MessageId::new(),
-                sender: responder,
-                recipient: Some(requester),
-                topic: None,
-                message_type: MessageType::Response(*request_id),
-                payload: EncryptedPayload {
-                    data: response_payload.clone(),
-                    nonce: vec![0u8; 12],
-                    encryption_algorithm: EncryptionAlgorithm::Aes256Gcm,
-                },
-                signature: MessageSignature {
-                    signature: vec![0u8; 64],
-                    algorithm: SignatureAlgorithm::Ed25519,
-                    public_key: vec![0u8; 32],
-                },
-                ttl: Duration::from_secs(3600),
-                timestamp: SystemTime::now(),
-            };
+            let response_message = bus_clone.create_internal_message(
+                responder,
+                requester,
+                response_payload.clone(),
+                MessageType::Response(*request_id),
+                Duration::from_secs(3600),
+            );
 
             bus_clone.send_message(response_message).await.unwrap();
         }

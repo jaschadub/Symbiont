@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use schemapin::crypto::{calculate_key_id, generate_key_pair, sign_data};
+use schemapin::crypto::{calculate_key_id, generate_key_pair, sign_data, verify_signature};
 use sha2::Digest;
 
 use super::types::{
@@ -38,13 +38,64 @@ impl NativeSchemaPinClient {
         Self {}
     }
 
-    /// Fetch public key from URL and return PEM format
+    /// Fetch public key from URL and return PEM format.
+    ///
+    /// Hardening:
+    /// - URL must pass [`crate::net_guard::reject_ssrf_url`] (no private IPs,
+    ///   loopback, link-local, or cloud-metadata hosts, no non-http(s) schemes).
+    /// - Plaintext HTTP is refused unless
+    ///   `SYMBIONT_SCHEMAPIN_ALLOW_INSECURE=1` is explicitly set — the fetched
+    ///   bytes become the trust anchor for schema signatures, so a MITM here
+    ///   silently breaks verification for every subsequent schema.
+    /// - Per-request 10 s timeout; response body capped at 64 KiB to stop a
+    ///   hostile keyserver from filling memory.
+    ///
+    /// Supports two response formats:
+    /// - Raw PEM: response body is the PEM-encoded public key directly
+    /// - SchemaPin discovery JSON: response is a JSON object with a `public_key_pem` field
+    ///   (e.g., from `/.well-known/schemapin.json`)
     async fn fetch_public_key(&self, public_key_url: &str) -> Result<String, SchemaPinError> {
-        let response = reqwest::get(public_key_url)
-            .await
+        use futures::StreamExt;
+
+        crate::net_guard::reject_ssrf_url(public_key_url).map_err(|reason| {
+            SchemaPinError::IoError {
+                reason: format!(
+                    "Refusing to fetch public key from {}: {}",
+                    public_key_url, reason
+                ),
+            }
+        })?;
+
+        let allow_insecure = std::env::var("SYMBIONT_SCHEMAPIN_ALLOW_INSECURE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if public_key_url.starts_with("http://") && !allow_insecure {
+            return Err(SchemaPinError::IoError {
+                reason: format!(
+                    "Refusing plaintext HTTP for public key fetch ({}); set \
+                     SYMBIONT_SCHEMAPIN_ALLOW_INSECURE=1 only for local testing",
+                    public_key_url
+                ),
+            });
+        }
+
+        // Use the SSRF-safe factory: custom DNS resolver refuses to return
+        // private/loopback IPs, and redirects are disabled so a trusted
+        // origin cannot bounce us to `http://10.0.0.1/` after the lexical
+        // check above.
+        let client = crate::net_guard::build_ssrf_safe_client(std::time::Duration::from_secs(10))
             .map_err(|e| SchemaPinError::IoError {
-                reason: format!("Failed to fetch public key from {}: {}", public_key_url, e),
-            })?;
+            reason: format!("Failed to build HTTP client: {}", e),
+        })?;
+
+        let response =
+            client
+                .get(public_key_url)
+                .send()
+                .await
+                .map_err(|e| SchemaPinError::IoError {
+                    reason: format!("Failed to fetch public key from {}: {}", public_key_url, e),
+                })?;
 
         if !response.status().is_success() {
             return Err(SchemaPinError::IoError {
@@ -52,11 +103,48 @@ impl NativeSchemaPinClient {
             });
         }
 
-        let public_key_pem = response.text().await.map_err(|e| SchemaPinError::IoError {
-            reason: format!("Failed to read public key response: {}", e),
+        // Stream the body with a hard cap so we can't be DoS'd by a huge
+        // response. 64 KiB is two orders of magnitude larger than any
+        // realistic PEM or JSON-wrapped key.
+        const MAX_KEY_BODY_BYTES: usize = 64 * 1024;
+        let mut stream = response.bytes_stream();
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| SchemaPinError::IoError {
+                reason: format!("Failed to read public key response: {}", e),
+            })?;
+            if buf.len() + chunk.len() > MAX_KEY_BODY_BYTES {
+                return Err(SchemaPinError::IoError {
+                    reason: format!(
+                        "Public key response from {} exceeded {} bytes",
+                        public_key_url, MAX_KEY_BODY_BYTES
+                    ),
+                });
+            }
+            buf.extend_from_slice(&chunk);
+        }
+
+        let body = String::from_utf8(buf).map_err(|e| SchemaPinError::IoError {
+            reason: format!("Public key response was not valid UTF-8: {}", e),
         })?;
 
-        Ok(public_key_pem)
+        // If the response looks like JSON, extract the public_key_pem field
+        let trimmed = body.trim();
+        if trimmed.starts_with('{') {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Some(pem) = json.get("public_key_pem").and_then(|v| v.as_str()) {
+                    return Ok(pem.to_string());
+                }
+                return Err(SchemaPinError::IoError {
+                    reason: format!(
+                        "JSON response from {} does not contain a 'public_key_pem' field",
+                        public_key_url
+                    ),
+                });
+            }
+        }
+
+        Ok(body)
     }
 
     /// Read file contents from filesystem
@@ -111,32 +199,119 @@ impl SchemaPinClient for NativeSchemaPinClient {
             reason: format!("Failed to calculate key ID: {}", e),
         })?;
 
-        // For basic verification, we assume the schema data itself is what we verify
-        // In a real implementation, you might need to extract signature from the schema
-        // and verify it against the schema content
+        // Calculate schema hash for the response regardless of outcome
+        let schema_hash = {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&schema_data);
+            hex::encode(hasher.finalize())
+        };
 
-        // Since we don't have a signature in the args, we'll return a successful verification
-        // In practice, this would need to be modified based on how signatures are embedded
-        // in the schema or provided separately
+        // Attempt to extract an embedded signature from the schema JSON.
+        // Schemas signed by SchemaPin contain a top-level `signature` field.
+        let embedded_signature: Option<String> =
+            serde_json::from_slice::<serde_json::Value>(&schema_data)
+                .ok()
+                .and_then(|v| {
+                    v.get("signature")
+                        .and_then(|s| s.as_str())
+                        .map(String::from)
+                });
 
-        Ok(VerificationResult {
-            success: true,
-            message: "Schema verification completed using native Rust implementation".to_string(),
-            schema_hash: Some({
-                let mut hasher = sha2::Sha256::new();
-                hasher.update(&schema_data);
-                hex::encode(hasher.finalize())
-            }),
-            public_key_url: Some(args.public_key_url.clone()),
-            signature: Some(SignatureInfo {
-                algorithm: "ECDSA_P256".to_string(),
-                signature: "native_verification".to_string(),
-                key_fingerprint: Some(key_id),
-                valid: true,
-            }),
-            metadata: None,
-            timestamp: Some(Utc::now().to_rfc3339()),
-        })
+        if let Some(ref sig) = embedded_signature {
+            // Verify the embedded signature against the schema content and fetched public key
+            // Strip the signature field to get the canonical payload that was signed
+            let mut schema_value: serde_json::Value = serde_json::from_slice(&schema_data)
+                .map_err(|e| SchemaPinError::IoError {
+                    reason: format!("Failed to parse schema JSON: {}", e),
+                })?;
+            if let Some(obj) = schema_value.as_object_mut() {
+                obj.remove("signature");
+            }
+            let canonical_payload =
+                serde_json::to_vec(&schema_value).map_err(|e| SchemaPinError::IoError {
+                    reason: format!("Failed to serialize canonical schema: {}", e),
+                })?;
+
+            match verify_signature(&public_key_pem, &canonical_payload, sig) {
+                Ok(true) => {
+                    tracing::info!(
+                        "Schema signature verified successfully for {}",
+                        args.schema_path
+                    );
+                    Ok(VerificationResult {
+                        success: true,
+                        message: "Schema signature verified successfully using native Rust implementation".to_string(),
+                        schema_hash: Some(schema_hash),
+                        public_key_url: Some(args.public_key_url.clone()),
+                        signature: Some(SignatureInfo {
+                            algorithm: "ECDSA_P256".to_string(),
+                            signature: sig.clone(),
+                            key_fingerprint: Some(key_id),
+                            valid: true,
+                        }),
+                        metadata: None,
+                        timestamp: Some(Utc::now().to_rfc3339()),
+                    })
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        "Schema signature verification failed: signature invalid for {}",
+                        args.schema_path
+                    );
+                    Ok(VerificationResult {
+                        success: false,
+                        message: "Schema signature verification failed: signature is invalid"
+                            .to_string(),
+                        schema_hash: Some(schema_hash),
+                        public_key_url: Some(args.public_key_url.clone()),
+                        signature: Some(SignatureInfo {
+                            algorithm: "ECDSA_P256".to_string(),
+                            signature: sig.clone(),
+                            key_fingerprint: Some(key_id),
+                            valid: false,
+                        }),
+                        metadata: None,
+                        timestamp: Some(Utc::now().to_rfc3339()),
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Schema signature verification error for {}: {}",
+                        args.schema_path,
+                        e
+                    );
+                    Ok(VerificationResult {
+                        success: false,
+                        message: format!("Schema signature verification error: {}", e),
+                        schema_hash: Some(schema_hash),
+                        public_key_url: Some(args.public_key_url.clone()),
+                        signature: Some(SignatureInfo {
+                            algorithm: "ECDSA_P256".to_string(),
+                            signature: sig.clone(),
+                            key_fingerprint: Some(key_id),
+                            valid: false,
+                        }),
+                        metadata: None,
+                        timestamp: Some(Utc::now().to_rfc3339()),
+                    })
+                }
+            }
+        } else {
+            // No signature provided — fail verification (fail-closed)
+            tracing::warn!(
+                "Schema verification failed for {}: no signature provided for verification",
+                args.schema_path
+            );
+            Ok(VerificationResult {
+                success: false,
+                message: "No signature provided for verification".to_string(),
+                schema_hash: Some(schema_hash),
+                public_key_url: Some(args.public_key_url.clone()),
+                signature: None,
+                metadata: None,
+                timestamp: Some(Utc::now().to_rfc3339()),
+            })
+        }
     }
 
     async fn sign_schema(&self, args: SignArgs) -> Result<SigningResult, SchemaPinError> {
@@ -327,6 +502,58 @@ mod tests {
 
         let version = client.get_version().await.unwrap();
         assert!(version.contains("schemapin-native"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_public_key_rejects_ssrf_targets() {
+        // Ensure the insecure-override is clear so the http:// + SSRF-guard
+        // combination is in effect.
+        std::env::remove_var("SYMBIONT_SCHEMAPIN_ALLOW_INSECURE");
+        let client = NativeSchemaPinClient::new();
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:8080/pub",
+            "http://10.1.2.3/key",
+            "file:///etc/passwd",
+        ] {
+            let err = client
+                .fetch_public_key(url)
+                .await
+                .expect_err(&format!("{} must be refused", url));
+            match err {
+                SchemaPinError::IoError { reason } => {
+                    assert!(
+                        reason.contains("Refusing"),
+                        "wrong message for {}: {}",
+                        url,
+                        reason
+                    );
+                }
+                other => panic!("unexpected error for {}: {:?}", url, other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_public_key_rejects_plaintext_http() {
+        // Public non-loopback HTTP URL passes the SSRF guard but must be
+        // refused by the TLS guard unless the insecure override is set.
+        std::env::remove_var("SYMBIONT_SCHEMAPIN_ALLOW_INSECURE");
+        let client = NativeSchemaPinClient::new();
+        let err = client
+            .fetch_public_key("http://example.com/pub")
+            .await
+            .expect_err("plaintext must be refused");
+        match err {
+            SchemaPinError::IoError { reason } => {
+                assert!(
+                    reason.contains("Refusing plaintext HTTP"),
+                    "wrong message: {}",
+                    reason
+                );
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
     }
 
     #[tokio::test]

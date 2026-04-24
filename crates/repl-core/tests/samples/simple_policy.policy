@@ -1,0 +1,3 @@
+policy simple_read
+  allow read
+end

@@ -9,19 +9,160 @@ use axum::{http::StatusCode, response::Json, Router};
 use std::sync::Arc;
 
 #[cfg(feature = "http-api")]
+use std::time::Instant;
+
+#[cfg(feature = "http-api")]
 use tokio::net::TcpListener;
 
 #[cfg(feature = "http-api")]
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 #[cfg(feature = "http-api")]
-use super::types::{ErrorResponse, HealthResponse};
+use utoipa::OpenApi;
+
+#[cfg(feature = "http-api")]
+use utoipa_swagger_ui::SwaggerUi;
+
+#[cfg(feature = "http-api")]
+use super::types::{
+    AddIdentityMappingRequest, AgentEvent, AgentEventType, AgentExecutionRecord,
+    AgentStatusResponse, ChannelActionResponse, ChannelAuditEntry, ChannelAuditResponse,
+    ChannelDetail, ChannelHealthResponse, ChannelSummary, CreateAgentRequest, CreateAgentResponse,
+    CreateScheduleRequest, CreateScheduleResponse, DeleteAgentResponse, DeleteChannelResponse,
+    DeleteScheduleResponse, ErrorResponse, ExecuteAgentRequest, ExecuteAgentResponse,
+    GetAgentHistoryResponse, HealthResponse, HeartbeatRequest, IdentityMappingEntry,
+    MessageEnvelope, MessageStatusResponse, NextRunsResponse, PushEventRequest,
+    ReceiveMessagesResponse, RegisterChannelRequest, RegisterChannelResponse, ResourceUsage,
+    ScheduleActionResponse, ScheduleDetail, ScheduleHistoryResponse, ScheduleRunEntry,
+    ScheduleSummary, SchedulerHealthResponse, SendMessageRequest, SendMessageResponse,
+    UpdateAgentRequest, UpdateAgentResponse, UpdateChannelRequest, UpdateScheduleRequest,
+    WorkflowExecutionRequest,
+};
 
 #[cfg(feature = "http-api")]
 use super::traits::RuntimeApiProvider;
 
 #[cfg(feature = "http-api")]
 use crate::types::RuntimeError;
+
+/// OpenAPI documentation structure
+#[cfg(feature = "http-api")]
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        super::routes::execute_workflow,
+        super::routes::get_agent_status,
+        super::routes::list_agents,
+        super::routes::get_metrics,
+        super::routes::create_agent,
+        super::routes::update_agent,
+        super::routes::delete_agent,
+        super::routes::execute_agent,
+        super::routes::get_agent_history,
+        super::routes::list_schedules,
+        super::routes::create_schedule,
+        super::routes::get_schedule,
+        super::routes::update_schedule,
+        super::routes::delete_schedule,
+        super::routes::pause_schedule,
+        super::routes::resume_schedule,
+        super::routes::trigger_schedule,
+        super::routes::get_schedule_history,
+        super::routes::get_schedule_next_runs,
+        super::routes::get_scheduler_health,
+        super::routes::list_channels,
+        super::routes::register_channel,
+        super::routes::get_channel,
+        super::routes::update_channel,
+        super::routes::delete_channel,
+        super::routes::start_channel,
+        super::routes::stop_channel,
+        super::routes::get_channel_health,
+        super::routes::list_channel_mappings,
+        super::routes::add_channel_mapping,
+        super::routes::remove_channel_mapping,
+        super::routes::get_channel_audit,
+        super::routes::agent_heartbeat,
+        super::routes::agent_push_event,
+        super::routes::send_agent_message,
+        super::routes::receive_agent_messages,
+        super::routes::get_message_status,
+        health_check,
+        liveness_check,
+        readiness_check
+    ),
+    components(
+        schemas(
+            WorkflowExecutionRequest,
+            AgentStatusResponse,
+            ResourceUsage,
+            HealthResponse,
+            CreateAgentRequest,
+            CreateAgentResponse,
+            UpdateAgentRequest,
+            UpdateAgentResponse,
+            DeleteAgentResponse,
+            ExecuteAgentRequest,
+            ExecuteAgentResponse,
+            GetAgentHistoryResponse,
+            AgentExecutionRecord,
+            ErrorResponse,
+            CreateScheduleRequest,
+            CreateScheduleResponse,
+            UpdateScheduleRequest,
+            ScheduleSummary,
+            ScheduleDetail,
+            NextRunsResponse,
+            ScheduleRunEntry,
+            ScheduleHistoryResponse,
+            ScheduleActionResponse,
+            DeleteScheduleResponse,
+            SchedulerHealthResponse,
+            RegisterChannelRequest,
+            RegisterChannelResponse,
+            UpdateChannelRequest,
+            ChannelSummary,
+            ChannelDetail,
+            ChannelActionResponse,
+            DeleteChannelResponse,
+            ChannelHealthResponse,
+            IdentityMappingEntry,
+            AddIdentityMappingRequest,
+            ChannelAuditEntry,
+            ChannelAuditResponse,
+            HeartbeatRequest,
+            PushEventRequest,
+            AgentEvent,
+            AgentEventType,
+            SendMessageRequest,
+            SendMessageResponse,
+            ReceiveMessagesResponse,
+            MessageEnvelope,
+            MessageStatusResponse
+        )
+    ),
+    tags(
+        (name = "agents", description = "Agent management endpoints"),
+        (name = "workflows", description = "Workflow execution endpoints"),
+        (name = "system", description = "System monitoring and health endpoints"),
+        (name = "schedules", description = "Cron schedule management endpoints"),
+        (name = "channels", description = "Channel adapter management endpoints")
+    ),
+    info(
+        title = "Symbiont Runtime API",
+        description = "HTTP API for the Symbiont Agent Runtime System",
+        version = "1.0.0",
+        contact(
+            name = "ThirdKey.ai",
+            url = "https://github.com/thirdkeyai/symbiont"
+        ),
+        license(
+            name = "Apache-2.0",
+            url = "https://www.apache.org/licenses/LICENSE-2.0"
+        )
+    )
+)]
+pub struct ApiDoc;
 
 /// HTTP API Server configuration
 #[cfg(feature = "http-api")]
@@ -35,6 +176,12 @@ pub struct HttpApiConfig {
     pub enable_cors: bool,
     /// Enable request tracing
     pub enable_tracing: bool,
+    /// Enable per-IP rate limiting (100 req/min)
+    pub enable_rate_limiting: bool,
+    /// Optional path to API keys JSON file for per-agent authentication
+    pub api_keys_file: Option<std::path::PathBuf>,
+    /// Serve AGENTS.md at /agents.md and /.well-known/agents.md (auth-gated)
+    pub serve_agents_md: bool,
 }
 
 #[cfg(feature = "http-api")]
@@ -45,6 +192,9 @@ impl Default for HttpApiConfig {
             port: 8080,
             enable_cors: true,
             enable_tracing: true,
+            enable_rate_limiting: true,
+            api_keys_file: None,
+            serve_agents_md: false,
         }
     }
 }
@@ -54,6 +204,9 @@ impl Default for HttpApiConfig {
 pub struct HttpApiServer {
     config: HttpApiConfig,
     runtime_provider: Option<Arc<dyn RuntimeApiProvider>>,
+    start_time: Instant,
+    api_key_store: Option<Arc<super::api_keys::ApiKeyStore>>,
+    coordinator_state: Option<Arc<super::coordinator::CoordinatorState>>,
 }
 
 #[cfg(feature = "http-api")]
@@ -63,6 +216,9 @@ impl HttpApiServer {
         Self {
             config,
             runtime_provider: None,
+            start_time: Instant::now(),
+            api_key_store: None,
+            coordinator_state: None,
         }
     }
 
@@ -72,36 +228,159 @@ impl HttpApiServer {
         self
     }
 
+    /// Set the coordinator state for the WebSocket chat endpoint.
+    pub fn with_coordinator(
+        mut self,
+        coordinator_state: Arc<super::coordinator::CoordinatorState>,
+    ) -> Self {
+        self.coordinator_state = Some(coordinator_state);
+        self
+    }
+
     /// Start the HTTP API server
-    pub async fn start(&self) -> Result<(), RuntimeError> {
+    pub async fn start(&mut self) -> Result<(), RuntimeError> {
+        // Initialize trusted proxy configuration from SYMBIONT_TRUSTED_PROXIES
+        super::middleware::init_trusted_proxies();
+
+        // Load API key store if configured
+        if let Some(ref keys_path) = self.config.api_keys_file {
+            match super::api_keys::ApiKeyStore::load_from_file(keys_path) {
+                Ok(store) => {
+                    tracing::info!("Loaded API key store from {}", keys_path.display());
+                    self.api_key_store = Some(Arc::new(store));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load API key store from {}: {} — falling back to legacy auth",
+                        keys_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+
         let app = self.create_router();
+
+        // Spawn unreachable detection loop for external agents
+        if let Some(ref provider) = self.runtime_provider {
+            let provider_clone = provider.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    provider_clone.check_unreachable_agents().await;
+                }
+            });
+        }
 
         let addr = format!("{}:{}", self.config.bind_address, self.config.port);
         let listener = TcpListener::bind(&addr)
             .await
             .map_err(|e| RuntimeError::Internal(format!("Failed to bind to {}: {}", addr, e)))?;
 
+        // Warn about authentication configuration
+        let has_key_store = self.api_key_store.as_ref().is_some_and(|s| s.has_records());
+        let has_env_token = std::env::var("SYMBIONT_API_TOKEN").is_ok();
+
+        if has_key_store && has_env_token {
+            tracing::warn!(
+                "API key store is configured — SYMBIONT_API_TOKEN will be ignored. \
+                 Remove the env var to avoid confusion."
+            );
+        } else if !has_key_store && has_env_token {
+            tracing::warn!(
+                "Using legacy SYMBIONT_API_TOKEN for authentication. \
+                 Migrate to an API key store (--api-keys-file) for production."
+            );
+        } else if !has_key_store && !has_env_token {
+            tracing::error!(
+                "No API key store and no SYMBIONT_API_TOKEN — \
+                 all authenticated endpoints will reject requests."
+            );
+        }
+
         tracing::info!("HTTP API server starting on {}", addr);
 
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| RuntimeError::Internal(format!("Server error: {}", e)))?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("Server error: {}", e)))?;
 
         Ok(())
     }
 
     /// Create the Axum router with all routes and middleware
     fn create_router(&self) -> Router {
-        use axum::routing::{get, post, put};
-        
-        let mut router = Router::new().route("/api/v1/health", get(health_check));
+        use axum::routing::{delete, get, post, put};
+
+        let mut router = Router::new()
+            .route("/api/v1/health", get(health_check))
+            .route("/api/v1/health/live", get(liveness_check))
+            .route("/api/v1/health/ready", get(readiness_check))
+            .with_state(self.start_time);
+
+        // Swagger UI / OpenAPI spec are OFF by default — they were previously
+        // exposed whenever SYMBIONT_ENV was unset or anything other than
+        // "production", which made every non-production deployment leak the
+        // full route inventory to unauthenticated callers. Require an
+        // explicit opt-in via `SYMBIONT_ENABLE_DOCS=1`, refuse the opt-in
+        // entirely in production, and (below) layer the routes behind the
+        // same bearer auth middleware as the rest of the API so that an
+        // accidentally-set flag in staging doesn't expose the spec.
+        let enable_docs = std::env::var("SYMBIONT_ENABLE_DOCS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let is_production = crate::env::is_production().unwrap_or_else(|err| {
+            tracing::error!(
+                error = %err,
+                "SYMBIONT_ENV parse failed; treating as production for guard purposes"
+            );
+            true
+        });
+        let docs_enabled = if enable_docs && is_production {
+            tracing::error!(
+                "SYMBIONT_ENABLE_DOCS=1 is not permitted when SYMBIONT_ENV=production; \
+                 refusing to mount Swagger UI"
+            );
+            false
+        } else {
+            enable_docs
+        };
 
         // Add stateful routes if we have a runtime provider
         if let Some(provider) = &self.runtime_provider {
-            use super::routes::{create_agent, delete_agent, execute_agent, execute_workflow, get_agent_history, get_agent_status, list_agents, get_metrics, update_agent};
             use super::middleware::auth_middleware;
+            use super::routes::{
+                add_channel_mapping, agent_heartbeat, agent_push_event, create_agent,
+                create_schedule, delete_agent, delete_channel, delete_schedule, execute_agent,
+                execute_workflow, get_agent_history, get_agent_status, get_channel,
+                get_channel_audit, get_channel_health, get_message_status, get_metrics,
+                get_schedule, get_schedule_history, get_schedule_next_runs, get_scheduler_health,
+                list_agents, list_channel_mappings, list_channels, list_schedules, pause_schedule,
+                receive_agent_messages, register_channel, remove_channel_mapping, resume_schedule,
+                send_agent_message, start_channel, stop_channel, trigger_schedule, update_agent,
+                update_channel, update_schedule,
+            };
+            use axum::extract::DefaultBodyLimit;
             use axum::middleware;
-            
+
+            /// Maximum accepted inter-agent message body (256 KiB). Messaging
+            /// routes are kept small on purpose — large payloads belong in
+            /// a storage tier, not inline in the bus.
+            const MESSAGE_BODY_LIMIT: usize = 256 * 1024;
+
+            // Messaging routes with a tight body-size limit to prevent
+            // memory exhaustion via oversized JSON bodies.
+            let messaging_router = Router::new()
+                .route(
+                    "/api/v1/agents/:id/messages",
+                    get(receive_agent_messages).post(send_agent_message),
+                )
+                .route("/api/v1/messages/:id/status", get(get_message_status))
+                .layer(DefaultBodyLimit::max(MESSAGE_BODY_LIMIT));
+
             // Agent routes that require authentication
             let agent_router = Router::new()
                 .route("/api/v1/agents", get(list_agents).post(create_agent))
@@ -109,16 +388,124 @@ impl HttpApiServer {
                 .route("/api/v1/agents/:id", put(update_agent).delete(delete_agent))
                 .route("/api/v1/agents/:id/execute", post(execute_agent))
                 .route("/api/v1/agents/:id/history", get(get_agent_history))
+                .route("/api/v1/agents/:id/heartbeat", post(agent_heartbeat))
+                .route("/api/v1/agents/:id/events", post(agent_push_event))
+                .merge(messaging_router)
                 .layer(middleware::from_fn(auth_middleware))
                 .with_state(provider.clone());
-            
-            // Other routes without authentication
-            let other_router = Router::new()
+
+            // Schedule routes
+            let schedule_router = Router::new()
+                .route(
+                    "/api/v1/schedules",
+                    get(list_schedules).post(create_schedule),
+                )
+                .route(
+                    "/api/v1/schedules/:id",
+                    get(get_schedule)
+                        .put(update_schedule)
+                        .delete(delete_schedule),
+                )
+                .route("/api/v1/schedules/:id/pause", post(pause_schedule))
+                .route("/api/v1/schedules/:id/resume", post(resume_schedule))
+                .route("/api/v1/schedules/:id/trigger", post(trigger_schedule))
+                .route("/api/v1/schedules/:id/history", get(get_schedule_history))
+                .route(
+                    "/api/v1/schedules/:id/next-runs",
+                    get(get_schedule_next_runs),
+                )
+                .layer(middleware::from_fn(auth_middleware))
+                .with_state(provider.clone());
+
+            // Channel routes
+            let channel_router = Router::new()
+                .route(
+                    "/api/v1/channels",
+                    get(list_channels).post(register_channel),
+                )
+                .route(
+                    "/api/v1/channels/:id",
+                    get(get_channel).put(update_channel).delete(delete_channel),
+                )
+                .route("/api/v1/channels/:id/start", post(start_channel))
+                .route("/api/v1/channels/:id/stop", post(stop_channel))
+                .route("/api/v1/channels/:id/health", get(get_channel_health))
+                .route(
+                    "/api/v1/channels/:id/mappings",
+                    get(list_channel_mappings).post(add_channel_mapping),
+                )
+                .route(
+                    "/api/v1/channels/:id/mappings/:user_id",
+                    delete(remove_channel_mapping),
+                )
+                .route("/api/v1/channels/:id/audit", get(get_channel_audit))
+                .layer(middleware::from_fn(auth_middleware))
+                .with_state(provider.clone());
+
+            // Protected routes (workflows + metrics + scheduler health) with authentication.
+            // Note: /api/v1/health (basic) remains public for load-balancer probes;
+            // /api/v1/health/scheduler exposes job counts and run stats so it requires auth.
+            let protected_router = Router::new()
                 .route("/api/v1/workflows/execute", post(execute_workflow))
                 .route("/api/v1/metrics", get(get_metrics))
+                .route("/api/v1/health/scheduler", get(get_scheduler_health))
+                .layer(middleware::from_fn(auth_middleware))
                 .with_state(provider.clone());
-            
-            router = router.merge(agent_router).merge(other_router);
+
+            router = router
+                .merge(agent_router)
+                .merge(schedule_router)
+                .merge(channel_router)
+                .merge(protected_router);
+        }
+
+        // WebSocket coordinator chat endpoint.
+        // Auth is handled inside the handler (token from query params),
+        // so the route is not wrapped with auth_middleware.
+        if let Some(ref coordinator_state) = self.coordinator_state {
+            let ws_router = Router::new()
+                .route("/ws/chat", get(super::ws_handler::ws_chat_handler))
+                .with_state(coordinator_state.clone());
+            router = router.merge(ws_router);
+        }
+
+        // Mount Swagger UI + OpenAPI spec only if explicitly enabled and not
+        // in production. The routes go behind the bearer auth_middleware so
+        // an accidentally-set flag in staging still requires a valid token
+        // to explore the spec.
+        if docs_enabled {
+            use super::middleware::auth_middleware;
+            use axum::middleware;
+
+            let docs_router: Router = Router::new()
+                .merge(
+                    SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()),
+                )
+                .layer(middleware::from_fn(auth_middleware));
+            router = router.merge(docs_router);
+            tracing::warn!(
+                "Swagger UI mounted at /swagger-ui behind auth_middleware (SYMBIONT_ENABLE_DOCS=1)"
+            );
+        }
+
+        // Conditionally serve AGENTS.md at well-known paths (auth-gated, no provider state needed)
+        if self.config.serve_agents_md {
+            use super::middleware::auth_middleware;
+            use axum::middleware;
+
+            let agents_md_router = Router::new()
+                .route("/agents.md", get(super::routes::serve_agents_md))
+                .route(
+                    "/.well-known/agents.md",
+                    get(super::routes::serve_agents_md),
+                )
+                .layer(middleware::from_fn(auth_middleware));
+            router = router.merge(agents_md_router);
+        }
+
+        // Add API key store as extension if available
+        if let Some(ref store) = self.api_key_store {
+            router = router.layer(axum::Extension(store.clone()));
         }
 
         // Add middleware conditionally
@@ -127,8 +514,34 @@ impl HttpApiServer {
         }
 
         if self.config.enable_cors {
-            router = router.layer(CorsLayer::permissive());
+            use axum::http::{header, HeaderValue, Method};
+
+            let allowed_origins: Vec<HeaderValue> = std::env::var("SYMBIONT_CORS_ORIGINS")
+                .unwrap_or_else(|_| "http://localhost:3001,http://localhost:3000".to_string())
+                .split(',')
+                .filter_map(|origin| origin.trim().parse().ok())
+                .collect();
+
+            let cors = CorsLayer::new()
+                .allow_origin(allowed_origins)
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+                .allow_credentials(false);
+
+            router = router.layer(cors);
         }
+
+        // Apply per-IP rate limiting
+        if self.config.enable_rate_limiting {
+            router = router.layer(axum::middleware::from_fn(
+                crate::api::middleware::rate_limit_middleware,
+            ));
+        }
+
+        // Apply security headers to all responses
+        router = router.layer(axum::middleware::from_fn(
+            crate::api::middleware::security_headers_middleware,
+        ));
 
         router
     }
@@ -136,13 +549,67 @@ impl HttpApiServer {
 
 /// Health check endpoint handler
 #[cfg(feature = "http-api")]
-async fn health_check() -> Result<Json<HealthResponse>, (StatusCode, Json<ErrorResponse>)> {
+#[utoipa::path(
+    get,
+    path = "/api/v1/health",
+    responses(
+        (status = 200, description = "Health check successful", body = HealthResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    tag = "system"
+)]
+async fn health_check(
+    axum::extract::State(start_time): axum::extract::State<Instant>,
+) -> Result<Json<HealthResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let uptime_seconds = start_time.elapsed().as_secs();
+
     let response = HealthResponse {
         status: "healthy".to_string(),
-        uptime_seconds: 0, // TODO: implement actual uptime tracking
+        uptime_seconds,
         timestamp: chrono::Utc::now(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
 
     Ok(Json(response))
+}
+
+/// Liveness probe — confirms the process is running and able to serve requests.
+#[cfg(feature = "http-api")]
+#[utoipa::path(
+    get,
+    path = "/api/v1/health/live",
+    responses(
+        (status = 200, description = "Process is alive"),
+        (status = 503, description = "Process is not alive")
+    ),
+    tag = "system"
+)]
+async fn liveness_check() -> StatusCode {
+    // Liveness: the process is running and can serve requests.
+    // No dependency checks — if this handler runs, we're alive.
+    StatusCode::OK
+}
+
+/// Readiness probe — confirms the system has completed initialization.
+#[cfg(feature = "http-api")]
+#[utoipa::path(
+    get,
+    path = "/api/v1/health/ready",
+    responses(
+        (status = 200, description = "System is ready to accept work"),
+        (status = 503, description = "System is not ready")
+    ),
+    tag = "system"
+)]
+async fn readiness_check(
+    axum::extract::State(start_time): axum::extract::State<Instant>,
+) -> StatusCode {
+    // Readiness: the system has completed initialization and can accept work.
+    // After 5 seconds of uptime, consider the system ready.
+    // In the future, check scheduler state, DB connections, etc.
+    if start_time.elapsed().as_secs() >= 5 {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }

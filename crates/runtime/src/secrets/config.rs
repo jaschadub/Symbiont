@@ -83,7 +83,7 @@ pub struct VaultConfig {
 }
 
 /// Vault authentication configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "lowercase")]
 pub enum VaultAuthConfig {
     /// Token-based authentication
@@ -124,10 +124,127 @@ pub enum VaultAuthConfig {
     },
 }
 
+impl std::fmt::Debug for VaultAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VaultAuthConfig::Token { .. } => f
+                .debug_struct("VaultAuthConfig::Token")
+                .field("token", &"[REDACTED]")
+                .finish(),
+            VaultAuthConfig::AppRole {
+                role_id,
+                mount_path,
+                ..
+            } => f
+                .debug_struct("VaultAuthConfig::AppRole")
+                .field("role_id", role_id)
+                .field("secret_id", &"[REDACTED]")
+                .field("mount_path", mount_path)
+                .finish(),
+            VaultAuthConfig::Kubernetes {
+                token_path,
+                role,
+                mount_path,
+            } => f
+                .debug_struct("VaultAuthConfig::Kubernetes")
+                .field("token_path", token_path)
+                .field("role", role)
+                .field("mount_path", mount_path)
+                .finish(),
+            VaultAuthConfig::Aws {
+                region,
+                role,
+                mount_path,
+            } => f
+                .debug_struct("VaultAuthConfig::Aws")
+                .field("region", region)
+                .field("role", role)
+                .field("mount_path", mount_path)
+                .finish(),
+        }
+    }
+}
+
+// Display must never print credential-bearing fields, so mirror the Debug
+// behaviour. Without an explicit impl, some logging crates fall back to
+// auto-generated Display via `Debug`, but some call sites format enums with
+// `{}` expecting a short human label; provide one that never leaks.
+impl std::fmt::Display for VaultAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VaultAuthConfig::Token { .. } => write!(f, "VaultAuthConfig::Token(redacted)"),
+            VaultAuthConfig::AppRole { role_id, .. } => {
+                write!(f, "VaultAuthConfig::AppRole(role_id={})", role_id)
+            }
+            VaultAuthConfig::Kubernetes { role, .. } => {
+                write!(f, "VaultAuthConfig::Kubernetes(role={})", role)
+            }
+            VaultAuthConfig::Aws { region, role, .. } => {
+                write!(f, "VaultAuthConfig::Aws(region={}, role={})", region, role)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod vault_auth_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_token() {
+        let cfg = VaultAuthConfig::Token {
+            token: "s.VERY_SECRET_TOKEN_1234".to_string(),
+        };
+        let rendered = format!("{:?}", cfg);
+        assert!(!rendered.contains("VERY_SECRET_TOKEN"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn debug_redacts_approle_secret_id() {
+        let cfg = VaultAuthConfig::AppRole {
+            role_id: "pub-role".to_string(),
+            secret_id: "THIS_IS_VERY_SECRET".to_string(),
+            mount_path: "approle".to_string(),
+        };
+        let rendered = format!("{:?}", cfg);
+        assert!(!rendered.contains("THIS_IS_VERY_SECRET"));
+        assert!(rendered.contains("pub-role"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn display_does_not_leak_token() {
+        let cfg = VaultAuthConfig::Token {
+            token: "s.DISPLAY_SHOULD_NOT_PRINT_THIS".to_string(),
+        };
+        let rendered = format!("{}", cfg);
+        assert!(!rendered.contains("DISPLAY_SHOULD_NOT_PRINT_THIS"));
+    }
+
+    #[test]
+    fn display_does_not_leak_approle_secret() {
+        let cfg = VaultAuthConfig::AppRole {
+            role_id: "pub-role".to_string(),
+            secret_id: "SECRET_ID_DO_NOT_LEAK".to_string(),
+            mount_path: "approle".to_string(),
+        };
+        let rendered = format!("{}", cfg);
+        assert!(!rendered.contains("SECRET_ID_DO_NOT_LEAK"));
+        assert!(rendered.contains("pub-role"));
+    }
+}
+
 /// Vault TLS configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VaultTlsConfig {
-    /// Skip TLS certificate verification (insecure)
+    /// **DEPRECATED**. Historically allowed turning off Vault TLS
+    /// verification; now refused unconditionally by the Vault backend.
+    ///
+    /// The field is retained so existing TOML/YAML configs that still
+    /// contain `tls.skip_verify = false` keep parsing; any `true` value is
+    /// rejected at backend initialisation with an instruction to configure
+    /// `ca_cert` instead. A future release will remove the field entirely.
     #[serde(default)]
     pub skip_verify: bool,
     /// Path to CA certificate file
@@ -281,25 +398,63 @@ impl Default for FileBackupConfig {
 }
 
 // Default value functions
-fn default_timeout() -> u64 { 30 }
-fn default_max_retries() -> u32 { 3 }
-fn default_enable_cache() -> bool { true }
-fn default_cache_ttl() -> u64 { 300 }
-fn default_vault_mount() -> String { "secret".to_string() }
-fn default_vault_api_version() -> String { "v2".to_string() }
-fn default_approle_mount() -> String { "approle".to_string() }
-fn default_k8s_token_path() -> String { "/var/run/secrets/kubernetes.io/serviceaccount/token".to_string() }
-fn default_k8s_mount() -> String { "kubernetes".to_string() }
-fn default_aws_mount() -> String { "aws".to_string() }
-fn default_max_connections() -> usize { 10 }
-fn default_connection_timeout() -> u64 { 10 }
-fn default_request_timeout() -> u64 { 30 }
-fn default_file_format() -> FileFormat { FileFormat::Json }
-fn default_encryption_algorithm() -> String { "AES-256-GCM".to_string() }
-fn default_kdf() -> String { "PBKDF2".to_string() }
-fn default_key_provider() -> String { "env".to_string() }
-fn default_max_backups() -> usize { 5 }
-fn default_backup_before_write() -> bool { true }
+fn default_timeout() -> u64 {
+    30
+}
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_enable_cache() -> bool {
+    true
+}
+fn default_cache_ttl() -> u64 {
+    300
+}
+fn default_vault_mount() -> String {
+    "secret".to_string()
+}
+fn default_vault_api_version() -> String {
+    "v2".to_string()
+}
+fn default_approle_mount() -> String {
+    "approle".to_string()
+}
+fn default_k8s_token_path() -> String {
+    "/var/run/secrets/kubernetes.io/serviceaccount/token".to_string()
+}
+fn default_k8s_mount() -> String {
+    "kubernetes".to_string()
+}
+fn default_aws_mount() -> String {
+    "aws".to_string()
+}
+fn default_max_connections() -> usize {
+    10
+}
+fn default_connection_timeout() -> u64 {
+    10
+}
+fn default_request_timeout() -> u64 {
+    30
+}
+fn default_file_format() -> FileFormat {
+    FileFormat::Json
+}
+fn default_encryption_algorithm() -> String {
+    "AES-256-GCM".to_string()
+}
+fn default_kdf() -> String {
+    "PBKDF2".to_string()
+}
+fn default_key_provider() -> String {
+    "env".to_string()
+}
+fn default_max_backups() -> usize {
+    5
+}
+fn default_backup_before_write() -> bool {
+    true
+}
 
 impl SecretsConfig {
     /// Create a Vault configuration with token authentication

@@ -9,7 +9,7 @@ use aes_gcm::{
 };
 use argon2::{
     password_hash::{rand_core::RngCore, PasswordHasher, SaltString},
-    Argon2,
+    Argon2, Params,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
@@ -65,8 +65,90 @@ impl fmt::Display for EncryptedData {
     }
 }
 
+// ---------------------------------------------------------------------------
+// KDF parameter versioning
+// ---------------------------------------------------------------------------
+//
+// Older Symbiont builds encrypted with Argon2id(m=19 MiB, t=2, p=1, out=32).
+// Current builds use (m=65_536 KiB=64 MiB, t=3, p=1, out=32) per OWASP's
+// 2024 recommendation for *data-at-rest* KDF, which is stronger than the
+// 19 MiB / 2-iter profile used for interactive password hashing.
+//
+// The chosen parameter set is encoded into `EncryptedData.kdf`. Decryption
+// looks up the parameters by label so blobs written under legacy params keep
+// decrypting unchanged. New encryptions always use the current (stronger)
+// parameters.
+
+/// Label stamped into `EncryptedData.kdf` for legacy 19 MiB / 2 iter blobs.
+/// Referenced from tests and documentation. Unknown kdf labels fall through
+/// to the legacy parameters, so runtime code does not read this constant
+/// directly — the match in `kdf_params_for_label` is `_ => legacy`.
+#[cfg_attr(not(test), allow(dead_code))]
+const LEGACY_KDF_ID: &str = "Argon2";
+/// Label used for current 64 MiB / 3 iter blobs.
+const CURRENT_KDF_ID: &str = "Argon2id-m65536-t3-p1";
+
+/// Build the current Argon2id parameter set. Kept as a function so tests and
+/// benchmarks can observe the exact values without digging through the
+/// encrypted blob.
+fn current_kdf_params() -> Result<Params, CryptoError> {
+    Params::new(65_536, 3, 1, Some(32)).map_err(|e| CryptoError::KeyDerivationFailed {
+        message: format!("Invalid Argon2 parameters (current): {}", e),
+    })
+}
+
+/// Look up the Argon2id parameters used to produce a blob stamped with
+/// `label`. Unknown labels map to the legacy parameters for maximum
+/// backwards-compatibility — new code paths always stamp a label we know,
+/// so an unknown value indicates a pre-existing blob from before the
+/// parameter bump.
+fn kdf_params_for_label(label: &str) -> Result<Params, CryptoError> {
+    match label {
+        CURRENT_KDF_ID => current_kdf_params(),
+        _ => Params::new(19 * 1024, 2, 1, Some(32)).map_err(|e| CryptoError::KeyDerivationFailed {
+            message: format!("Invalid Argon2 parameters (legacy): {}", e),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod kdf_params_tests {
+    use super::*;
+
+    #[test]
+    fn current_params_meet_owasp_at_rest_baseline() {
+        let p = current_kdf_params().expect("params build");
+        // 64 MiB memory cost and at least 3 iterations (OWASP 2024 at-rest).
+        assert!(p.m_cost() >= 65_536, "memory too low: {}", p.m_cost());
+        assert!(p.t_cost() >= 3, "iterations too low: {}", p.t_cost());
+    }
+
+    #[test]
+    fn legacy_roundtrip_still_supported() {
+        // Legacy blobs must keep decrypting; the label lookup must not fall
+        // through to the current (stronger) params or the derived key would
+        // differ from what originally produced the ciphertext.
+        let legacy = kdf_params_for_label(LEGACY_KDF_ID).expect("legacy params build");
+        assert_eq!(legacy.m_cost(), 19 * 1024);
+        assert_eq!(legacy.t_cost(), 2);
+    }
+
+    #[test]
+    fn unknown_label_falls_through_to_legacy() {
+        let p = kdf_params_for_label("unknown-kdf-label").expect("params build");
+        assert_eq!(p.m_cost(), 19 * 1024);
+        assert_eq!(p.t_cost(), 2);
+    }
+}
+
 /// AES-256-GCM encryption/decryption utilities
 pub struct Aes256GcmCrypto;
+
+impl Default for Aes256GcmCrypto {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Aes256GcmCrypto {
     /// Create a new Aes256GcmCrypto instance
@@ -77,10 +159,8 @@ impl Aes256GcmCrypto {
     /// Encrypt data using AES-256-GCM with a direct key (for CLI usage)
     pub fn encrypt(&self, plaintext: &[u8], key: &str) -> Result<Vec<u8>, CryptoError> {
         // Decode the base64 key
-        let key_bytes = BASE64.decode(key).map_err(|e| {
-            CryptoError::InvalidKey {
-                message: format!("Invalid base64 key: {}", e),
-            }
+        let key_bytes = BASE64.decode(key).map_err(|e| CryptoError::InvalidKey {
+            message: format!("Invalid base64 key: {}", e),
         })?;
 
         if key_bytes.len() != 32 {
@@ -96,11 +176,12 @@ impl Aes256GcmCrypto {
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
         // Encrypt
-        let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|e| {
-            CryptoError::EncryptionFailed {
-                message: e.to_string(),
-            }
-        })?;
+        let ciphertext =
+            cipher
+                .encrypt(&nonce, plaintext)
+                .map_err(|e| CryptoError::EncryptionFailed {
+                    message: e.to_string(),
+                })?;
 
         // Combine nonce + ciphertext
         let mut result = Vec::with_capacity(12 + ciphertext.len());
@@ -119,10 +200,8 @@ impl Aes256GcmCrypto {
         }
 
         // Decode the base64 key
-        let key_bytes = BASE64.decode(key).map_err(|e| {
-            CryptoError::InvalidKey {
-                message: format!("Invalid base64 key: {}", e),
-            }
+        let key_bytes = BASE64.decode(key).map_err(|e| CryptoError::InvalidKey {
+            message: format!("Invalid base64 key: {}", e),
         })?;
 
         if key_bytes.len() != 32 {
@@ -139,27 +218,34 @@ impl Aes256GcmCrypto {
         let nonce = Nonce::from_slice(nonce_bytes);
 
         // Decrypt
-        let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| {
-            CryptoError::DecryptionFailed {
-                message: e.to_string(),
-            }
-        })?;
+        let plaintext =
+            cipher
+                .decrypt(nonce, ciphertext)
+                .map_err(|e| CryptoError::DecryptionFailed {
+                    message: e.to_string(),
+                })?;
 
         Ok(plaintext)
     }
 
     /// Encrypt data using AES-256-GCM with Argon2 key derivation (original method)
-    pub fn encrypt_with_password(plaintext: &[u8], password: &str) -> Result<EncryptedData, CryptoError> {
+    pub fn encrypt_with_password(
+        plaintext: &[u8],
+        password: &str,
+    ) -> Result<EncryptedData, CryptoError> {
         // Generate random salt
         let mut salt = [0u8; 32];
         OsRng.fill_bytes(&mut salt);
-        let salt_string = SaltString::encode_b64(&salt)
-            .map_err(|e| CryptoError::KeyDerivationFailed {
+        let salt_string =
+            SaltString::encode_b64(&salt).map_err(|e| CryptoError::KeyDerivationFailed {
                 message: e.to_string(),
             })?;
 
-        // Derive key using Argon2
-        let argon2 = Argon2::default();
+        // Derive key using Argon2id with current at-rest parameters. The
+        // chosen params are encoded into the `kdf` field so older ciphertexts
+        // remain decryptable after future tuning.
+        let params = current_kdf_params()?;
+        let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
         let password_hash = argon2
             .hash_password(password.as_bytes(), &salt_string)
             .map_err(|e| CryptoError::KeyDerivationFailed {
@@ -167,7 +253,11 @@ impl Aes256GcmCrypto {
             })?;
 
         // Extract the hash bytes for the encryption key
-        let hash_binding = password_hash.hash.unwrap();
+        let hash_binding = password_hash
+            .hash
+            .ok_or_else(|| CryptoError::KeyDerivationFailed {
+                message: "Password hash generation returned None".to_string(),
+            })?;
         let key_bytes = hash_binding.as_bytes();
         if key_bytes.len() < 32 {
             return Err(CryptoError::InvalidKey {
@@ -182,58 +272,71 @@ impl Aes256GcmCrypto {
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
         // Encrypt
-        let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|e| {
-            CryptoError::EncryptionFailed {
-                message: e.to_string(),
-            }
-        })?;
+        let ciphertext =
+            cipher
+                .encrypt(&nonce, plaintext)
+                .map_err(|e| CryptoError::EncryptionFailed {
+                    message: e.to_string(),
+                })?;
 
         Ok(EncryptedData {
             ciphertext: BASE64.encode(&ciphertext),
             nonce: BASE64.encode(nonce),
             salt: BASE64.encode(salt),
             algorithm: "AES-256-GCM".to_string(),
-            kdf: "Argon2".to_string(),
+            kdf: CURRENT_KDF_ID.to_string(),
         })
     }
 
     /// Decrypt data using AES-256-GCM with Argon2 key derivation (static method)
-    pub fn decrypt_with_password(encrypted_data: &EncryptedData, password: &str) -> Result<Vec<u8>, CryptoError> {
+    pub fn decrypt_with_password(
+        encrypted_data: &EncryptedData,
+        password: &str,
+    ) -> Result<Vec<u8>, CryptoError> {
         // Decode base64 components
-        let ciphertext = BASE64.decode(&encrypted_data.ciphertext).map_err(|e| {
-            CryptoError::Base64Error {
-                message: e.to_string(),
-            }
-        })?;
+        let ciphertext =
+            BASE64
+                .decode(&encrypted_data.ciphertext)
+                .map_err(|e| CryptoError::Base64Error {
+                    message: e.to_string(),
+                })?;
 
-        let nonce_bytes = BASE64.decode(&encrypted_data.nonce).map_err(|e| {
-            CryptoError::Base64Error {
-                message: e.to_string(),
-            }
-        })?;
+        let nonce_bytes =
+            BASE64
+                .decode(&encrypted_data.nonce)
+                .map_err(|e| CryptoError::Base64Error {
+                    message: e.to_string(),
+                })?;
 
-        let salt = BASE64.decode(&encrypted_data.salt).map_err(|e| {
-            CryptoError::Base64Error {
+        let salt = BASE64
+            .decode(&encrypted_data.salt)
+            .map_err(|e| CryptoError::Base64Error {
                 message: e.to_string(),
-            }
-        })?;
+            })?;
 
         // Reconstruct salt string
-        let salt_string = SaltString::encode_b64(&salt).map_err(|e| {
-            CryptoError::KeyDerivationFailed {
+        let salt_string =
+            SaltString::encode_b64(&salt).map_err(|e| CryptoError::KeyDerivationFailed {
                 message: e.to_string(),
-            }
-        })?;
+            })?;
 
-        // Derive key using the same parameters
-        let argon2 = Argon2::default();
+        // Select the KDF parameters that produced this ciphertext, keyed on
+        // the stored `kdf` label. Older blobs keep decrypting under the legacy
+        // 19 MiB / 2 iter params; new blobs use the stronger 64 MiB / 3 iter
+        // defaults chosen by `current_kdf_params`.
+        let params = kdf_params_for_label(&encrypted_data.kdf)?;
+        let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
         let password_hash = argon2
             .hash_password(password.as_bytes(), &salt_string)
             .map_err(|e| CryptoError::KeyDerivationFailed {
                 message: e.to_string(),
             })?;
 
-        let hash_binding = password_hash.hash.unwrap();
+        let hash_binding = password_hash
+            .hash
+            .ok_or_else(|| CryptoError::KeyDerivationFailed {
+                message: "Password hash generation returned None".to_string(),
+            })?;
         let key_bytes = hash_binding.as_bytes();
         if key_bytes.len() < 32 {
             return Err(CryptoError::InvalidKey {
@@ -266,6 +369,12 @@ impl Aes256GcmCrypto {
 /// Utilities for key management
 pub struct KeyUtils;
 
+impl Default for KeyUtils {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KeyUtils {
     /// Create a new KeyUtils instance
     pub fn new() -> Self {
@@ -273,24 +382,246 @@ impl KeyUtils {
     }
 
     /// Get or create a key, prioritizing keychain, then environment, then generating new
+    ///
+    /// # Security Warning
+    ///
+    /// This method will generate a new encryption key if none is found. This can lead to
+    /// data loss if you have existing encrypted data that was encrypted with a different key.
+    ///
+    /// Key priority order:
+    /// 1. System keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service)
+    /// 2. Environment variable SYMBIONT_MASTER_KEY
+    /// 3. Generate new random key (⚠️ will make old encrypted data unrecoverable)
+    ///
+    /// # Recommendations
+    ///
+    /// For production deployments:
+    /// - Use a secrets management system (HashiCorp Vault, AWS Secrets Manager)
+    /// - Set SYMBIONT_MASTER_KEY environment variable with a secure key
+    /// - Ensure proper key backup and rotation procedures
     pub fn get_or_create_key(&self) -> Result<String, CryptoError> {
         // Try keychain first
         if let Ok(key) = self.get_key_from_keychain("symbiont", "secrets") {
+            tracing::debug!("Using encryption key from system keychain");
             return Ok(key);
         }
 
         // Try environment variable
-        if let Ok(key) = Self::get_key_from_env("SYMBIONT_SECRET_KEY") {
+        if let Ok(key) = Self::get_key_from_env("SYMBIONT_MASTER_KEY") {
+            tracing::info!("Using encryption key from SYMBIONT_MASTER_KEY environment variable");
             return Ok(key);
         }
 
-        // Generate a new key and store it in keychain
-        let new_key = self.generate_key();
-        if let Err(e) = self.store_key_in_keychain("symbiont", "secrets", &new_key) {
-            eprintln!("Warning: Failed to store key in keychain: {}", e);
+        // Try an on-disk key file at the configured or default location.
+        // This gives containers without a D-Bus keyring a stable place to
+        // persist a generated key without the operator having to pipe it
+        // through `SYMBIONT_MASTER_KEY` every run.
+        if let Some(path) = self.resolve_key_file_path() {
+            if let Some(key) = Self::read_key_from_file(&path)? {
+                tracing::info!(path = %path.display(), "Using encryption key from file");
+                return Ok(key);
+            }
         }
-        
+
+        // Refuse to auto-generate in production unless the operator has
+        // explicitly opted into an ephemeral key for this process.
+        let is_prod = crate::env::is_production().map_err(|e| CryptoError::InvalidKey {
+            message: format!("SYMBIONT_ENV parse failed: {e}"),
+        })?;
+        let allow_ephemeral = std::env::var("SYMBIONT_ALLOW_EPHEMERAL_KEY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if is_prod && !allow_ephemeral {
+            return Err(CryptoError::InvalidKey {
+                message: "No encryption key source is available and SYMBIONT_ENV=production. \
+                     Provide one of: SYMBIONT_MASTER_KEY env var, an OS keyring entry, \
+                     or SYMBIONT_MASTER_KEY_FILE pointing at a 0600 key file. \
+                     Set SYMBIONT_ALLOW_EPHEMERAL_KEY=1 only if a per-process \
+                     non-persistent key is acceptable (all data will be lost on restart)."
+                    .to_string(),
+            });
+        }
+
+        tracing::warn!(
+            "No encryption key found in keychain, env, or key file. \
+             Generating a new random key; any previously-encrypted data is \
+             now UNRECOVERABLE. Set SYMBIONT_MASTER_KEY or SYMBIONT_MASTER_KEY_FILE \
+             to persist an explicit key."
+        );
+
+        // Generate a new key
+        let new_key = self.generate_key();
+
+        // Persist the new key: first try the system keychain, then fall back
+        // to a 0600 file so containers don't silently burn the key at exit.
+        match self.store_key_in_keychain("symbiont", "secrets", &new_key) {
+            Ok(_) => {
+                tracing::info!("New encryption key stored in system keychain");
+            }
+            Err(keychain_err) => {
+                tracing::warn!(
+                    error = %keychain_err,
+                    "Keychain store failed; attempting on-disk key file fallback"
+                );
+                match self.resolve_key_file_path() {
+                    Some(path) => match Self::write_key_to_file(&path, &new_key) {
+                        Ok(()) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                "New encryption key written to 0600 file. \
+                                 Back this file up — its contents are NOT logged."
+                            );
+                        }
+                        Err(file_err) => {
+                            tracing::error!(
+                                error = %file_err,
+                                "Failed to persist generated key to disk"
+                            );
+                            if !allow_ephemeral {
+                                return Err(CryptoError::InvalidKey {
+                                    message: format!(
+                                        "Failed to persist generated key (keychain: {keychain_err}; \
+                                         file: {file_err}). Set SYMBIONT_MASTER_KEY, configure \
+                                         SYMBIONT_MASTER_KEY_FILE, or set \
+                                         SYMBIONT_ALLOW_EPHEMERAL_KEY=1 to accept a \
+                                         non-persistent in-memory key."
+                                    ),
+                                });
+                            }
+                            tracing::error!(
+                                "SYMBIONT_ALLOW_EPHEMERAL_KEY=1: proceeding with an \
+                                 in-memory-only key. All encrypted data will be \
+                                 unrecoverable after this process exits."
+                            );
+                        }
+                    },
+                    None => {
+                        if !allow_ephemeral {
+                            return Err(CryptoError::InvalidKey {
+                                message: format!(
+                                    "Keychain unavailable ({keychain_err}) and no key file \
+                                     path configured. Set SYMBIONT_MASTER_KEY_FILE or \
+                                     SYMBIONT_ALLOW_EPHEMERAL_KEY=1."
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(new_key)
+    }
+
+    /// Resolve the on-disk key file path.
+    ///
+    /// Precedence:
+    ///   1. `SYMBIONT_MASTER_KEY_FILE` env var (explicit path)
+    ///   2. `$XDG_STATE_HOME/symbiont/master.key`
+    ///   3. `$HOME/.symbi/master.key`
+    ///
+    /// Returns `None` when neither `HOME` nor `XDG_STATE_HOME` is set, which
+    /// only happens in exotic sandbox configurations; in that case callers
+    /// fall back to ephemeral keys (with `SYMBIONT_ALLOW_EPHEMERAL_KEY=1`).
+    fn resolve_key_file_path(&self) -> Option<std::path::PathBuf> {
+        use std::path::PathBuf;
+        if let Ok(explicit) = std::env::var("SYMBIONT_MASTER_KEY_FILE") {
+            return Some(PathBuf::from(explicit));
+        }
+        if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+            return Some(PathBuf::from(xdg).join("symbiont").join("master.key"));
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return Some(PathBuf::from(home).join(".symbi").join("master.key"));
+        }
+        None
+    }
+
+    /// Read a key from a 0600 file, returning `Ok(None)` if the file does not
+    /// exist (so the caller can proceed to generate one). Refuses to read
+    /// files whose Unix mode grants any permission to group or other.
+    fn read_key_from_file(path: &std::path::Path) -> Result<Option<String>, CryptoError> {
+        use std::io::Read;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let meta = std::fs::metadata(path).map_err(|e| CryptoError::InvalidKey {
+            message: format!("Failed to stat {}: {e}", path.display()),
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(CryptoError::InvalidKey {
+                    message: format!(
+                        "Key file {} has insecure mode {mode:o}; expected 0600. \
+                         Run: chmod 600 {}",
+                        path.display(),
+                        path.display()
+                    ),
+                });
+            }
+        }
+        if !meta.is_file() {
+            return Err(CryptoError::InvalidKey {
+                message: format!("Key path {} is not a regular file", path.display()),
+            });
+        }
+        let mut file = std::fs::File::open(path).map_err(|e| CryptoError::InvalidKey {
+            message: format!("Failed to open {}: {e}", path.display()),
+        })?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .map_err(|e| CryptoError::InvalidKey {
+                message: format!("Failed to read {}: {e}", path.display()),
+            })?;
+        let trimmed = contents.trim().to_string();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(trimmed))
+    }
+
+    /// Write a key to disk at `path` with 0600 permissions on Unix. Creates
+    /// parent directories as needed. Never logs the key itself.
+    fn write_key_to_file(path: &std::path::Path, key: &str) -> Result<(), CryptoError> {
+        use std::io::Write;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| CryptoError::InvalidKey {
+                message: format!("Failed to create key directory {}: {e}", parent.display()),
+            })?;
+        }
+
+        // Create the file with 0600 mode atomically on Unix. On other
+        // platforms we fall back to a regular create; the caller warns that
+        // the mode is not enforced.
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| CryptoError::InvalidKey {
+                    message: format!("Failed to create key file {}: {e}", path.display()),
+                })?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::File::create(path).map_err(|e| CryptoError::InvalidKey {
+            message: format!("Failed to create key file {}: {e}", path.display()),
+        })?;
+
+        file.write_all(key.as_bytes())
+            .map_err(|e| CryptoError::InvalidKey {
+                message: format!("Failed to write key file {}: {e}", path.display()),
+            })?;
+        file.sync_all().map_err(|e| CryptoError::InvalidKey {
+            message: format!("Failed to fsync key file {}: {e}", path.display()),
+        })?;
+        Ok(())
     }
 
     /// Generate a new random key
@@ -303,21 +634,32 @@ impl KeyUtils {
 
     /// Store a key in the OS keychain
     #[cfg(feature = "keychain")]
-    fn store_key_in_keychain(&self, service: &str, account: &str, key: &str) -> Result<(), CryptoError> {
+    fn store_key_in_keychain(
+        &self,
+        service: &str,
+        account: &str,
+        key: &str,
+    ) -> Result<(), CryptoError> {
         use keyring::Entry;
-        
-        let entry = Entry::new(service, account)
-            .map_err(|e| CryptoError::InvalidKey {
-                message: format!("Failed to create keychain entry: {}", e),
-            })?;
 
-        entry.set_password(key).map_err(|e| CryptoError::InvalidKey {
-            message: format!("Failed to store in keychain: {}", e),
-        })
+        let entry = Entry::new(service, account).map_err(|e| CryptoError::InvalidKey {
+            message: format!("Failed to create keychain entry: {}", e),
+        })?;
+
+        entry
+            .set_password(key)
+            .map_err(|e| CryptoError::InvalidKey {
+                message: format!("Failed to store in keychain: {}", e),
+            })
     }
 
     #[cfg(not(feature = "keychain"))]
-    fn store_key_in_keychain(&self, _service: &str, _account: &str, _key: &str) -> Result<(), CryptoError> {
+    fn store_key_in_keychain(
+        &self,
+        _service: &str,
+        _account: &str,
+        _key: &str,
+    ) -> Result<(), CryptoError> {
         Err(CryptoError::InvalidKey {
             message: "Keychain support not enabled. Compile with 'keychain' feature.".to_string(),
         })
@@ -332,13 +674,16 @@ impl KeyUtils {
 
     /// Retrieve a key from OS keychain (cross-platform)
     #[cfg(feature = "keychain")]
-    pub fn get_key_from_keychain(&self, service: &str, account: &str) -> Result<String, CryptoError> {
+    pub fn get_key_from_keychain(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<String, CryptoError> {
         use keyring::Entry;
-        
-        let entry = Entry::new(service, account)
-            .map_err(|e| CryptoError::InvalidKey {
-                message: format!("Failed to create keychain entry: {}", e),
-            })?;
+
+        let entry = Entry::new(service, account).map_err(|e| CryptoError::InvalidKey {
+            message: format!("Failed to create keychain entry: {}", e),
+        })?;
 
         entry.get_password().map_err(|e| CryptoError::InvalidKey {
             message: format!("Failed to retrieve from keychain: {}", e),
@@ -346,7 +691,11 @@ impl KeyUtils {
     }
 
     #[cfg(not(feature = "keychain"))]
-    pub fn get_key_from_keychain(&self, _service: &str, _account: &str) -> Result<String, CryptoError> {
+    pub fn get_key_from_keychain(
+        &self,
+        _service: &str,
+        _account: &str,
+    ) -> Result<String, CryptoError> {
         Err(CryptoError::InvalidKey {
             message: "Keychain support not enabled. Compile with 'keychain' feature.".to_string(),
         })

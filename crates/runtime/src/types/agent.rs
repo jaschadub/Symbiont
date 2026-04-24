@@ -31,10 +31,25 @@ pub enum ExecutionMode {
     /// Task-based execution that terminates after completion
     #[default]
     Ephemeral,
-    /// Cron-like scheduling with periodic execution
+    /// Interval-based scheduling with periodic execution
     Scheduled { interval: Duration },
+    /// Cron-expression–based scheduling with timezone support
+    CronScheduled {
+        cron_expression: String,
+        timezone: String,
+    },
     /// Reactive to events and messages
     EventDriven,
+    /// Externally-managed agent visible for fleet monitoring only.
+    /// Not scheduled or executed by the runtime.
+    External {
+        /// Optional HTTP endpoint for the agent (future health check pull).
+        endpoint: Option<String>,
+        /// Optional AgentPin domain for identity verification (A2A forward-compat).
+        agentpin_domain: Option<String>,
+        /// Expected heartbeat interval in seconds. Default 60. Unreachable after 3×.
+        heartbeat_interval_secs: u64,
+    },
 }
 
 /// Agent state in the lifecycle
@@ -51,6 +66,8 @@ pub enum AgentState {
     Failed,
     Terminating,
     Terminated,
+    /// External agent has not sent a heartbeat within the expected window.
+    Unreachable,
 }
 
 /// Agent metadata structure

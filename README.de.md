@@ -1,263 +1,209 @@
 <img src="logo-hz.png" alt="Symbi">
 
-**Symbi** ist ein KI-natives Agentenframework zum Aufbau autonomer und richtlinienbewusster Agenten, die sicher mit Menschen, anderen Agenten und großen Sprachmodellen zusammenarbeiten können. Die Community Edition bietet Kernfunktionalität mit optionalen Enterprise-Features für erweiterte Sicherheit, Überwachung und Zusammenarbeit.
+[English](README.md) | [中文简体](README.zh-cn.md) | [Español](README.es.md) | [Português](README.pt.md) | [日本語](README.ja.md) | **Deutsch**
 
-## 🚀 Schnellstart
+[![Build](https://img.shields.io/github/actions/workflow/status/thirdkeyai/symbiont/docker-build.yml?branch=main)](https://github.com/thirdkeyai/symbiont/actions)
+[![Crates.io](https://img.shields.io/crates/v/symbi)](https://crates.io/crates/symbi)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-online-brightgreen)](https://docs.symbiont.dev)
+
+---
+
+**Richtliniengesteuerte Agenten-Laufzeitumgebung fuer den Produktionseinsatz.**
+*Derselbe Agent. Sichere Laufzeitumgebung.*
+
+Symbiont ist eine Rust-native Laufzeitumgebung fuer die Ausfuehrung von KI-Agenten und Tools unter expliziter Richtlinien-, Identitaets- und Audit-Kontrolle.
+
+Die meisten Agenten-Frameworks konzentrieren sich auf Orchestrierung. Symbiont konzentriert sich darauf, was passiert, wenn Agenten in realen Umgebungen mit echten Risiken ausgefuehrt werden muessen: nicht vertrauenswuerdige Tools, sensible Daten, Genehmigungsgrenzen, Audit-Anforderungen und wiederholbare Durchsetzung.
+
+---
+
+## Warum Symbiont
+
+KI-Agenten sind leicht zu demonstrieren und schwer zu vertrauen.
+
+Sobald ein Agent Tools aufrufen, auf Dateien zugreifen, Nachrichten senden oder externe Dienste nutzen kann, braucht man mehr als Prompts und Glue-Code. Man braucht:
+
+* **Richtliniendurchsetzung** fuer das, was ein Agent tun darf -- eingebaute DSL und [Cedar](https://www.cedarpolicy.com/)-Autorisierung
+* **Tool-Verifikation**, damit die Ausfuehrung kein blindes Vertrauen ist -- [SchemaPin](https://github.com/ThirdKeyAI/SchemaPin) kryptografische Verifikation von MCP-Tools
+* **Tool-Vertraege**, die regeln, wie Tools ausgefuehrt werden -- [ToolClad](https://github.com/ThirdKeyAI/ToolClad) deklarative Argumentvalidierung, Scope-Durchsetzung und Injection-Schutz
+* **Agenten-Identitaet**, damit man weiss, wer handelt -- [AgentPin](https://github.com/ThirdKeyAI/AgentPin) domaingebundene ES256-Identitaet
+* **Sandboxing** fuer riskante Workloads -- Docker-Isolation mit Ressourcenlimits
+* **Audit-Trails** fuer das, was passiert ist und warum -- kryptografisch manipulationssichere Logs
+* **Genehmigungsgates** fuer sensible Aktionen -- menschliche Ueberpruefung vor der Ausfuehrung, wenn die Richtlinie es erfordert
+
+Symbiont ist fuer diese Schicht gebaut.
+
+---
+
+## Schnellstart
 
 ### Voraussetzungen
-- Docker (empfohlen) oder Rust 1.88+
-- Qdrant Vektordatenbank (für semantische Suche)
 
-### Ausführung mit vorgefertigten Containern
+* Docker (empfohlen) oder Rust 1.82+
 
-**GitHub Container Registry verwenden (empfohlen):**
+### Ausfuehrung mit Docker
 
 ```bash
-# symbi unified CLI ausführen
-docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest dsl parse /workspace/agent.dsl
+# Laufzeitumgebung starten (API auf :8080, HTTP-Eingabe auf :8081)
+docker run --rm -p 8080:8080 -p 8081:8081 ghcr.io/thirdkeyai/symbi:latest up
 
-# MCP Server ausführen
+# Nur MCP-Server ausfuehren
 docker run --rm -p 8080:8080 ghcr.io/thirdkeyai/symbi:latest mcp
 
-# Interaktive Entwicklung
-docker run --rm -it -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest bash
+# Agent-DSL-Datei parsen
+docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest dsl parse /workspace/agent.dsl
 ```
 
 ### Aus Quellcode erstellen
 
 ```bash
-# Entwicklungsumgebung erstellen
-docker build -t symbi:latest .
-docker run --rm -it -v $(pwd):/workspace symbi:latest bash
-
-# symbi unified binary erstellen
 cargo build --release
+./target/release/symbi --help
 
-# Komponenten testen
-cargo test
+# Laufzeitumgebung starten
+cargo run -- up
 
-# Beispielagenten ausführen (von crates/runtime)
-cd crates/runtime && cargo run --example basic_agent
-cd crates/runtime && cargo run --example full_system
-cd crates/runtime && cargo run --example rag_example
-
-# symbi unified CLI verwenden
-cargo run -- dsl parse my_agent.dsl
-cargo run -- mcp --port 8080
-
-# HTTP API aktivieren (optional)
-cd crates/runtime && cargo run --features http-api --example full_system
+# Interaktive REPL
+cargo run -- repl
 ```
 
-### Optionale HTTP API
-
-RESTful HTTP API für externe Integration aktivieren:
-
-```bash
-# Mit HTTP API Feature erstellen
-cargo build --features http-api
-
-# Oder zu Cargo.toml hinzufügen
-[dependencies]
-symbi-runtime = { version = "0.1.2", features = ["http-api"] }
-```
-
-**Hauptendpunkte:**
-- `GET /api/v1/health` - Gesundheitsprüfung und Systemstatus
-- `GET /api/v1/agents` - Alle aktiven Agenten auflisten
-- `POST /api/v1/workflows/execute` - Workflows ausführen
-- `GET /api/v1/metrics` - Systemmetriken
-
-## 📁 Projektstruktur
-
-```
-symbi/
-├── src/                   # symbi unified CLI binary
-├── crates/                # Workspace crates
-│   ├── dsl/              # Symbi DSL Implementation
-│   │   ├── src/          # Parser- und Bibliothekscode
-│   │   ├── tests/        # DSL-Testsuite
-│   │   └── tree-sitter-symbiont/ # Grammatikdefinition
-│   └── runtime/          # Agent Runtime System (Community)
-│       ├── src/          # Kern-Runtime-Komponenten
-│       ├── examples/     # Verwendungsbeispiele
-│       └── tests/        # Integrationstests
-├── docs/                 # Dokumentation
-└── Cargo.toml           # Workspace-Konfiguration
-```
-
-## 🔧 Features
-
-### ✅ Community Features (OSS)
-- **DSL-Grammatik**: Vollständige Tree-sitter-Grammatik für Agentendefinitionen
-- **Agenten-Runtime**: Aufgabenplanung, Ressourcenverwaltung, Lebenszykluskontrolle
-- **Tier 1 Isolation**: Docker-Container-Isolation für Agentenoperationen
-- **MCP Integration**: Model Context Protocol Client für externe Tools
-- **SchemaPin Security**: Grundlegende kryptografische Tool-Verifikation
-- **RAG Engine**: Retrieval-Augmented Generation mit Vektorsuche
-- **Kontextverwaltung**: Persistenter Agentenspeicher und Wissenserhaltung
-- **Vektordatenbank**: Qdrant-Integration für semantische Suche
-- **Umfassendes Secrets Management**: HashiCorp Vault Integration mit mehreren Authentifizierungsmethoden
-- **Verschlüsseltes Datei-Backend**: AES-256-GCM Verschlüsselung mit OS-Keyring-Integration
-- **Secrets CLI Tools**: Vollständige Verschlüsseln/Entschlüsseln/Bearbeiten-Operationen mit Audit-Trails
-- **HTTP API**: Optionale RESTful-Schnittstelle (Feature-gesteuert)
-
-### 🏢 Enterprise Features (Lizenz erforderlich)
-- **Erweiterte Isolation**: gVisor und Firecracker Isolation **(Enterprise)**
-- **KI-Tool-Review**: Automatisierter Sicherheitsanalyse-Workflow **(Enterprise)**
-- **Kryptografische Auditierung**: Vollständige Audit-Trails mit Ed25519-Signaturen **(Enterprise)**
-- **Multi-Agent-Kommunikation**: Verschlüsseltes Messaging zwischen Agenten **(Enterprise)**
-- **Echtzeit-Monitoring**: SLA-Metriken und Performance-Dashboards **(Enterprise)**
-- **Professional Services & Support**: Kundenspezifische Entwicklung und Support **(Enterprise)**
-
-## 📐 Symbiont DSL
-
-Intelligente Agenten mit eingebauten Richtlinien und Fähigkeiten definieren:
-
-```symbiont
-metadata {
-    version = "1.0.0"
-    author = "Your Name"
-    description = "Data analysis agent"
-}
-
-agent analyze_data(input: DataSet) -> Result {
-    capabilities = ["data_analysis", "visualization"]
-    
-    policy data_privacy {
-        allow: read(input) if input.anonymized == true
-        deny: store(input) if input.contains_pii == true
-        audit: all_operations
-    }
-    
-    with memory = "persistent", requires = "approval" {
-        if (llm_check_safety(input)) {
-            result = analyze(input);
-            return result;
-        } else {
-            return reject("Safety check failed");
-        }
-    }
-}
-```
-
-## 🔐 Secrets Management
-
-Symbi bietet Enterprise-Grade Secrets Management mit mehreren Backend-Optionen:
-
-### Backend-Optionen
-- **HashiCorp Vault**: Produktionsreifes Secrets Management mit mehreren Authentifizierungsmethoden
-  - Token-basierte Authentifizierung
-  - Kubernetes Service Account Authentifizierung
-- **Verschlüsselte Dateien**: AES-256-GCM lokaler verschlüsselter Speicher mit OS-Keyring-Integration
-- **Agent-Namespaces**: Agent-spezifischer Secrets-Zugriff für Isolation
-
-### CLI-Operationen
-```bash
-# Secrets-Datei verschlüsseln
-symbi secrets encrypt config.json --output config.enc
-
-# Secrets-Datei entschlüsseln
-symbi secrets decrypt config.enc --output config.json
-
-# Verschlüsselte Secrets direkt bearbeiten
-symbi secrets edit config.enc
-
-# Vault-Backend konfigurieren
-symbi secrets configure vault --endpoint https://vault.company.com
-```
-
-### Auditierung und Compliance
-- Vollständige Audit-Trails für alle Secrets-Operationen
-- Kryptografische Integritätsverifikation
-- Agent-spezifische Zugriffskontrolle
-- Manipulationssichere Protokollierung
-
-## 🔒 Sicherheitsmodell
-
-### Grundlegende Sicherheit (Community)
-- **Tier 1 Isolation**: Docker-Container-Agentenausführung
-- **Schema-Verifikation**: Kryptografische Tool-Validierung mit SchemaPin
-- **Richtlinien-Engine**: Grundlegende Ressourcenzugriffskontrolle
-- **Secrets Management**: Vault und verschlüsselte Dateispeicher-Integration
-- **Audit-Protokollierung**: Operationsverfolgung und Compliance
-
-### Erweiterte Sicherheit (Enterprise)
-- **Verstärkte Isolation**: gVisor (Tier2) und Firecracker (Tier3) Isolation **(Enterprise)**
-- **KI-Sicherheitsreview**: Automatisierte Tool-Analyse und -Genehmigung **(Enterprise)**
-- **Verschlüsselte Kommunikation**: Sichere Agent-zu-Agent-Nachrichten **(Enterprise)**
-- **Umfassende Audits**: Kryptografische Integritätsgarantien **(Enterprise)**
-
-## 🧪 Tests
-
-```bash
-# Alle Tests ausführen
-cargo test
-
-# Spezifische Komponenten ausführen
-cd crates/dsl && cargo test          # DSL Parser
-cd crates/runtime && cargo test     # Runtime System
-
-# Integrationstests
-cd crates/runtime && cargo test --test integration_tests
-cd crates/runtime && cargo test --test rag_integration_tests
-cd crates/runtime && cargo test --test mcp_client_tests
-```
-
-## 📚 Dokumentation
-
-- **[Erste Schritte](https://docs.symbiont.dev/getting-started)** - Installation und erste Schritte
-- **[DSL-Leitfaden](https://docs.symbiont.dev/dsl-guide)** - Vollständige Sprachreferenz
-- **[Runtime-Architektur](https://docs.symbiont.dev/runtime-architecture)** - Systemdesign
-- **[Sicherheitsmodell](https://docs.symbiont.dev/security-model)** - Sicherheitsimplementierung
-- **[API-Referenz](https://docs.symbiont.dev/api-reference)** - Vollständige API-Dokumentation
-- **[Beitragen](https://docs.symbiont.dev/contributing)** - Entwicklungsrichtlinien
-
-### Technische Referenzen
-- [`crates/runtime/README.md`](crates/runtime/README.md) - Runtime-spezifische Dokumentation
-- [`crates/runtime/API_REFERENCE.md`](crates/runtime/API_REFERENCE.md) - Vollständige API-Referenz
-- [`crates/dsl/README.md`](crates/dsl/README.md) - DSL-Implementierungsdetails
-
-## 🤝 Beitragen
-
-Beiträge sind willkommen! Bitte konsultieren Sie [`docs/contributing.md`](docs/contributing.md) für Richtlinien.
-
-**Entwicklungsprinzipien:**
-- Security First - alle Features müssen Sicherheitsüberprüfung bestehen
-- Zero Trust - alle Eingaben als potenziell böswillig annehmen
-- Umfassende Tests - hohe Testabdeckung beibehalten
-- Klare Dokumentation - alle Features und APIs dokumentieren
-
-## 🎯 Anwendungsfälle
-
-### Entwicklung und Automatisierung
-- Sichere Codegenerierung und Refactoring
-- Automatisierte Tests mit Richtlinien-Compliance
-- KI-Agenten-Deployment mit Tool-Verifikation
-- Wissensmanagement mit semantischer Suche
-
-### Unternehmen und regulierte Branchen
-- HIPAA-konforme Gesundheitsdatenverarbeitung **(Enterprise)**
-- Finanzdienstleistungen mit Audit-Anforderungen **(Enterprise)**
-- Regierungssysteme mit Sicherheitsfreigaben **(Enterprise)**
-- Rechtsdokumentanalyse mit Vertraulichkeit **(Enterprise)**
-
-## 📄 Lizenz
-
-**Community Edition**: MIT-Lizenz  
-**Enterprise Edition**: Kommerzielle Lizenz erforderlich
-
-Kontaktieren Sie [ThirdKey](https://thirdkey.ai) für Enterprise-Lizenzierung.
-
-## 🔗 Links
-
-- [ThirdKey Website](https://thirdkey.ai)
-- [Runtime API-Referenz](crates/runtime/API_REFERENCE.md)
+> Fuer Produktionsdeployments lesen Sie `SECURITY.md` und den [Deployment-Leitfaden](https://docs.symbiont.dev/getting-started), bevor Sie nicht vertrauenswuerdige Tool-Ausfuehrung aktivieren.
 
 ---
 
-*Symbi ermöglicht sichere Zusammenarbeit zwischen KI-Agenten und Menschen durch intelligente Richtliniendurchsetzung, kryptografische Verifikation und umfassende Audit-Trails.*
+## Funktionsweise
+
+Symbiont trennt die Absicht des Agenten von der Ausfuehrungsberechtigung:
+
+1. **Agenten schlagen** Aktionen durch die Reasoning-Schleife vor (Observe-Reason-Gate-Act)
+2. **Die Laufzeitumgebung evaluiert** jede Aktion gegen Richtlinien-, Identitaets- und Vertrauenspruefungen
+3. **Richtlinien entscheiden** -- erlaubte Aktionen werden ausgefuehrt; abgelehnte Aktionen werden blockiert oder zur Genehmigung weitergeleitet
+4. **Alles wird protokolliert** -- manipulationssicherer Audit-Trail fuer jede Entscheidung
+
+Modellausgaben werden niemals als Ausfuehrungsberechtigung behandelt. Die Laufzeitumgebung kontrolliert, was tatsaechlich passiert.
+
+### Beispiel: nicht vertrauenswuerdiges Tool durch Richtlinie blockiert
+
+Ein Agent versucht, ein nicht verifiziertes MCP-Tool aufzurufen. Die Laufzeitumgebung:
+
+1. Prueft den SchemaPin-Verifikationsstatus -- Tool-Signatur fehlt oder ist ungueltig
+2. Evaluiert die Cedar-Richtlinie -- `forbid(action == Action::"tool_call") when { !resource.verified }`
+3. Blockiert die Ausfuehrung und protokolliert die Ablehnung mit vollstaendigem Kontext
+4. Leitet optional an einen Operator zur manuellen Genehmigung weiter
+
+Keine Code-Aenderung erforderlich. Die Richtlinie steuert die Ausfuehrung.
+
+---
+
+## DSL-Beispiel
+
+```symbiont
+agent secure_analyst(input: DataSet) -> Result {
+    policy access_control {
+        allow: read(input) if input.verified == true
+        deny: send_email without approval
+        audit: all_operations
+    }
+
+    with memory = "persistent", requires = "approval" {
+        result = analyze(input);
+        return result;
+    }
+}
+```
+
+Den vollstaendigen DSL-Leitfaden mit `metadata`-, `schedule`-, `webhook`- und `channel`-Bloecken finden Sie im [DSL-Leitfaden](https://docs.symbiont.dev/dsl-guide).
+
+---
+
+## Kernfaehigkeiten
+
+| Faehigkeit | Beschreibung |
+|-----------|-------------|
+| **Policy Engine** | Feingranulare [Cedar](https://www.cedarpolicy.com/)-Autorisierung fuer Agenten-Aktionen, Tool-Aufrufe und Ressourcenzugriff |
+| **Tool-Verifikation** | [SchemaPin](https://github.com/ThirdKeyAI/SchemaPin) kryptografische Verifikation von MCP-Tool-Schemas vor der Ausfuehrung |
+| **Tool-Vertraege** | [ToolClad](https://github.com/ThirdKeyAI/ToolClad) deklarative Vertraege mit Argumentvalidierung, Scope-Durchsetzung und Cedar-Policy-Generierung |
+| **Agenten-Identitaet** | [AgentPin](https://github.com/ThirdKeyAI/AgentPin) domaingebundene ES256-Identitaet fuer Agenten und geplante Aufgaben |
+| **Reasoning-Schleife** | Typestate-erzwungener Observe-Reason-Gate-Act-Zyklus mit Richtlinien-Gates und Circuit-Breakern |
+| **Sandboxing** | Docker-basierte Isolation mit Ressourcenlimits fuer nicht vertrauenswuerdige Workloads |
+| **Audit-Logging** | Manipulationssichere Logs mit strukturierten Datensaetzen fuer jede Richtlinienentscheidung |
+| **Secrets Management** | Vault/OpenBao-Integration, AES-256-GCM-verschluesselter Speicher, pro Agent begrenzt |
+| **MCP-Integration** | Native Model Context Protocol-Unterstuetzung mit gesteuertem Tool-Zugriff |
+
+Weitere Faehigkeiten: Bedrohungsscanning fuer Tool-/Skill-Inhalte (40 Regeln, 10 Angriffskategorien), Cron-Scheduling, persistenter Agentenspeicher, hybride RAG-Suche (LanceDB/Qdrant), Webhook-Verifikation, Delivery-Routing, OTLP-Telemetrie, HTTP-Sicherheitshardening und Governance-Plugins fuer [Claude Code](https://github.com/thirdkeyai/symbi-claude-code) und [Gemini CLI](https://github.com/thirdkeyai/symbi-gemini-cli). Details finden Sie in der [vollstaendigen Dokumentation](https://docs.symbiont.dev).
+
+Repraesentative Benchmarks sind im [Benchmark-Harness](crates/runtime/benches/performance_claims.rs) und in den [Schwellenwerttests](crates/runtime/tests/performance_claims.rs) verfuegbar.
+
+---
+
+## Sicherheitsmodell
+
+Symbiont basiert auf einem einfachen Prinzip: **Modellausgaben sollten niemals als Ausfuehrungsberechtigung vertraut werden.**
+
+Aktionen durchlaufen Laufzeitkontrollen:
+
+* **Zero Trust** -- alle Agenten-Eingaben sind standardmaessig nicht vertrauenswuerdig
+* **Richtlinienpruefungen** -- Cedar-Autorisierung vor jedem Tool-Aufruf und Ressourcenzugriff
+* **Tool-Verifikation** -- SchemaPin kryptografische Verifikation von Tool-Schemas
+* **Sandbox-Grenzen** -- Docker-Isolation fuer nicht vertrauenswuerdige Ausfuehrung
+* **Operator-Genehmigung** -- menschliche Ueberpruefungsgates fuer sensible Aktionen
+* **Secrets-Kontrolle** -- Vault/OpenBao-Backends, verschluesselter lokaler Speicher, Agenten-Namespaces
+* **Audit-Logging** -- kryptografisch manipulationssichere Aufzeichnungen jeder Entscheidung
+
+Wenn Sie nicht vertrauenswuerdigen Code oder riskante Tools ausfuehren, verlassen Sie sich nicht auf ein schwaches lokales Ausfuehrungsmodell als einzige Grenze. Siehe [`SECURITY.md`](SECURITY.md) und die [Sicherheitsmodell-Dokumentation](https://docs.symbiont.dev/security-model).
+
+---
+
+## Workspace
+
+| Crate | Beschreibung |
+|-------|-------------|
+| `symbi` | Einheitliches CLI-Binary |
+| `symbi-runtime` | Kern-Agenten-Laufzeitumgebung und Ausfuehrungsengine |
+| `symbi-dsl` | DSL-Parser und -Evaluator |
+| `symbi-channel-adapter` | Slack/Teams/Mattermost-Adapter |
+| `repl-core` / `repl-proto` / `repl-cli` | Interaktive REPL und JSON-RPC-Server |
+| `repl-lsp` | Language Server Protocol-Unterstuetzung |
+| `symbi-a2ui` | Admin-Dashboard (Lit/TypeScript, Alpha) |
+
+Governance-Plugins: [`symbi-claude-code`](https://github.com/thirdkeyai/symbi-claude-code) | [`symbi-gemini-cli`](https://github.com/thirdkeyai/symbi-gemini-cli)
+
+---
+
+## Dokumentation
+
+* [Erste Schritte](https://docs.symbiont.dev/getting-started)
+* [Sicherheitsmodell](https://docs.symbiont.dev/security-model)
+* [Runtime-Architektur](https://docs.symbiont.dev/runtime-architecture)
+* [Reasoning-Loop-Leitfaden](https://docs.symbiont.dev/reasoning-loop)
+* [DSL-Leitfaden](https://docs.symbiont.dev/dsl-guide)
+* [API-Referenz](https://docs.symbiont.dev/api-reference)
+
+Wenn Sie Symbiont fuer den Produktionseinsatz evaluieren, beginnen Sie mit dem Sicherheitsmodell und der Erste-Schritte-Dokumentation.
+
+---
+
+## SDKs
+
+Offizielle Client-SDKs zur Integration der Symbiont-Laufzeitumgebung in Ihre Anwendung:
+
+| Sprache | Paket | Repository |
+|---------|-------|------------|
+| **JavaScript/TypeScript** | [symbiont-sdk-js](https://www.npmjs.com/package/symbiont-sdk-js) | [GitHub](https://github.com/ThirdKeyAI/symbiont-sdk-js) |
+| **Python** | [symbiont-sdk](https://pypi.org/project/symbiont-sdk/) | [GitHub](https://github.com/ThirdKeyAI/symbiont-sdk-python) |
+
+---
+
+## Lizenz
+
+* **Community Edition** (Apache 2.0): Kern-Laufzeitumgebung, DSL, Policy Engine, Tool-Verifikation, Sandboxing, Agentenspeicher, Scheduling, MCP-Integration, RAG, Audit-Logging und alle CLI/REPL-Werkzeuge.
+* **Enterprise Edition** (kommerzielle Lizenz): Erweiterte Sandbox-Backends, Compliance-Audit-Exporte, KI-gestuetzte Tool-Ueberpruefung, verschluesselte Multi-Agenten-Kollaboration, Monitoring-Dashboards und dedizierter Support.
+
+Kontaktieren Sie [ThirdKey](https://thirdkey.ai) fuer Enterprise-Lizenzierung.
+
+---
 
 <div align="right">
-  <img src="symbi-trans.png" alt="Symbi Transparentes Logo" width="120">
+  <img src="symbi-trans.png" alt="Symbi-Logo" width="120">
 </div>

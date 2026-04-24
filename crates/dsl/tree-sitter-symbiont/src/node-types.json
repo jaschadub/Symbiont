@@ -20,7 +20,34 @@
           "named": true
         },
         {
+          "type": "parameter",
+          "named": true
+        },
+        {
           "type": "policy_definition",
+          "named": true
+        },
+        {
+          "type": "type",
+          "named": true
+        },
+        {
+          "type": "with_block",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "array",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "expression",
           "named": true
         }
       ]
@@ -62,6 +89,105 @@
     }
   },
   {
+    "type": "channel_data_classification_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "data_classification_rule",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "channel_definition",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "channel_data_classification_block",
+          "named": true
+        },
+        {
+          "type": "channel_policy_block",
+          "named": true
+        },
+        {
+          "type": "channel_property",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "channel_policy_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "policy_rule",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "channel_property",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "array",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "value",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "data_classification_rule",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "expression",
     "named": true,
     "fields": {},
@@ -69,6 +195,10 @@
       "multiple": false,
       "required": true,
       "types": [
+        {
+          "type": "array",
+          "named": true
+        },
         {
           "type": "function_call",
           "named": true
@@ -132,6 +262,10 @@
         },
         {
           "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "named_argument",
           "named": true
         }
       ]
@@ -203,6 +337,82 @@
     }
   },
   {
+    "type": "memory_definition",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "memory_property",
+          "named": true
+        },
+        {
+          "type": "memory_search_block",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "memory_property",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "value",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "memory_search_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "memory_search_property",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "memory_search_property",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "value",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "metadata_block",
     "named": true,
     "fields": {},
@@ -231,6 +441,25 @@
         },
         {
           "type": "value",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "named_argument",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "expression",
+          "named": true
+        },
+        {
+          "type": "identifier",
           "named": true
         }
       ]
@@ -303,11 +532,19 @@
           "named": true
         },
         {
+          "type": "channel_definition",
+          "named": true
+        },
+        {
           "type": "comment",
           "named": true
         },
         {
           "type": "function_definition",
+          "named": true
+        },
+        {
+          "type": "memory_definition",
           "named": true
         },
         {
@@ -319,7 +556,15 @@
           "named": true
         },
         {
+          "type": "schedule_definition",
+          "named": true
+        },
+        {
           "type": "type_definition",
+          "named": true
+        },
+        {
+          "type": "webhook_definition",
           "named": true
         }
       ]
@@ -335,6 +580,44 @@
       "types": [
         {
           "type": "expression",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "schedule_definition",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "schedule_property",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "schedule_property",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "value",
           "named": true
         }
       ]
@@ -452,11 +735,133 @@
           "named": true
         },
         {
+          "type": "duration_literal",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
           "type": "number",
           "named": true
         },
         {
           "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "webhook_definition",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "webhook_filter_block",
+          "named": true
+        },
+        {
+          "type": "webhook_property",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "webhook_filter_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "webhook_filter_property",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "webhook_filter_property",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "value",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "webhook_property",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "value",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "with_attribute",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "value",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "with_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "block",
+          "named": true
+        },
+        {
+          "type": "with_attribute",
           "named": true
         }
       ]
@@ -531,13 +936,25 @@
     "named": false
   },
   {
+    "type": "channel",
+    "named": false
+  },
+  {
     "type": "comment",
     "named": true,
     "extra": true
   },
   {
+    "type": "data_classification",
+    "named": false
+  },
+  {
     "type": "deny",
     "named": false
+  },
+  {
+    "type": "duration_literal",
+    "named": true
   },
   {
     "type": "else",
@@ -545,6 +962,10 @@
   },
   {
     "type": "false",
+    "named": false
+  },
+  {
+    "type": "filter",
     "named": false
   },
   {
@@ -572,6 +993,10 @@
     "named": false
   },
   {
+    "type": "memory",
+    "named": false
+  },
+  {
     "type": "metadata",
     "named": false
   },
@@ -592,6 +1017,14 @@
     "named": false
   },
   {
+    "type": "schedule",
+    "named": false
+  },
+  {
+    "type": "search",
+    "named": false
+  },
+  {
     "type": "string",
     "named": true
   },
@@ -601,6 +1034,14 @@
   },
   {
     "type": "type",
+    "named": false
+  },
+  {
+    "type": "webhook",
+    "named": false
+  },
+  {
+    "type": "with",
     "named": false
   },
   {

@@ -12,6 +12,17 @@ use thiserror::Error;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
+/// Controls whether audit failures block secret operations
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditFailureMode {
+    /// Block the secret operation if audit logging fails (production default)
+    #[default]
+    Strict,
+    /// Log a warning and allow the operation to proceed
+    Permissive,
+}
+
 /// Errors that can occur during audit operations
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]
 pub enum AuditError {
@@ -55,6 +66,8 @@ pub struct SecretAuditEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AuditOutcome {
+    /// Intent to perform an operation (logged *before* the call)
+    Attempt,
     /// Operation completed successfully
     Success,
     /// Operation failed
@@ -62,6 +75,22 @@ pub enum AuditOutcome {
 }
 
 impl SecretAuditEvent {
+    /// Create an intent-to-access audit event, logged **before** the backend call.
+    ///
+    /// This ensures that even if the process crashes during the Vault/file read,
+    /// there is a paper trail showing the access was attempted.
+    pub fn attempt(agent_id: String, operation: String, secret_key: Option<String>) -> Self {
+        Self {
+            timestamp: Utc::now(),
+            agent_id,
+            operation,
+            secret_key,
+            outcome: AuditOutcome::Attempt,
+            error_message: None,
+            metadata: None,
+        }
+    }
+
     /// Create a new audit event for a successful operation
     pub fn success(agent_id: String, operation: String, secret_key: Option<String>) -> Self {
         Self {
@@ -112,12 +141,17 @@ pub trait SecretAuditSink: Send + Sync {
     /// * `Ok(())` - If the event was successfully logged
     /// * `Err(AuditError)` - If there was an error logging the event
     async fn log_event(&self, event: SecretAuditEvent) -> Result<(), AuditError>;
+
+    /// Return the failure mode for this audit sink
+    fn failure_mode(&self) -> AuditFailureMode;
 }
 
 /// JSON file-based audit sink that appends audit events as JSON lines
 pub struct JsonFileAuditSink {
     /// Path to the audit log file
     file_path: PathBuf,
+    /// Failure mode for this sink
+    failure_mode: AuditFailureMode,
 }
 
 impl JsonFileAuditSink {
@@ -127,19 +161,30 @@ impl JsonFileAuditSink {
     /// * `file_path` - Path to the audit log file
     ///
     /// # Returns
-    /// * New JsonFileAuditSink instance
+    /// * New JsonFileAuditSink instance (defaults to Strict failure mode)
     pub fn new(file_path: PathBuf) -> Self {
-        Self { file_path }
+        Self {
+            file_path,
+            failure_mode: AuditFailureMode::default(),
+        }
+    }
+
+    /// Create a new JSON file audit sink with a specific failure mode
+    pub fn with_failure_mode(file_path: PathBuf, failure_mode: AuditFailureMode) -> Self {
+        Self {
+            file_path,
+            failure_mode,
+        }
     }
 
     /// Ensure the audit log directory exists
     async fn ensure_directory_exists(&self) -> Result<(), AuditError> {
         if let Some(parent) = self.file_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                AuditError::IoError {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| AuditError::IoError {
                     message: format!("Failed to create audit log directory: {}", e),
-                }
-            })?;
+                })?;
         }
         Ok(())
     }
@@ -152,16 +197,17 @@ impl SecretAuditSink for JsonFileAuditSink {
         self.ensure_directory_exists().await?;
 
         // Serialize the event to JSON
-        let json_line = serde_json::to_string(&event).map_err(|e| {
-            AuditError::SerializationError {
+        let json_line =
+            serde_json::to_string(&event).map_err(|e| AuditError::SerializationError {
                 message: format!("Failed to serialize audit event: {}", e),
-            }
-        })?;
+            })?;
 
         // Open the file in append mode (create if it doesn't exist)
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        opts.mode(0o600); // Owner-only read/write
+        let mut file = opts
             .open(&self.file_path)
             .await
             .map_err(|e| AuditError::IoError {
@@ -169,15 +215,17 @@ impl SecretAuditSink for JsonFileAuditSink {
             })?;
 
         // Write the JSON line followed by a newline
-        file.write_all(json_line.as_bytes()).await.map_err(|e| {
-            AuditError::IoError {
+        file.write_all(json_line.as_bytes())
+            .await
+            .map_err(|e| AuditError::IoError {
                 message: format!("Failed to write to audit log: {}", e),
-            }
-        })?;
+            })?;
 
-        file.write_all(b"\n").await.map_err(|e| AuditError::IoError {
-            message: format!("Failed to write newline to audit log: {}", e),
-        })?;
+        file.write_all(b"\n")
+            .await
+            .map_err(|e| AuditError::IoError {
+                message: format!("Failed to write newline to audit log: {}", e),
+            })?;
 
         // Ensure data is written to disk
         file.flush().await.map_err(|e| AuditError::IoError {
@@ -185,6 +233,10 @@ impl SecretAuditSink for JsonFileAuditSink {
         })?;
 
         Ok(())
+    }
+
+    fn failure_mode(&self) -> AuditFailureMode {
+        self.failure_mode
     }
 }
 
@@ -194,9 +246,13 @@ pub type BoxedAuditSink = Arc<dyn SecretAuditSink + Send + Sync>;
 /// Helper function to create an optional audit sink from configuration
 pub fn create_audit_sink(audit_config: &Option<AuditConfig>) -> Option<BoxedAuditSink> {
     audit_config.as_ref().map(|config| match config {
-        AuditConfig::JsonFile { file_path } => {
-            Arc::new(JsonFileAuditSink::new(file_path.clone())) as BoxedAuditSink
-        }
+        AuditConfig::JsonFile {
+            file_path,
+            failure_mode,
+        } => Arc::new(JsonFileAuditSink::with_failure_mode(
+            file_path.clone(),
+            failure_mode.unwrap_or_default(),
+        )) as BoxedAuditSink,
     })
 }
 
@@ -208,6 +264,9 @@ pub enum AuditConfig {
     JsonFile {
         /// Path to the audit log file
         file_path: PathBuf,
+        /// Failure mode: strict (block operation) or permissive (log warning)
+        #[serde(default)]
+        failure_mode: Option<AuditFailureMode>,
     },
 }
 
@@ -278,11 +337,8 @@ mod tests {
 
         // Log multiple events
         for i in 0..3 {
-            let event = SecretAuditEvent::success(
-                format!("agent-{}", i),
-                "list_secrets".to_string(),
-                None,
-            );
+            let event =
+                SecretAuditEvent::success(format!("agent-{}", i), "list_secrets".to_string(), None);
             sink.log_event(event).await.unwrap();
         }
 

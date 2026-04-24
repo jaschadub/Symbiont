@@ -12,7 +12,7 @@ use crate::types::AgentId;
 #[cfg(feature = "http-input")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpInputConfig {
-    /// Address to bind the HTTP server (e.g., "0.0.0.0" or "127.0.0.1")
+    /// Address to bind the HTTP server (default: "127.0.0.1"; use "0.0.0.0" to listen on all interfaces)
     pub bind_address: String,
 
     /// Port number to listen on (e.g., 8081)
@@ -45,18 +45,21 @@ pub struct HttpInputConfig {
     /// Optional headers to inject into agent input context
     pub forward_headers: Vec<String>,
 
-    /// Optional CORS support for browser-facing apps
-    pub cors_enabled: bool,
+    /// Optional CORS origin allow-list (empty = CORS disabled, `["*"]` = permissive)
+    pub cors_origins: Vec<String>,
 
     /// Enable structured audit logging of all received events
     pub audit_enabled: bool,
+
+    /// Webhook signature verification configuration.
+    pub webhook_verify: Option<WebhookVerifyConfig>,
 }
 
 #[cfg(feature = "http-input")]
 impl Default for HttpInputConfig {
     fn default() -> Self {
         Self {
-            bind_address: "0.0.0.0".to_string(),
+            bind_address: "127.0.0.1".to_string(),
             port: 8081,
             path: "/webhook".to_string(),
             agent: AgentId::new(),
@@ -67,8 +70,9 @@ impl Default for HttpInputConfig {
             routing_rules: None,
             response_control: None,
             forward_headers: vec![],
-            cors_enabled: false,
+            cors_origins: vec![],
             audit_enabled: true,
+            webhook_verify: None,
         }
     }
 }
@@ -105,6 +109,16 @@ pub struct ResponseControlConfig {
     pub error_status: u16,
     /// Whether to echo the input request body on error
     pub echo_input_on_error: bool,
+}
+
+/// Configuration for webhook signature verification.
+#[cfg(feature = "http-input")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookVerifyConfig {
+    /// Provider preset (github, stripe, slack, custom).
+    pub provider: String,
+    /// Secret for signature verification (can be a secret:// reference).
+    pub secret: String,
 }
 
 #[cfg(feature = "http-input")]

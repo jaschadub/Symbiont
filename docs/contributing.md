@@ -1,21 +1,9 @@
----
-layout: default
-title: Contributing
-nav_order: 6
-description: "How to contribute to the Symbiont project"
----
-
 # Contributing
-{: .no_toc }
+
 
 Learn how to contribute to the Symbiont project, from reporting issues to submitting code changes.
-{: .fs-6 .fw-300 }
 
-## Table of contents
-{: .no_toc .text-delta }
 
-1. TOC
-{:toc}
 
 ---
 
@@ -40,7 +28,7 @@ Symbiont welcomes contributions from the community! Whether you're fixing bugs, 
 
 Before contributing, ensure you have:
 
-- **Rust 1.88+** with cargo
+- **Rust 1.82+** with cargo
 - **Git** for version control
 - **Docker** for testing and development
 - **Basic knowledge** of Rust, security principles, and AI systems
@@ -87,7 +75,7 @@ cargo tarpaulin --out html
 4. **Start Development Services**
 ```bash
 # Start required services with Docker Compose
-docker-compose up -d qdrant redis postgres
+docker-compose up -d redis postgres
 
 # Verify services are running
 cargo run --example basic_agent
@@ -216,7 +204,7 @@ What actually happens
 ## Environment
 - OS: [e.g., Ubuntu 22.04]
 - Rust version: [e.g., 1.88.0]
-- Symbiont version: [e.g., 0.5.0]
+- Symbiont version: [e.g., 1.0.0]
 - Docker version: [if applicable]
 
 ## Additional Context
@@ -309,16 +297,10 @@ description: "Brief page description"
 ---
 
 # Page Title
-{: .no_toc }
 
 Brief introduction paragraph.
-{: .fs-6 .fw-300 }
 
-## Table of contents
-{: .no_toc .text-delta }
 
-1. TOC
-{:toc}
 
 ---
 

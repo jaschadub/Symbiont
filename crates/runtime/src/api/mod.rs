@@ -13,10 +13,31 @@ pub mod routes;
 pub mod middleware;
 
 #[cfg(feature = "http-api")]
+pub mod api_keys;
+
+#[cfg(feature = "http-api")]
 pub mod types;
 
 #[cfg(feature = "http-api")]
 pub mod traits;
+
+#[cfg(feature = "http-api")]
+pub mod ws_types;
+
+#[cfg(feature = "http-api")]
+pub mod streaming_journal;
+
+#[cfg(feature = "http-api")]
+pub mod coordinator_executor;
+
+#[cfg(feature = "http-api")]
+pub mod coordinator;
+
+#[cfg(feature = "http-api")]
+pub mod ws_handler;
+
+#[cfg(feature = "composio")]
+pub mod composio_executor;
 
 #[cfg(feature = "http-api")]
 pub use server::HttpApiServer;

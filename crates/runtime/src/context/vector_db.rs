@@ -1,12 +1,15 @@
 //! Vector Database integration for Qdrant
 
 use async_trait::async_trait;
+#[cfg(feature = "vector-qdrant")]
 use qdrant_client::config::QdrantConfig as ClientConfig;
+#[cfg(feature = "vector-qdrant")]
 use qdrant_client::qdrant::{
     Condition, CreateCollection, DeletePoints, Distance, FieldCondition, Filter, Match, PointId,
     PointStruct, PointsIdsList, PointsSelector, SearchPoints, UpsertPoints, Value as QdrantValue,
     VectorParams, VectorsConfig, WithPayloadSelector, WithVectorsSelector,
 };
+#[cfg(feature = "vector-qdrant")]
 use qdrant_client::Qdrant;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -17,6 +20,7 @@ use super::types::*;
 use crate::types::AgentId;
 
 /// Convert Qdrant errors to ContextError with specific mappings
+#[cfg(feature = "vector-qdrant")]
 fn map_qdrant_error(error: qdrant_client::QdrantError) -> ContextError {
     match error {
         qdrant_client::QdrantError::ResponseError { status, .. } => {
@@ -89,6 +93,7 @@ pub enum QdrantDistance {
     Dot,
 }
 
+#[cfg(feature = "vector-qdrant")]
 impl From<QdrantDistance> for Distance {
     fn from(distance: QdrantDistance) -> Self {
         match distance {
@@ -183,11 +188,13 @@ pub struct VectorDatabaseStats {
 }
 
 /// Qdrant client wrapper implementation
+#[cfg(feature = "vector-qdrant")]
 pub struct QdrantClientWrapper {
     client: Arc<RwLock<Option<Arc<Qdrant>>>>,
     config: QdrantConfig,
 }
 
+#[cfg(feature = "vector-qdrant")]
 impl QdrantClientWrapper {
     /// Create a new QdrantClientWrapper
     pub fn new(config: QdrantConfig) -> Self {
@@ -374,6 +381,7 @@ impl QdrantClientWrapper {
     }
 }
 
+#[cfg(feature = "vector-qdrant")]
 #[async_trait]
 impl VectorDatabase for QdrantClientWrapper {
     async fn initialize(&self) -> Result<(), ContextError> {
@@ -438,11 +446,45 @@ impl VectorDatabase for QdrantClientWrapper {
         let client = self.get_client().await?;
         let vector_id = VectorId::new();
 
+        // Extract agent_id from context - for now use a default agent id based on content hash
+        let agent_id = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+
+            let mut hasher = DefaultHasher::new();
+            item.content.hash(&mut hasher);
+            item.id.0.hash(&mut hasher);
+            let hash_value = hasher.finish();
+
+            // Create a deterministic UUID from hash
+            let uuid_bytes = [
+                (hash_value >> 56) as u8,
+                (hash_value >> 48) as u8,
+                (hash_value >> 40) as u8,
+                (hash_value >> 32) as u8,
+                (hash_value >> 24) as u8,
+                (hash_value >> 16) as u8,
+                (hash_value >> 8) as u8,
+                hash_value as u8,
+                // Fill remaining 8 bytes with more hash data
+                (hash_value >> 56) as u8,
+                (hash_value >> 48) as u8,
+                (hash_value >> 40) as u8,
+                (hash_value >> 32) as u8,
+                (hash_value >> 24) as u8,
+                (hash_value >> 16) as u8,
+                (hash_value >> 8) as u8,
+                hash_value as u8,
+            ];
+
+            AgentId(uuid::Uuid::from_bytes(uuid_bytes))
+        };
+
         // Create point for Qdrant
         let point = PointStruct::new(
             vector_id.0.to_string(),
             embedding,
-            self.knowledge_item_to_metadata(item, AgentId::new()), // Using new AgentId as placeholder
+            self.knowledge_item_to_metadata(item, agent_id),
         );
 
         let upsert_points = UpsertPoints {
@@ -1086,6 +1128,279 @@ impl VectorDatabase for QdrantClientWrapper {
             collection_size_bytes: 0, // Not directly available from Qdrant API
             avg_query_time_ms: 0.0,   // Would need to track this separately
         })
+    }
+}
+
+#[cfg(feature = "vector-qdrant")]
+#[async_trait]
+impl super::vector_db_trait::VectorDb for QdrantClientWrapper {
+    async fn initialize(&self) -> Result<(), ContextError> {
+        <Self as VectorDatabase>::initialize(self).await
+    }
+    async fn store_knowledge_item(
+        &self,
+        item: &KnowledgeItem,
+        embedding: Vec<f32>,
+    ) -> Result<VectorId, ContextError> {
+        <Self as VectorDatabase>::store_knowledge_item(self, item, embedding).await
+    }
+    async fn store_memory_item(
+        &self,
+        agent_id: AgentId,
+        memory: &MemoryItem,
+        embedding: Vec<f32>,
+    ) -> Result<VectorId, ContextError> {
+        <Self as VectorDatabase>::store_memory_item(self, agent_id, memory, embedding).await
+    }
+    async fn batch_store(
+        &self,
+        batch: VectorBatchOperation,
+    ) -> Result<Vec<VectorId>, ContextError> {
+        <Self as VectorDatabase>::batch_store(self, batch).await
+    }
+    async fn search_knowledge_base(
+        &self,
+        agent_id: AgentId,
+        query_embedding: Vec<f32>,
+        limit: usize,
+    ) -> Result<Vec<KnowledgeItem>, ContextError> {
+        <Self as VectorDatabase>::search_knowledge_base(self, agent_id, query_embedding, limit)
+            .await
+    }
+    async fn semantic_search(
+        &self,
+        agent_id: AgentId,
+        query_embedding: Vec<f32>,
+        limit: usize,
+        threshold: f32,
+    ) -> Result<Vec<ContextItem>, ContextError> {
+        <Self as VectorDatabase>::semantic_search(self, agent_id, query_embedding, limit, threshold)
+            .await
+    }
+    async fn advanced_search(
+        &self,
+        agent_id: AgentId,
+        query_embedding: Vec<f32>,
+        filters: HashMap<String, String>,
+        limit: usize,
+        threshold: f32,
+    ) -> Result<Vec<VectorSearchResult>, ContextError> {
+        <Self as VectorDatabase>::advanced_search(
+            self,
+            agent_id,
+            query_embedding,
+            filters,
+            limit,
+            threshold,
+        )
+        .await
+    }
+    async fn delete_knowledge_item(&self, vector_id: VectorId) -> Result<(), ContextError> {
+        <Self as VectorDatabase>::delete_knowledge_item(self, vector_id).await
+    }
+    async fn batch_delete(&self, vector_ids: Vec<VectorId>) -> Result<(), ContextError> {
+        <Self as VectorDatabase>::batch_delete(self, vector_ids).await
+    }
+    async fn update_metadata(
+        &self,
+        vector_id: VectorId,
+        metadata: HashMap<String, Value>,
+    ) -> Result<(), ContextError> {
+        <Self as VectorDatabase>::update_metadata(self, vector_id, metadata).await
+    }
+    async fn get_stats(&self) -> Result<VectorDatabaseStats, ContextError> {
+        <Self as VectorDatabase>::get_stats(self).await
+    }
+    async fn create_index(&self, field_name: &str) -> Result<(), ContextError> {
+        <Self as VectorDatabase>::create_index(self, field_name).await
+    }
+    async fn optimize_collection(&self) -> Result<(), ContextError> {
+        <Self as VectorDatabase>::optimize_collection(self).await
+    }
+    async fn health_check(&self) -> Result<bool, ContextError> {
+        <Self as VectorDatabase>::get_stats(self)
+            .await
+            .map(|_| true)
+    }
+}
+
+/// No-op vector database for when no backend is configured
+pub struct NoOpVectorDatabase;
+
+#[async_trait]
+impl VectorDatabase for NoOpVectorDatabase {
+    async fn initialize(&self) -> Result<(), ContextError> {
+        Ok(())
+    }
+
+    async fn store_knowledge_item(
+        &self,
+        _item: &KnowledgeItem,
+        _embedding: Vec<f32>,
+    ) -> Result<VectorId, ContextError> {
+        Ok(VectorId::new())
+    }
+
+    async fn store_memory_item(
+        &self,
+        _agent_id: AgentId,
+        _memory: &MemoryItem,
+        _embedding: Vec<f32>,
+    ) -> Result<VectorId, ContextError> {
+        Ok(VectorId::new())
+    }
+
+    async fn batch_store(
+        &self,
+        batch: VectorBatchOperation,
+    ) -> Result<Vec<VectorId>, ContextError> {
+        Ok(batch.items.iter().map(|_| VectorId::new()).collect())
+    }
+
+    async fn search_knowledge_base(
+        &self,
+        _agent_id: AgentId,
+        _query_embedding: Vec<f32>,
+        _limit: usize,
+    ) -> Result<Vec<KnowledgeItem>, ContextError> {
+        Ok(Vec::new())
+    }
+
+    async fn semantic_search(
+        &self,
+        _agent_id: AgentId,
+        _query_embedding: Vec<f32>,
+        _limit: usize,
+        _threshold: f32,
+    ) -> Result<Vec<ContextItem>, ContextError> {
+        Ok(Vec::new())
+    }
+
+    async fn advanced_search(
+        &self,
+        _agent_id: AgentId,
+        _query_embedding: Vec<f32>,
+        _filters: HashMap<String, String>,
+        _limit: usize,
+        _threshold: f32,
+    ) -> Result<Vec<VectorSearchResult>, ContextError> {
+        Ok(Vec::new())
+    }
+
+    async fn delete_knowledge_item(&self, _vector_id: VectorId) -> Result<(), ContextError> {
+        Ok(())
+    }
+
+    async fn batch_delete(&self, _vector_ids: Vec<VectorId>) -> Result<(), ContextError> {
+        Ok(())
+    }
+
+    async fn update_metadata(
+        &self,
+        _vector_id: VectorId,
+        _metadata: HashMap<String, Value>,
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+
+    async fn get_stats(&self) -> Result<VectorDatabaseStats, ContextError> {
+        Ok(VectorDatabaseStats {
+            total_vectors: 0,
+            collection_size_bytes: 0,
+            avg_query_time_ms: 0.0,
+        })
+    }
+
+    async fn create_index(&self, _field_name: &str) -> Result<(), ContextError> {
+        Ok(())
+    }
+
+    async fn optimize_collection(&self) -> Result<(), ContextError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl super::vector_db_trait::VectorDb for NoOpVectorDatabase {
+    async fn initialize(&self) -> Result<(), ContextError> {
+        Ok(())
+    }
+    async fn store_knowledge_item(
+        &self,
+        _item: &KnowledgeItem,
+        _embedding: Vec<f32>,
+    ) -> Result<VectorId, ContextError> {
+        Ok(VectorId::new())
+    }
+    async fn store_memory_item(
+        &self,
+        _agent_id: AgentId,
+        _memory: &MemoryItem,
+        _embedding: Vec<f32>,
+    ) -> Result<VectorId, ContextError> {
+        Ok(VectorId::new())
+    }
+    async fn batch_store(
+        &self,
+        batch: VectorBatchOperation,
+    ) -> Result<Vec<VectorId>, ContextError> {
+        Ok(batch.items.iter().map(|_| VectorId::new()).collect())
+    }
+    async fn search_knowledge_base(
+        &self,
+        _agent_id: AgentId,
+        _query_embedding: Vec<f32>,
+        _limit: usize,
+    ) -> Result<Vec<KnowledgeItem>, ContextError> {
+        Ok(Vec::new())
+    }
+    async fn semantic_search(
+        &self,
+        _agent_id: AgentId,
+        _query_embedding: Vec<f32>,
+        _limit: usize,
+        _threshold: f32,
+    ) -> Result<Vec<ContextItem>, ContextError> {
+        Ok(Vec::new())
+    }
+    async fn advanced_search(
+        &self,
+        _agent_id: AgentId,
+        _query_embedding: Vec<f32>,
+        _filters: HashMap<String, String>,
+        _limit: usize,
+        _threshold: f32,
+    ) -> Result<Vec<VectorSearchResult>, ContextError> {
+        Ok(Vec::new())
+    }
+    async fn delete_knowledge_item(&self, _vector_id: VectorId) -> Result<(), ContextError> {
+        Ok(())
+    }
+    async fn batch_delete(&self, _vector_ids: Vec<VectorId>) -> Result<(), ContextError> {
+        Ok(())
+    }
+    async fn update_metadata(
+        &self,
+        _vector_id: VectorId,
+        _metadata: HashMap<String, Value>,
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+    async fn get_stats(&self) -> Result<VectorDatabaseStats, ContextError> {
+        Ok(VectorDatabaseStats {
+            total_vectors: 0,
+            collection_size_bytes: 0,
+            avg_query_time_ms: 0.0,
+        })
+    }
+    async fn create_index(&self, _field_name: &str) -> Result<(), ContextError> {
+        Ok(())
+    }
+    async fn optimize_collection(&self) -> Result<(), ContextError> {
+        Ok(())
+    }
+    async fn health_check(&self) -> Result<bool, ContextError> {
+        Ok(true)
     }
 }
 

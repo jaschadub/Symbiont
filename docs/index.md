@@ -1,195 +1,213 @@
----
-layout: default
-title: Home
-nav_order: 1
-description: "Symbiont: AI-native, privacy-first programming language and agent framework"
-permalink: /
----
-
 # Symbiont Documentation
-{: .fs-9 }
 
-AI-native, privacy-first programming language and agent framework for autonomous, policy-aware software development.
-{: .fs-6 .fw-300 }
-
-[Get started now](#getting-started){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
-[View on GitHub](https://github.com/thirdkeyai/symbiont){: .btn .fs-5 .mb-4 .mb-md-0 }
-
----
-
-## 🌐 Other Languages
-{: .no_toc}
-
-**English** | [中文简体](index.zh-cn.md) | [Español](index.es.md) | [Português](index.pt.md) | [日本語](index.ja.md) | [Deutsch](index.de.md)
-
----
+Policy-governed agent runtime for production. Execute AI agents and tools under explicit policy, identity, and audit controls.
 
 ## What is Symbiont?
 
-Symbiont represents the next evolution in software development — where AI agents and human developers collaborate securely, transparently, and effectively. It enables developers to build autonomous, policy-aware agents that can safely collaborate with humans, other agents, and large language models while enforcing zero-trust security, data privacy, and verifiable behavior.
+Symbiont is a Rust-native runtime for executing AI agents and tools under explicit policy, identity, and audit controls.
 
-### Key Features
+Most agent frameworks focus on orchestration. Symbiont focuses on what happens when agents need to run in real environments with real risk: untrusted tools, sensitive data, approval boundaries, audit requirements, and repeatable enforcement.
 
-- **🛡️ Security-First Design**: Multi-tier sandboxing with Docker and gVisor
-- **📋 Policy-Aware Programming**: Declarative security policies with runtime enforcement
-- **🔐 Enterprise Secrets Management**: HashiCorp Vault integration with encrypted file backends
-- **🔑 Cryptographic Auditability**: Complete operation logging with Ed25519 signatures
-- **🧠 Intelligent Context Management**: RAG-enhanced knowledge systems with vector search
-- **🔗 Secure Tool Integration**: MCP protocol with cryptographic verification
-- **⚡ High Performance**: Rust-native implementation for production workloads
+### How it works
+
+Symbiont separates agent intent from execution authority:
+
+1. **Agents propose** actions through the reasoning loop (Observe-Reason-Gate-Act)
+2. **The runtime evaluates** each action against policy, identity, and trust checks
+3. **Policy decides** — allowed actions execute; denied actions are blocked or routed for approval
+4. **Everything is logged** — tamper-evident audit trail for every decision
+
+Model output is never treated as execution authority. The runtime controls what actually happens.
+
+### Core capabilities
+
+| Capability | What it does |
+|-----------|-------------|
+| **Policy engine** | Fine-grained [Cedar](https://www.cedarpolicy.com/) authorization for agent actions, tool calls, and resource access |
+| **Tool verification** | [SchemaPin](https://schemapin.org) cryptographic verification of MCP tool schemas before execution |
+| **Agent identity** | [AgentPin](https://agentpin.org) domain-anchored ES256 identity for agents and scheduled tasks |
+| **Reasoning loop** | Typestate-enforced Observe-Reason-Gate-Act cycle with policy gates and circuit breakers |
+| **Sandboxing** | Docker-based isolation with resource limits for untrusted workloads |
+| **Audit logging** | Tamper-evident logs with structured records for every policy decision |
+| **Secrets management** | Vault/OpenBao integration, AES-256-GCM encrypted storage, scoped per agent |
+| **MCP integration** | Native Model Context Protocol support with governed tool access |
+
+Additional capabilities: threat scanning for tool/skill content, cron scheduling, persistent agent memory, hybrid RAG search (LanceDB/Qdrant), webhook verification, delivery routing, OTLP telemetry, HTTP security hardening, channel adapters (Slack/Teams/Mattermost), and governance plugins for [Claude Code](https://github.com/thirdkeyai/symbi-claude-code) and [Gemini CLI](https://github.com/thirdkeyai/symbi-gemini-cli).
 
 ---
 
-## Getting Started
+## Quick start
 
-### Quick Installation
+### Installation
 
+**Install script (macOS / Linux):**
 ```bash
-# Clone the repository
+curl -fsSL https://symbiont.dev/install.sh | bash
+```
+
+**Homebrew (macOS):**
+```bash
+brew tap thirdkeyai/tap
+brew install symbi
+```
+
+**Docker:**
+```bash
+docker run --rm -p 8080:8080 -p 8081:8081 ghcr.io/thirdkeyai/symbi:latest up
+```
+
+**From source:**
+```bash
 git clone https://github.com/thirdkeyai/symbiont.git
 cd symbiont
-
-# Build unified symbi container
-docker build -t symbi:latest .
-
-# Or use pre-built container
-docker pull ghcr.io/thirdkeyai/symbi:latest
-
-# Test the system
-cargo test
-
-# Test the unified CLI
-docker run --rm symbi:latest --version
-docker run --rm -v $(pwd):/workspace symbi:latest dsl parse --help
-docker run --rm symbi:latest mcp --help
+cargo build --release
 ```
 
-### Your First Agent
+Pre-built binaries are also available from [GitHub Releases](https://github.com/thirdkeyai/symbiont/releases). See the [Getting Started guide](/getting-started) for full details.
 
-```rust
-metadata {
-    version = "1.0.0"
-    author = "developer"
-    description = "Simple analysis agent"
-}
+### Your first agent
 
-agent analyze_data(input: DataSet) -> Result {
-    capabilities = ["data_analysis"]
-    
-    policy secure_analysis {
-        allow: read(input) if input.anonymized == true
-        deny: store(input) if input.contains_pii == true
-        audit: all_operations with signature
+```symbiont
+agent secure_analyst(input: DataSet) -> Result {
+    policy access_control {
+        allow: read(input) if input.verified == true
+        deny: send_email without approval
+        audit: all_operations
     }
-    
-    with memory = "ephemeral", privacy = "high" {
-        if (validate_input(input)) {
-            result = process_data(input);
-            audit_log("analysis_completed", result.metadata);
-            return result;
-        } else {
-            return reject("Invalid input data");
-        }
+
+    with memory = "persistent", requires = "approval" {
+        result = analyze(input);
+        return result;
     }
 }
+```
+
+See the [DSL guide](/dsl-guide) for the full grammar including `metadata`, `schedule`, `webhook`, and `channel` blocks.
+
+### Project scaffolding
+
+```bash
+symbi init        # Interactive project setup with profile templates
+symbi run agent   # Run a single agent without starting the full runtime
+symbi up          # Start the full runtime with auto-configuration
 ```
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```mermaid
 graph TB
-    A[Governance & Policy Layer] --> B[Core Rust Engine]
-    B --> C[Agent Framework]
-    B --> D[Tree-sitter DSL Engine]
-    B --> E[Multi-Tier Sandboxing]
-    E --> F[Docker - Low Risk]
-    E --> G[gVisor - Medium/High Risk]
-    B --> I[Cryptographic Audit Trail]
-    
-    subgraph "Context & Knowledge"
+    A[Policy Engine — Cedar] --> B[Core Runtime]
+    B --> C[Reasoning Loop — ORGA]
+    B --> D[DSL Parser]
+    B --> E[Sandbox — Docker]
+    B --> I[Audit Trail]
+
+    subgraph "Scheduling"
+        S[Cron Scheduler]
+        H[Session Isolation]
+        R[Delivery Router]
+    end
+
+    subgraph "Channels"
+        SL[Slack]
+        TM[Teams]
+        MM[Mattermost]
+    end
+
+    subgraph "Knowledge"
         J[Context Manager]
-        K[Vector Database]
+        K[Vector Search]
         L[RAG Engine]
+        MD[Agent Memory]
     end
-    
-    subgraph "Secure Integrations"
+
+    subgraph "Trust Stack"
         M[MCP Client]
-        N[Tool Verification]
-        O[Policy Engine]
+        N[SchemaPin]
+        O[AgentPin]
+        SK[Threat Scanner]
     end
-    
+
+    C --> S
+    S --> H
+    S --> R
+    R --> SL
+    R --> TM
+    R --> MM
     C --> J
     C --> M
     J --> K
     J --> L
+    J --> MD
     M --> N
-    M --> O
+    C --> O
+    C --> SK
 ```
 
 ---
 
-## Use Cases
+## Security model
 
-### Development & Research
-- Secure code generation and automated testing
-- Multi-agent collaboration experiments
-- Context-aware AI system development
+Symbiont is designed around a simple principle: **model output should never be trusted as execution authority.**
 
-### Privacy-Critical Applications
-- Healthcare data processing with privacy controls
-- Financial services automation with audit capabilities
-- Government and defense systems with security features
+Actions flow through runtime controls:
 
----
+- **Zero trust** — all agent inputs are untrusted by default
+- **Policy checks** — Cedar authorization before every tool call and resource access
+- **Tool verification** — SchemaPin cryptographic verification of tool schemas
+- **Sandbox boundaries** — Docker isolation for untrusted execution
+- **Operator approval** — human review gates for sensitive actions
+- **Secrets control** — Vault/OpenBao backends, encrypted local storage, agent namespaces
+- **Audit logging** — cryptographically tamper-evident records of every decision
 
-## Project Status
-
-### ✅ Completed Phases
-- **Phase 1-3**: Core infrastructure, agent framework, and security implementation
-- **Phase 4**: Context & knowledge systems with RAG capabilities
-- **Phase 5**: Secure MCP integration with tool verification
-- **Phase 6**: Enterprise secrets management with HashiCorp Vault integration
-
-### 🔮 Planned Features
-- Multi-modal RAG support (images, audio, structured data)
-- Cross-agent knowledge synthesis and collaboration
-- Advanced learning capabilities with policy adaptation
-- Performance optimization and intelligent caching
-- Enhanced audit trails with blockchain integration
+See the [Security Model](/security-model) guide for full details.
 
 ---
 
-## Community
+## Guides
 
-- **Documentation**: Comprehensive guides and API references
-- [API Reference](api-reference.md)
-- [HTTP Input Module](http-input.md)
+- [Getting Started](/getting-started) — Installation, configuration, first agent
+- [Security Model](/security-model) — Zero-trust architecture, policy enforcement
+- [Runtime Architecture](/runtime-architecture) — Runtime internals and execution model
+- [Reasoning Loop](/reasoning-loop) — ORGA cycle, policy gates, circuit breakers
+- [DSL Guide](/dsl-guide) — Agent definition language reference
+- [ToolClad](/toolclad) — Declarative tool contracts, argument validation, scope enforcement
+- [API Reference](/api-reference) — HTTP API endpoints and configuration
+- [Scheduling](/scheduling) — Cron engine, delivery routing, dead-letter queues
+- [HTTP Input](/http-input) — Webhook server, auth, rate limiting
+
+---
+
+## Community and resources
+
+- **Packages**: [crates.io/crates/symbi](https://crates.io/crates/symbi) | [npm symbiont-sdk-js](https://www.npmjs.com/package/symbiont-sdk-js) | [PyPI symbiont-sdk](https://pypi.org/project/symbiont-sdk/)
+- **SDKs**: [JavaScript/TypeScript](https://github.com/ThirdKeyAI/symbiont-sdk-js) | [Python](https://github.com/ThirdKeyAI/symbiont-sdk-python)
+- **Plugins**: [Claude Code](https://github.com/thirdkeyai/symbi-claude-code) | [Gemini CLI](https://github.com/thirdkeyai/symbi-gemini-cli)
 - **Issues**: [GitHub Issues](https://github.com/thirdkeyai/symbiont/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/thirdkeyai/symbiont/discussions)
-- **License**: Open source software by ThirdKey
+- **License**: Apache 2.0 (Community Edition)
 
 ---
 
-## Next Steps
+## Next steps
 
 <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mt-8">
   <div class="card">
-    <h3>🚀 Get Started</h3>
-    <p>Follow our getting started guide to set up your first Symbiont environment.</p>
+    <h3>Get Started</h3>
+    <p>Install Symbiont and run your first governed agent.</p>
     <a href="/getting-started" class="btn btn-outline">Quick Start Guide</a>
   </div>
-  
+
   <div class="card">
-    <h3>📖 Learn the DSL</h3>
-    <p>Master the Symbiont DSL for building policy-aware agents.</p>
-    <a href="/dsl-guide" class="btn btn-outline">DSL Documentation</a>
+    <h3>Security Model</h3>
+    <p>Understand the trust boundaries and policy enforcement.</p>
+    <a href="/security-model" class="btn btn-outline">Security Guide</a>
   </div>
-  
+
   <div class="card">
-    <h3>🏗️ Architecture</h3>
-    <p>Understand the runtime system and security model.</p>
-    <a href="/runtime-architecture" class="btn btn-outline">Architecture Guide</a>
+    <h3>DSL Reference</h3>
+    <p>Learn the agent definition language.</p>
+    <a href="/dsl-guide" class="btn btn-outline">DSL Guide</a>
   </div>
 </div>

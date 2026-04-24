@@ -12,8 +12,175 @@ use tokio::time::Instant;
 
 use super::types::*;
 use super::{PolicyEnforcementPoint, ResourceAccessConfig};
-use crate::secrets::{SecretStore, SecretError};
+use crate::secrets::{SecretError, SecretStore};
+use crate::types::security::Capability;
 use crate::types::*;
+use serde_json::Value;
+
+/// Core trait for policy engines
+#[async_trait]
+pub trait PolicyEngine: Send + Sync {
+    /// Evaluates a policy for a given agent and input data
+    async fn evaluate_policy(
+        &self,
+        agent_id: &str,
+        input: &serde_json::Value,
+    ) -> Result<PolicyDecision, PolicyError>;
+
+    /// Checks if a given capability is allowed for an agent.
+    async fn check_capability(
+        &self,
+        agent_id: &str,
+        capability: &Capability,
+    ) -> Result<PolicyDecision, PolicyError>;
+}
+
+/// Policy decision outcomes
+#[derive(Debug, Clone, PartialEq)]
+pub enum PolicyDecision {
+    Allow,
+    Deny,
+}
+
+/// OPA-based policy engine implementation
+#[derive(Clone)]
+pub struct OpaPolicyEngine {
+    opa_client: OpaClient,
+}
+
+impl OpaPolicyEngine {
+    /// Creates a new OPA policy engine
+    pub fn new() -> Self {
+        Self {
+            opa_client: OpaClient::new(),
+        }
+    }
+}
+
+impl Default for OpaPolicyEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl PolicyEngine for OpaPolicyEngine {
+    async fn evaluate_policy(
+        &self,
+        agent_id: &str,
+        input: &serde_json::Value,
+    ) -> Result<PolicyDecision, PolicyError> {
+        let query_input = serde_json::json!({
+            "input": {
+                "agent_id": agent_id,
+                "data": input
+            }
+        });
+
+        let query = "data.symbiont.main.allow".to_string();
+        let results: Value = self.opa_client.query(query, query_input).await?;
+
+        if results
+            .get("result")
+            .and_then(|r| r.as_bool())
+            .unwrap_or(false)
+        {
+            Ok(PolicyDecision::Allow)
+        } else {
+            Ok(PolicyDecision::Deny)
+        }
+    }
+
+    async fn check_capability(
+        &self,
+        agent_id: &str,
+        capability: &Capability,
+    ) -> Result<PolicyDecision, PolicyError> {
+        let input = serde_json::json!({
+            "input": {
+                "agent_id": agent_id,
+                "capability": capability,
+            }
+        });
+
+        let query = "data.symbiont.main.allow".to_string();
+        let results: Value = self.opa_client.query(query, input).await?;
+
+        if results
+            .get("result")
+            .and_then(|r| r.as_bool())
+            .unwrap_or(false)
+        {
+            Ok(PolicyDecision::Allow)
+        } else {
+            Ok(PolicyDecision::Deny)
+        }
+    }
+}
+
+/// OPA policy engine client.
+///
+/// Queries an Open Policy Agent server via its REST API.
+/// Falls back to deny-by-default if the server is unreachable.
+#[derive(Clone)]
+struct OpaClient {
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl OpaClient {
+    fn new() -> Self {
+        let base_url = std::env::var("SYMBIONT_OPA_URL")
+            .unwrap_or_else(|_| "http://localhost:8181".to_string());
+        Self {
+            base_url,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+
+    async fn query(
+        &self,
+        query: String,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, PolicyError> {
+        let query_path = query.replace("data.", "");
+        let query_url = format!("{}/v1/data/{}", self.base_url, query_path);
+        let body = serde_json::json!({ "input": input });
+
+        match self.client.post(&query_url).json(&body).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    let result: serde_json::Value = resp.json().await.map_err(|e| {
+                        PolicyError::EvaluationFailed(format!(
+                            "Failed to parse OPA response: {}",
+                            e
+                        ))
+                    })?;
+                    // OPA wraps results under "result" key
+                    Ok(result
+                        .get("result")
+                        .cloned()
+                        .unwrap_or(serde_json::json!(false)))
+                } else {
+                    tracing::warn!("OPA returned HTTP {}: denying by default", resp.status());
+                    Ok(serde_json::json!(false))
+                }
+            }
+            Err(e) => {
+                // Fail-closed: deny if OPA is unreachable
+                tracing::warn!(
+                    "OPA unreachable at {}: {}. Denying by default (fail-closed)",
+                    self.base_url,
+                    e
+                );
+                Ok(serde_json::json!(false))
+            }
+        }
+    }
+}
 
 /// Default implementation of PolicyEnforcementPoint
 pub struct DefaultPolicyEnforcementPoint {
@@ -71,7 +238,7 @@ impl DefaultPolicyEnforcementPoint {
     async fn load_default_policies(&self) -> Result<(), PolicyError> {
         let policies_data: serde_yaml::Value = serde_yaml::from_str(DEFAULT_POLICIES_YAML)
             .map_err(|e| PolicyError::InvalidPolicy {
-                reason: format!("Failed to parse default policies: {}", e),
+                reason: format!("Failed to parse default policies: {}", e).into(),
             })?;
 
         let policies = self.parse_policies_from_yaml(&policies_data)?;
@@ -96,7 +263,7 @@ impl DefaultPolicyEnforcementPoint {
             .get("policies")
             .and_then(|v| v.as_sequence())
             .ok_or_else(|| PolicyError::InvalidPolicy {
-                reason: "Missing 'policies' array in YAML".to_string(),
+                reason: "Missing 'policies' array in YAML".into(),
             })?;
 
         let mut policies = Vec::new();
@@ -107,7 +274,7 @@ impl DefaultPolicyEnforcementPoint {
         }
 
         // Sort by priority (higher priority first)
-        policies.sort_by(|a, b| b.priority.cmp(&a.priority));
+        policies.sort_by_key(|p| std::cmp::Reverse(p.priority));
 
         Ok(policies)
     }
@@ -121,7 +288,7 @@ impl DefaultPolicyEnforcementPoint {
             .get("id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| PolicyError::InvalidPolicy {
-                reason: "Policy missing 'id' field".to_string(),
+                reason: "Policy missing 'id' field".into(),
             })?
             .to_string();
 
@@ -146,7 +313,7 @@ impl DefaultPolicyEnforcementPoint {
         let enabled = data
             .get("enabled")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+            .unwrap_or(false); // fail-closed: policies must be explicitly enabled
 
         let priority = data
             .get("priority")
@@ -166,7 +333,7 @@ impl DefaultPolicyEnforcementPoint {
         }
 
         // Sort rules by priority within policy
-        rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+        rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
 
         Ok(ResourceAccessPolicy {
             id,
@@ -188,7 +355,7 @@ impl DefaultPolicyEnforcementPoint {
             .get("id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| PolicyError::InvalidPolicy {
-                reason: "Rule missing 'id' field".to_string(),
+                reason: "Rule missing 'id' field".into(),
             })?
             .to_string();
 
@@ -229,14 +396,14 @@ impl DefaultPolicyEnforcementPoint {
         data: Option<&serde_yaml::Value>,
     ) -> Result<RuleEffect, PolicyError> {
         let effect_data = data.ok_or_else(|| PolicyError::InvalidPolicy {
-            reason: "Rule missing 'effect' field".to_string(),
+            reason: "Rule missing 'effect' field".into(),
         })?;
 
         let effect_type = effect_data
             .get("type")
             .and_then(|v| v.as_str())
             .ok_or_else(|| PolicyError::InvalidPolicy {
-                reason: "Effect missing 'type' field".to_string(),
+                reason: "Effect missing 'type' field".into(),
             })?;
 
         match effect_type {
@@ -279,7 +446,7 @@ impl DefaultPolicyEnforcementPoint {
                 Ok(RuleEffect::Escalate { to, reason })
             }
             _ => Err(PolicyError::InvalidPolicy {
-                reason: format!("Unknown effect type: {}", effect_type),
+                reason: format!("Unknown effect type: {}", effect_type).into(),
             }),
         }
     }
@@ -360,7 +527,11 @@ impl DefaultPolicyEnforcementPoint {
     }
 
     /// Check if a rule matches the request
-    async fn rule_matches(&self, rule: &ResourceAccessRule, _request: &ResourceAccessRequest) -> Result<bool, PolicyError> {
+    async fn rule_matches(
+        &self,
+        rule: &ResourceAccessRule,
+        _request: &ResourceAccessRequest,
+    ) -> Result<bool, PolicyError> {
         // Check secret requirements in rule conditions
         let secret_valid = self.validate_secret_requirements(&rule.conditions).await?;
         if !secret_valid {
@@ -523,7 +694,11 @@ impl DefaultPolicyEnforcementPoint {
         conditions: &[RuleCondition],
     ) -> Result<bool, PolicyError> {
         for condition in conditions {
-            if let RuleCondition::SecretMatch { secret_name, permissions: _ } = condition {
+            if let RuleCondition::SecretMatch {
+                secret_name,
+                permissions: _,
+            } = condition
+            {
                 if let Some(ref secrets) = self.secrets {
                     match secrets.get_secret(secret_name).await {
                         Ok(_) => {
@@ -537,9 +712,10 @@ impl DefaultPolicyEnforcementPoint {
                             return Ok(false);
                         }
                         Err(e) => {
-                            return Err(PolicyError::EvaluationFailed(
-                                format!("Secret validation error: {}", e)
-                            ));
+                            return Err(PolicyError::EvaluationFailed(format!(
+                                "Secret validation error: {}",
+                                e
+                            )));
                         }
                     }
                 } else {

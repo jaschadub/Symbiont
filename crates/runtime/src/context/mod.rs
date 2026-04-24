@@ -21,7 +21,7 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = ContextManagerConfig::default();
-//! let context_manager = StandardContextManager::new(config);
+//! let context_manager = StandardContextManager::new(config, "my-agent").await?;
 //! context_manager.initialize().await?;
 //!
 //! let agent_id = AgentId::new();
@@ -40,9 +40,17 @@
 //! - **Retention Policies**: Automatic archiving and cleanup of old context data
 //! - **Access Control**: Policy-driven access control for context operations
 
+pub mod compaction;
+pub mod embedding;
 pub mod manager;
+pub mod markdown_memory;
+pub mod token_counter;
 pub mod types;
 pub mod vector_db;
+pub mod vector_db_factory;
+#[cfg(feature = "vector-lancedb")]
+pub mod vector_db_lance;
+pub mod vector_db_trait;
 
 // Re-export commonly used types and traits
 pub use types::{
@@ -55,10 +63,30 @@ pub use types::{
 
 pub use manager::{ContextManager, ContextManagerConfig, FilePersistence, StandardContextManager};
 
+pub use markdown_memory::MarkdownMemoryStore;
+
+pub use embedding::{
+    create_embedding_service, create_embedding_service_from_env, EmbeddingConfig,
+    EmbeddingProvider, OllamaEmbeddingService, OpenAiEmbeddingService,
+};
+
 pub use vector_db::{
-    EmbeddingService, MockEmbeddingService, QdrantClientWrapper, QdrantConfig, QdrantDistance,
+    EmbeddingService, MockEmbeddingService, NoOpVectorDatabase, QdrantConfig, QdrantDistance,
     TfIdfEmbeddingService, VectorDatabase, VectorDatabaseStats,
 };
+
+#[cfg(feature = "vector-qdrant")]
+pub use vector_db::QdrantClientWrapper;
+
+pub use compaction::{CompactionConfig, CompactionResult, CompactionTier};
+pub use token_counter::{
+    context_limit_for_model, create_token_counter, HeuristicTokenCounter, TiktokenCounter,
+    TokenCounter,
+};
+pub use vector_db_factory::{create_vector_backend, resolve_vector_config, VectorBackendConfig};
+#[cfg(feature = "vector-lancedb")]
+pub use vector_db_lance::{LanceDbBackend, LanceDbConfig};
+pub use vector_db_trait::{DistanceMetric, VectorDb};
 
 #[cfg(test)]
 mod tests {
@@ -66,19 +94,32 @@ mod tests {
     use crate::types::AgentId;
     use std::time::SystemTime;
 
+    /// Create a test config with an isolated temp directory to avoid
+    /// cross-test interference from shared `~/.symbiont/data`.
+    fn test_config() -> (ContextManagerConfig, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = ContextManagerConfig::default();
+        config.persistence_config.root_data_dir = tmp.path().to_path_buf();
+        (config, tmp)
+    }
+
     #[tokio::test]
     async fn test_context_manager_creation() {
-        let config = ContextManagerConfig::default();
+        let (config, _tmp) = test_config();
         let agent_id = AgentId::new();
-        let manager = StandardContextManager::new(config, &agent_id.to_string()).await.unwrap();
+        let manager = StandardContextManager::new(config, &agent_id.to_string())
+            .await
+            .unwrap();
         assert!(manager.initialize().await.is_ok());
     }
 
     #[tokio::test]
     async fn test_session_creation() {
-        let config = ContextManagerConfig::default();
+        let (config, _tmp) = test_config();
         let agent_id = AgentId::new();
-        let manager = StandardContextManager::new(config, &agent_id.to_string()).await.unwrap();
+        let manager = StandardContextManager::new(config, &agent_id.to_string())
+            .await
+            .unwrap();
         manager.initialize().await.unwrap();
 
         let session_id = manager.create_session(agent_id).await.unwrap();
@@ -94,9 +135,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_memory_operations() {
-        let config = ContextManagerConfig::default();
+        let (config, _tmp) = test_config();
         let agent_id = AgentId::new();
-        let manager = StandardContextManager::new(config, &agent_id.to_string()).await.unwrap();
+        let manager = StandardContextManager::new(config, &agent_id.to_string())
+            .await
+            .unwrap();
         manager.initialize().await.unwrap();
 
         let _session_id = manager.create_session(agent_id).await.unwrap();
@@ -116,9 +159,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_knowledge_operations() {
-        let config = ContextManagerConfig::default();
+        let (config, _tmp) = test_config();
         let agent_id = AgentId::new();
-        let manager = StandardContextManager::new(config, &agent_id.to_string()).await.unwrap();
+        let manager = StandardContextManager::new(config, &agent_id.to_string())
+            .await
+            .unwrap();
         manager.initialize().await.unwrap();
 
         let _session_id = manager.create_session(agent_id).await.unwrap();
@@ -150,9 +195,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_query() {
-        let config = ContextManagerConfig::default();
+        let (config, _tmp) = test_config();
         let agent_id = AgentId::new();
-        let manager = StandardContextManager::new(config, &agent_id.to_string()).await.unwrap();
+        let manager = StandardContextManager::new(config, &agent_id.to_string())
+            .await
+            .unwrap();
         manager.initialize().await.unwrap();
 
         let _session_id = manager.create_session(agent_id).await.unwrap();
@@ -175,9 +222,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_context_stats() {
-        let config = ContextManagerConfig::default();
+        let (config, _tmp) = test_config();
         let agent_id = AgentId::new();
-        let manager = StandardContextManager::new(config, &agent_id.to_string()).await.unwrap();
+        let manager = StandardContextManager::new(config, &agent_id.to_string())
+            .await
+            .unwrap();
         manager.initialize().await.unwrap();
 
         let _session_id = manager.create_session(agent_id).await.unwrap();
@@ -190,10 +239,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_secrets_integration() {
-        let config = ContextManagerConfig::default();
+        let (config, _tmp) = test_config();
         let agent_id = AgentId::new();
-        let manager = StandardContextManager::new(config, &agent_id.to_string()).await.unwrap();
-        
+        let manager = StandardContextManager::new(config, &agent_id.to_string())
+            .await
+            .unwrap();
+
         // Test that secrets accessor is available
         let _secrets = manager.secrets();
         // This test just verifies the secrets integration compiles and is accessible

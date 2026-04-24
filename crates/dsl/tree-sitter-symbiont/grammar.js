@@ -1,6 +1,10 @@
 module.exports = grammar({
   name: 'symbiont',
 
+  conflicts: $ => [
+    [$.expression, $.value],
+  ],
+
   rules: {
     program: $ => repeat($._item),
 
@@ -10,7 +14,11 @@ module.exports = grammar({
       $.agent_definition,
       $.policy_definition,
       $.type_definition,
-      $.function_definition
+      $.function_definition,
+      $.schedule_definition,
+      $.channel_definition,
+      $.memory_definition,
+      $.webhook_definition
     ),
 
     metadata_block: $ => seq(
@@ -30,6 +38,8 @@ module.exports = grammar({
     agent_definition: $ => seq(
       'agent',
       $.identifier,
+      optional(seq('(', repeat(seq($.parameter, optional(','))), ')')),
+      optional(seq('->', $.type)),
       '{',
       repeat($._agent_item),
       '}'
@@ -38,7 +48,20 @@ module.exports = grammar({
     _agent_item: $ => choice(
       $.capabilities_declaration,
       $.policy_definition,
-      $.function_definition
+      $.function_definition,
+      $.with_block
+    ),
+
+    with_block: $ => seq(
+      'with',
+      repeat(seq($.with_attribute, optional(','))),
+      $.block
+    ),
+
+    with_attribute: $ => seq(
+      $.identifier,
+      '=',
+      $.value
     ),
 
     capabilities_declaration: $ => seq(
@@ -71,6 +94,122 @@ module.exports = grammar({
       ')',
       optional(seq('->', $.type)),
       $.block
+    ),
+
+    schedule_definition: $ => seq(
+      'schedule',
+      $.identifier,
+      '{',
+      repeat($.schedule_property),
+      '}'
+    ),
+
+    schedule_property: $ => seq(
+      $.identifier,
+      ':',
+      $.value,
+      optional(',')
+    ),
+
+    channel_definition: $ => seq(
+      'channel',
+      $.identifier,
+      '{',
+      repeat(choice(
+        $.channel_property,
+        $.channel_policy_block,
+        $.channel_data_classification_block
+      )),
+      '}'
+    ),
+
+    channel_property: $ => seq(
+      $.identifier,
+      ':',
+      choice($.value, $.array),
+      optional(',')
+    ),
+
+    channel_policy_block: $ => seq(
+      'policy',
+      $.identifier,
+      '{',
+      repeat($.policy_rule),
+      '}'
+    ),
+
+    channel_data_classification_block: $ => seq(
+      'data_classification',
+      '{',
+      repeat($.data_classification_rule),
+      '}'
+    ),
+
+    data_classification_rule: $ => seq(
+      $.identifier,
+      ':',
+      $.identifier,
+      optional(',')
+    ),
+
+    memory_definition: $ => seq(
+      'memory',
+      $.identifier,
+      '{',
+      repeat(choice(
+        $.memory_property,
+        $.memory_search_block
+      )),
+      '}'
+    ),
+
+    memory_property: $ => seq(
+      $.identifier,
+      $.value,
+      optional(',')
+    ),
+
+    memory_search_block: $ => seq(
+      'search',
+      '{',
+      repeat($.memory_search_property),
+      '}'
+    ),
+
+    memory_search_property: $ => seq(
+      $.identifier,
+      $.value,
+      optional(',')
+    ),
+
+    webhook_definition: $ => seq(
+      'webhook',
+      $.identifier,
+      '{',
+      repeat(choice(
+        $.webhook_property,
+        $.webhook_filter_block
+      )),
+      '}'
+    ),
+
+    webhook_property: $ => seq(
+      $.identifier,
+      $.value,
+      optional(',')
+    ),
+
+    webhook_filter_block: $ => seq(
+      'filter',
+      '{',
+      repeat($.webhook_filter_property),
+      '}'
+    ),
+
+    webhook_filter_property: $ => seq(
+      $.identifier,
+      $.value,
+      optional(',')
     ),
 
     parameter: $ => seq(
@@ -185,16 +324,19 @@ module.exports = grammar({
 
     value: $ => choice(
       $.string,
+      $.duration_literal,
       $.number,
-      $.boolean
+      $.boolean,
+      $.identifier
     ),
 
     identifier: $ => token(prec(-1, /[a-zA-Z_][a-zA-Z0-9_]*/)),
     string: $ => /"[^"]*"/,
+    duration_literal: $ => /\d+(\.seconds|\.minutes|\.hours|s|m|h|d|w|months|y)/,
     number: $ => /\d+(\.\d+)?/,
     boolean: $ => choice('true', 'false'),
 
-    comment: $ => token(seq('//', /.*/)),
+    comment: $ => token(choice(seq('//', /.*/), seq('#', /.*/))),
   },
 
   extras: $ => [

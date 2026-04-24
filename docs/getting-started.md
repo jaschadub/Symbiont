@@ -1,28 +1,8 @@
----
-layout: default
-title: Getting Started
-nav_order: 2
-description: "Quick start guide for Symbiont"
----
-
 # Getting Started
-{: .no_toc }
-
-## 🌐 Other Languages
-{: .no_toc}
-
-**English** | [中文简体](getting-started.zh-cn.md) | [Español](getting-started.es.md) | [Português](getting-started.pt.md) | [日本語](getting-started.ja.md) | [Deutsch](getting-started.de.md)
-
----
 
 This guide will walk you through setting up Symbi and creating your first AI agent.
-{: .fs-6 .fw-300 }
 
-## Table of contents
-{: .no_toc .text-delta }
 
-1. TOC
-{:toc}
 
 ---
 
@@ -33,19 +13,40 @@ Before getting started with Symbi, ensure you have the following installed:
 ### Required Dependencies
 
 - **Docker** (for containerized development)
-- **Rust 1.88+** (if building locally)
+- **Rust 1.82+** (if building locally)
+- **protobuf-compiler** (required for building — `apt install protobuf-compiler` on Ubuntu, `brew install protobuf` on macOS)
 - **Git** (for cloning the repository)
 
 ### Optional Dependencies
 
-- **Qdrant** vector database (for semantic search capabilities)
-- **SchemaPin Go CLI** (for tool verification)
+- **[symbi-claude-code](https://github.com/thirdkeyai/symbi-claude-code)** (Claude Code governance plugin)
+- **[symbi-gemini-cli](https://github.com/thirdkeyai/symbi-gemini-cli)** (Gemini CLI governance extension)
+
+> **Note:** Vector search is built in. Symbi ships with [LanceDB](https://lancedb.com/) as an embedded vector database -- no external service required.
 
 ---
 
 ## Installation
 
-### Option 1: Docker (Recommended)
+### Option 1: Pre-Built Binaries (Quick Start)
+
+> **Note:** Pre-built binaries are tested but considered less reliable than cargo install or Docker.
+
+**macOS (Homebrew):**
+```bash
+brew tap thirdkeyai/tap
+brew install symbi
+```
+
+**macOS / Linux (install script):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/thirdkeyai/symbiont/main/scripts/install.sh | bash
+```
+
+**Manual download:**
+Download from [GitHub Releases](https://github.com/thirdkeyai/symbiont/releases) and add to your PATH.
+
+### Option 2: Docker (Recommended)
 
 The fastest way to get started is using Docker:
 
@@ -64,7 +65,7 @@ docker pull ghcr.io/thirdkeyai/symbi:latest
 docker run --rm -it -v $(pwd):/workspace symbi:latest bash
 ```
 
-### Option 2: Local Installation
+### Option 3: Local Installation
 
 For local development:
 
@@ -103,6 +104,76 @@ cargo run -- mcp --help
 docker run --rm symbi:latest --version
 docker run --rm -v $(pwd):/workspace symbi:latest dsl parse --help
 docker run --rm symbi:latest mcp --help
+```
+
+---
+
+## Project Initialization
+
+The fastest way to start a new Symbiont project is `symbi init`:
+
+```bash
+symbi init
+```
+
+This launches an interactive wizard that guides you through:
+- **Profile selection**: `minimal`, `assistant`, `dev-agent`, or `multi-agent`
+- **SchemaPin mode**: `tofu` (Trust-On-First-Use), `strict`, or `disabled`
+- **Sandbox tier**: `tier0` (none), `tier1` (Docker), or `tier2` (gVisor)
+
+### Non-interactive mode
+
+For CI/CD or scripted setups:
+
+```bash
+symbi init --profile assistant --schemapin tofu --sandbox tier1 --no-interact
+```
+
+### Profiles
+
+| Profile | What it creates |
+|---------|----------------|
+| `minimal` | `symbiont.toml` + default Cedar policy |
+| `assistant` | + single governed assistant agent |
+| `dev-agent` | + CliExecutor agent with safety policies |
+| `multi-agent` | + coordinator/worker agents with inter-agent policies |
+
+### Importing from the catalog
+
+Import pre-built agents alongside any profile:
+
+```bash
+symbi init --profile minimal --no-interact
+symbi init --catalog assistant,dev
+```
+
+List available catalog agents:
+
+```bash
+symbi init --catalog list
+```
+
+After initialization, validate and run:
+
+```bash
+symbi dsl -f agents/assistant.dsl   # validate your agent
+symbi run assistant -i '{"query": "hello"}'  # test a single agent
+symbi up                             # start the full runtime
+```
+
+### Running a single agent
+
+Use `symbi run` to execute one agent without starting the full runtime server:
+
+```bash
+symbi run <agent-name-or-file> --input <json>
+```
+
+The command resolves agent names by searching: direct path, then `agents/` directory. It sets up cloud inference from environment variables (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`), runs the ORGA reasoning loop, and exits.
+
+```bash
+symbi run assistant -i 'Summarize this document'
+symbi run agents/recon.dsl -i '{"target": "10.0.1.5"}' --max-iterations 5
 ```
 
 ---
@@ -240,20 +311,148 @@ cd crates/runtime && cargo run --features http-api --example full_system
 
 **Key API Endpoints:**
 - `GET /api/v1/health` - Health check and system status
-- `GET /api/v1/agents` - List all active agents
+- `GET /api/v1/agents` - List all active agents with real-time execution status
+- `GET /api/v1/agents/{id}/status` - Get detailed agent execution metrics
 - `POST /api/v1/workflows/execute` - Execute workflows
 
-#### Vector Database Integration
+**New Agent Management Features:**
+- Real-time process monitoring and health checks
+- Graceful shutdown capabilities for running agents
+- Comprehensive execution metrics and resource usage tracking
+- Support for different execution modes (ephemeral, persistent, scheduled, event-driven)
 
-For semantic search capabilities:
+#### Cloud LLM Inference
+
+Connect to cloud LLM providers via OpenRouter:
 
 ```bash
-# Start Qdrant vector database
-docker run -p 6333:6333 qdrant/qdrant
+# Enable cloud inference
+cargo build --features cloud-llm
 
-# Run agent with RAG capabilities
-cd crates/runtime && cargo run --example rag_example
+# Set API key and model
+export OPENROUTER_API_KEY="sk-or-..."
+export OPENROUTER_MODEL="google/gemini-2.0-flash-001"  # optional
 ```
+
+#### Standalone Agent Mode
+
+One-liner for cloud-native agents with LLM inference and Composio tool access:
+
+```bash
+cargo build --features standalone-agent
+# Enables: cloud-llm + composio
+```
+
+#### Advanced Reasoning Primitives
+
+Enable tool curation, stuck-loop detection, context pre-fetch, and scoped conventions:
+
+```bash
+cargo build --features orga-adaptive
+```
+
+See the [orga-adaptive guide](/orga-adaptive) for full documentation.
+
+#### Cedar Policy Engine
+
+Formal authorization with the Cedar policy language:
+
+```bash
+cargo build --features cedar
+```
+
+#### Vector Database (Built-in)
+
+Symbi includes LanceDB as a zero-config embedded vector database. Semantic search and RAG work out of the box -- no separate service to start:
+
+```bash
+# Run agent with RAG capabilities (vector search just works)
+cd crates/runtime && cargo run --example rag_example
+
+# Test context management with advanced search
+cd crates/runtime && cargo run --example context_example
+```
+
+> **Minimal build:** LanceDB is included by default but can be excluded for lighter binaries: `cargo build --no-default-features`. The runtime gracefully falls back to a no-op vector backend.
+>
+> **Scaled deployments:** Qdrant is available as an optional backend. Build with `--features vector-qdrant` and set `SYMBIONT_VECTOR_BACKEND=qdrant`.
+
+**Context Management Features:**
+- **Multi-Modal Search**: Keyword, temporal, similarity, and hybrid search modes
+- **Importance Calculation**: Sophisticated scoring algorithm considering access patterns, recency, and user feedback
+- **Access Control**: Policy engine integration with agent-scoped access controls
+- **Automatic Archiving**: Retention policies with compressed storage and cleanup
+- **Knowledge Sharing**: Secure cross-agent knowledge sharing with trust scores
+
+#### Feature Flags Reference
+
+| Feature | Description | Default |
+|---------|-------------|---------|
+| `keychain` | OS keychain integration for secrets | Yes |
+| `vector-lancedb` | LanceDB embedded vector backend | Yes |
+| `vector-qdrant` | Qdrant distributed vector backend | No |
+| `embedding-models` | Local embedding models via Candle | No |
+| `http-api` | REST API with Swagger UI | No |
+| `http-input` | Webhook server with JWT auth | No |
+| `cloud-llm` | Cloud LLM inference (OpenRouter) | No |
+| `composio` | Composio MCP tool integration | No |
+| `standalone-agent` | Cloud LLM + Composio combo | No |
+| `cedar` | Cedar policy engine | No |
+| `orga-adaptive` | Advanced reasoning primitives | No |
+| `cron` | Persistent cron scheduling | No |
+| `native-sandbox` | Native process sandboxing | No |
+| `metrics` | OpenTelemetry metrics/tracing | No |
+| `interactive` | Interactive prompts for `symbi init` (dialoguer) | Default |
+| `full` | All features except enterprise | No |
+
+```bash
+# Build with specific features
+cargo build --features "cloud-llm,orga-adaptive,cedar"
+
+# Build with everything
+cargo build --features full
+```
+
+---
+
+## AI Assistant Plugins
+
+Symbiont provides first-party governance plugins for popular AI coding assistants with three progressive protection tiers:
+
+1. **Awareness** (default) — advisory logging of all state-modifying tool calls
+2. **Protection** — blocking hook enforces a local deny list (`.symbiont/local-policy.toml`)
+3. **Governance** — Cedar policy evaluation when `symbi` is on PATH
+
+The deny list config is tool-agnostic — the same `.symbiont/local-policy.toml` works with both plugins:
+
+```toml
+[deny]
+paths = [".env", ".ssh/", ".aws/"]
+commands = ["rm -rf", "git push --force"]
+branches = ["main", "master", "production"]
+```
+
+### Claude Code
+
+```bash
+# Install from marketplace
+/plugin marketplace add https://github.com/thirdkeyai/symbi-claude-code
+
+# Available skills: /symbi-init, /symbi-policy, /symbi-verify, /symbi-audit, /symbi-dsl
+```
+
+See [symbi-claude-code](https://github.com/thirdkeyai/symbi-claude-code) for details.
+
+### Gemini CLI
+
+```bash
+# Install extension
+gemini extensions install https://github.com/thirdkeyai/symbi-gemini-cli
+```
+
+The Gemini CLI extension provides additional defense-in-depth via `excludeTools` manifest blocking and native `policies/*.toml` enforcement at the platform level.
+
+See [symbi-gemini-cli](https://github.com/thirdkeyai/symbi-gemini-cli) for details.
 
 ---
 
@@ -268,12 +467,26 @@ Set up your environment for optimal performance:
 export SYMBI_LOG_LEVEL=info
 export SYMBI_RUNTIME_MODE=development
 
-# Vector database (optional)
-export QDRANT_URL=http://localhost:6333
+# Vector search works out of the box with the built-in LanceDB backend.
+# To use Qdrant instead (optional, enterprise):
+# export SYMBIONT_VECTOR_BACKEND=qdrant
+# export QDRANT_URL=http://localhost:6333
 
 # MCP integration (optional)
 export MCP_SERVER_URLS="http://localhost:8080"
 ```
+
+### Tool Contracts (ToolClad)
+
+Define governed tool contracts in the `tools/` directory:
+
+```bash
+symbi tools init my_tool          # create a starter manifest
+symbi tools validate              # validate all manifests
+symbi tools test my_tool --arg target=10.0.1.5   # dry-run with args
+```
+
+See the [ToolClad guide](/toolclad) for the full manifest format, execution modes, and scope enforcement.
 
 ### Runtime Configuration
 
@@ -292,8 +505,9 @@ policy_enforcement = "strict"
 
 [vector_db]
 enabled = true
-url = "http://localhost:6333"
+backend = "lancedb"              # default; also supports "qdrant"
 collection_name = "symbi_knowledge"
+# url = "http://localhost:6333"  # only needed when backend = "qdrant"
 ```
 
 ---
@@ -360,7 +574,7 @@ RUST_LOG=debug cd crates/runtime && cargo run --example basic_agent
 
 - **Issues**: [GitHub Issues](https://github.com/thirdkeyai/symbiont/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/thirdkeyai/symbiont/discussions)
-- **Documentation**: [Complete API Reference](https://docs.symbiont.platform)
+- **Documentation**: [Complete API Reference](https://docs.symbiont.dev/api-reference)
 
 ### Debug Mode
 
@@ -381,8 +595,10 @@ cd crates/runtime && cargo run --example basic_agent 2>&1 | tee debug.log
 Now that you have Symbi running, explore these advanced topics:
 
 1. **[DSL Guide](/dsl-guide)** - Learn advanced DSL features
-2. **[Runtime Architecture](/runtime-architecture)** - Understand the system internals
-3. **[Security Model](/security-model)** - Implement security policies
-4. **[Contributing](/contributing)** - Contribute to the project
+2. **[Reasoning Loop Guide](/reasoning-loop)** - Understand the ORGA cycle
+3. **[Advanced Reasoning (orga-adaptive)](/orga-adaptive)** - Tool curation, stuck-loop detection, pre-hydration
+4. **[Runtime Architecture](/runtime-architecture)** - Understand the system internals
+5. **[Security Model](/security-model)** - Implement security policies
+6. **[Contributing](/contributing)** - Contribute to the project
 
 Ready to build something amazing? Start with our [example projects](https://github.com/thirdkeyai/symbiont/tree/main/crates/runtime/examples) or dive into the [complete specification](/specification).

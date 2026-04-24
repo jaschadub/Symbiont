@@ -1,18 +1,4 @@
----
-layout: default
-title: API Reference
-nav_order: 5
-description: "Comprehensive API documentation for Symbiont runtime"
----
-
 # API Reference
-
-## 🌐 Other Languages
-{: .no_toc}
-
-**English** | [中文简体](api-reference.zh-cn.md) | [Español](api-reference.es.md) | [Português](api-reference.pt.md) | [日本語](api-reference.ja.md) | [Deutsch](api-reference.de.md)
-
----
 
 This document provides comprehensive documentation for the Symbiont runtime APIs. The Symbiont project exposes two distinct API systems designed for different use cases and development stages.
 
@@ -61,7 +47,7 @@ Returns the current system health status and basic runtime information.
   "status": "healthy",
   "uptime_seconds": 3600,
   "timestamp": "2024-01-15T10:30:00Z",
-  "version": "0.1.0"
+  "version": "1.0.0"
 }
 ```
 
@@ -126,21 +112,36 @@ GET /api/v1/agents/{id}/status
 Authorization: Bearer <your-token>
 ```
 
-Get detailed status information for a specific agent.
+Get detailed status information for a specific agent including real-time execution metrics.
 
 **Response (200 OK):**
 ```json
 {
   "agent_id": "uuid",
-  "state": "active|idle|busy|error",
+  "state": "running|ready|waiting|failed|completed|terminated",
   "last_activity": "2024-01-15T10:30:00Z",
+  "scheduled_at": "2024-01-15T10:00:00Z",
   "resource_usage": {
-    "memory_bytes": 268435456,
-    "cpu_percent": 15.5,
-    "active_tasks": 3
+    "memory_usage": 268435456,
+    "cpu_usage": 15.5,
+    "active_tasks": 1
+  },
+  "execution_context": {
+    "execution_mode": "ephemeral|persistent|scheduled|event_driven",
+    "process_id": 12345,
+    "uptime": "00:15:30",
+    "health_status": "healthy|unhealthy"
   }
 }
 ```
+
+**New Agent States:**
+- `running`: Agent is actively executing with a running process
+- `ready`: Agent is initialized and ready for execution
+- `waiting`: Agent is queued for execution
+- `failed`: Agent execution failed or health check failed
+- `completed`: Agent task completed successfully
+- `terminated`: Agent was gracefully or forcibly terminated
 
 ##### Create Agent
 ```http
@@ -248,27 +249,163 @@ Retrieve the execution history for a specific agent.
 }
 ```
 
+##### Agent Heartbeat
+```http
+POST /api/v1/agents/{id}/heartbeat
+Authorization: Bearer <your-token>
+```
+
+Send a heartbeat from a running agent to update its health status.
+
+##### Push Event to Agent
+```http
+POST /api/v1/agents/{id}/events
+Authorization: Bearer <your-token>
+```
+
+Push an external event to a running agent for event-driven execution.
+
 #### System Metrics
 ```http
 GET /api/v1/metrics
 ```
 
-Retrieve comprehensive system performance metrics.
+Retrieve a comprehensive metrics snapshot covering scheduler, task manager, load balancer, and system resources.
 
 **Response (200 OK):**
 ```json
 {
-  "system": {
-    "uptime_seconds": 3600,
-    "memory_usage": "75%",
-    "cpu_usage": "45%"
+  "timestamp": "2026-02-16T12:00:00Z",
+  "scheduler": {
+    "total_jobs": 12,
+    "active_jobs": 8,
+    "paused_jobs": 2,
+    "failed_jobs": 1,
+    "total_runs": 450,
+    "successful_runs": 445,
+    "dead_letter_count": 2
   },
-  "agents": {
-    "total": 5,
-    "active": 3,
-    "idle": 2
+  "task_manager": {
+    "queued_tasks": 3,
+    "running_tasks": 5,
+    "completed_tasks": 1200,
+    "failed_tasks": 15
+  },
+  "load_balancer": {
+    "total_workers": 4,
+    "active_workers": 3,
+    "requests_per_second": 12.5
+  },
+  "system": {
+    "cpu_usage_percent": 45.2,
+    "memory_usage_bytes": 536870912,
+    "memory_total_bytes": 17179869184,
+    "uptime_seconds": 3600
   }
 }
+```
+
+The metrics snapshot can also be exported to files (atomic JSON write) or OTLP endpoints using the runtime's `MetricsExporter` system. See the [Metrics & Telemetry](#metrics--telemetry) section below.
+
+---
+
+### Metrics & Telemetry
+
+Symbiont supports exporting runtime metrics to multiple backends:
+
+#### File Exporter
+
+Writes metric snapshots as atomic JSON files (tempfile + rename):
+
+```rust
+use symbi_runtime::metrics::{FileMetricsExporter, MetricsExporterConfig};
+
+let exporter = FileMetricsExporter::new("/var/lib/symbi/metrics.json");
+exporter.export(&snapshot)?;
+```
+
+#### OTLP Exporter
+
+Sends metrics to any OpenTelemetry-compatible endpoint (requires the `metrics` feature):
+
+```rust
+use symbi_runtime::metrics::{OtlpExporter, OtlpExporterConfig, OtlpProtocol};
+
+let config = OtlpExporterConfig {
+    endpoint: "http://localhost:4317".to_string(),
+    protocol: OtlpProtocol::Grpc,
+    ..Default::default()
+};
+```
+
+#### Composite Exporter
+
+Fan-out to multiple backends simultaneously — individual export failures are logged but don't block other exporters:
+
+```rust
+use symbi_runtime::metrics::CompositeExporter;
+
+let composite = CompositeExporter::new(vec![
+    Box::new(file_exporter),
+    Box::new(otlp_exporter),
+]);
+```
+
+#### Background Collection
+
+The `MetricsCollector` runs as a background thread, periodically gathering snapshots and exporting them:
+
+```rust
+use symbi_runtime::metrics::MetricsCollector;
+
+let collector = MetricsCollector::new(exporter, interval);
+collector.start();
+// ... later ...
+collector.stop();
+```
+
+---
+
+### Skill Scanning (ClawHavoc)
+
+The `SkillScanner` inspects agent skill content for malicious patterns before loading. It ships with **40 built-in ClawHavoc defense rules** across 10 attack categories:
+
+| Category | Count | Severity | Examples |
+|----------|-------|----------|----------|
+| Original defense rules | 10 | Critical/Warning | `pipe-to-shell`, `eval-with-fetch`, `rm-rf-pattern` |
+| Reverse shells | 7 | Critical | bash, nc, ncat, mkfifo, python, perl, ruby |
+| Credential harvesting | 6 | High | SSH keys, AWS creds, cloud config, browser cookies, keychain |
+| Network exfiltration | 3 | High | DNS tunnel, `/dev/tcp`, netcat outbound |
+| Process injection | 4 | Critical | ptrace, LD_PRELOAD, `/proc/mem`, gdb attach |
+| Privilege escalation | 5 | High | sudo, setuid, setcap, chown root, nsenter |
+| Symlink / path traversal | 2 | Medium | symlink escape, deep path traversal |
+| Downloader chains | 3 | Medium | curl save, wget save, chmod exec |
+
+See the [Security Model](/security-model#clawhavoc-skill-scanner) for the full rule list and severity model.
+
+#### Usage
+
+```rust
+use symbi_runtime::skills::SkillScanner;
+
+let scanner = SkillScanner::new(); // includes all 40 default rules
+let result = scanner.scan_skill("/path/to/skill/");
+
+if !result.passed {
+    for finding in &result.findings {
+        eprintln!("[{}] {}: {} (line {})",
+            finding.severity, finding.rule, finding.message, finding.line);
+    }
+}
+```
+
+Custom deny patterns can be added alongside the defaults:
+
+```rust
+let scanner = SkillScanner::with_custom_rules(vec![
+    ("custom-pattern".into(), r"my_dangerous_pattern".into(),
+     ScanSeverity::Warning, "Custom rule description".into()),
+]);
 ```
 
 ### Server Configuration
@@ -279,6 +416,91 @@ The Runtime HTTP API server can be configured with the following options:
 - **CORS support**: Configurable for development
 - **Request tracing**: Enabled via Tower middleware
 - **Feature gate**: Available behind `http-api` Cargo feature
+
+---
+
+### Feature Configuration Reference
+
+#### Cloud LLM Inference (`cloud-llm`)
+
+Connect to cloud LLM providers via OpenRouter for agent reasoning:
+
+```bash
+cargo build --features cloud-llm
+```
+
+**Environment Variables:**
+- `OPENROUTER_API_KEY` — Your OpenRouter API key (required)
+- `OPENROUTER_MODEL` — Model to use (default: `google/gemini-2.0-flash-001`)
+
+The cloud LLM provider integrates with the reasoning loop's `execute_actions()` pipeline. It supports streaming responses, automatic retries with exponential backoff, and token usage tracking.
+
+#### Standalone Agent Mode (`standalone-agent`)
+
+Combines cloud LLM inference with Composio tool access for cloud-native agents:
+
+```bash
+cargo build --features standalone-agent
+# Enables: cloud-llm + composio
+```
+
+**Environment Variables:**
+- `OPENROUTER_API_KEY` — OpenRouter API key
+- `COMPOSIO_API_KEY` — Composio API key
+- `COMPOSIO_MCP_URL` — Composio MCP server URL
+
+#### Cedar Policy Engine (`cedar`)
+
+Formal authorization using the [Cedar policy language](https://www.cedarpolicy.com/):
+
+```bash
+cargo build --features cedar
+```
+
+Cedar policies integrate with the reasoning loop's Gate phase, providing fine-grained authorization decisions. See the [Security Model](/security-model#cedar-policy-engine) for policy examples.
+
+#### Vector Database Configuration
+
+Symbiont ships with **LanceDB** as the default embedded vector backend — no external service required. For scaled deployments, Qdrant is available as an optional backend.
+
+**LanceDB (default):**
+```toml
+[vector_db]
+enabled = true
+backend = "lancedb"
+collection_name = "symbi_knowledge"
+```
+
+No additional configuration needed. Data stored locally alongside the runtime.
+
+**Qdrant (optional):**
+```bash
+cargo build --features vector-qdrant
+```
+
+```toml
+[vector_db]
+enabled = true
+backend = "qdrant"
+collection_name = "symbi_knowledge"
+url = "http://localhost:6333"
+```
+
+**Environment Variables:**
+- `SYMBIONT_VECTOR_BACKEND` — `lancedb` (default) or `qdrant`
+- `QDRANT_URL` — Qdrant server URL (only when using Qdrant)
+
+#### Advanced Reasoning Primitives (`orga-adaptive`)
+
+Enable tool curation, stuck-loop detection, context pre-fetch, and scoped conventions:
+
+```bash
+cargo build --features orga-adaptive
+```
+
+See the [orga-adaptive guide](/orga-adaptive) for full configuration reference.
+
+---
 
 ### Data Structures
 
@@ -363,19 +585,323 @@ GetAgentHistoryResponse {
 
 ### Runtime Provider Interface
 
-The API implements a `RuntimeApiProvider` trait with the following methods:
+The API implements a `RuntimeApiProvider` trait with the following enhanced methods:
 
 - `execute_workflow()` - Execute a workflow with given parameters
-- `get_agent_status()` - Retrieve status information for a specific agent
-- `get_system_health()` - Get overall system health status
-- `list_agents()` - List all active agents in the runtime
-- `shutdown_agent()` - Gracefully shutdown a specific agent
-- `get_metrics()` - Retrieve system performance metrics
-- `create_agent()` - Create a new agent with provided configuration
-- `update_agent()` - Update an existing agent's configuration
-- `delete_agent()` - Delete an existing agent from the runtime
-- `execute_agent()` - Trigger execution of a specific agent
-- `get_agent_history()` - Retrieve execution history for a specific agent
+- `get_agent_status()` - Retrieve detailed status with real-time execution metrics
+- `get_system_health()` - Get overall system health with scheduler statistics
+- `list_agents()` - List all agents (running, queued, and completed)
+- `shutdown_agent()` - Gracefully shutdown with resource cleanup and timeout handling
+- `get_metrics()` - Retrieve comprehensive system metrics including task statistics
+- `create_agent()` - Create agents with execution mode specification
+- `update_agent()` - Update agent configuration with persistence
+- `delete_agent()` - Delete agent with proper cleanup of running processes
+- `execute_agent()` - Trigger execution with monitoring and health checks
+- `get_agent_history()` - Retrieve detailed execution history with performance metrics
+
+#### Scheduling API
+
+All scheduling endpoints require authentication. Requires the `cron` feature.
+
+##### List Schedules
+```http
+GET /api/v1/schedules
+Authorization: Bearer <your-token>
+```
+
+**Response (200 OK):**
+```json
+[
+  {
+    "job_id": "uuid",
+    "name": "daily-report",
+    "cron_expression": "0 0 9 * * *",
+    "timezone": "America/New_York",
+    "status": "active",
+    "enabled": true,
+    "next_run": "2026-03-04T09:00:00Z",
+    "run_count": 42
+  }
+]
+```
+
+##### Create Schedule
+```http
+POST /api/v1/schedules
+Authorization: Bearer <your-token>
+```
+
+**Request Body:**
+```json
+{
+  "name": "daily-report",
+  "cron_expression": "0 0 9 * * *",
+  "timezone": "America/New_York",
+  "agent_name": "report-agent",
+  "policy_ids": ["policy-1"],
+  "one_shot": false
+}
+```
+
+The `cron_expression` uses six fields: `sec min hour day month weekday` (optional seventh field for year).
+
+**Response (200 OK):**
+```json
+{
+  "job_id": "uuid",
+  "next_run": "2026-03-04T09:00:00Z",
+  "status": "created"
+}
+```
+
+##### Update Schedule
+```http
+PUT /api/v1/schedules/{id}
+Authorization: Bearer <your-token>
+```
+
+**Request Body (all fields optional):**
+```json
+{
+  "cron_expression": "0 */10 * * * *",
+  "timezone": "UTC",
+  "policy_ids": ["policy-2"],
+  "one_shot": true
+}
+```
+
+##### Pause / Resume / Trigger Schedule
+```http
+POST /api/v1/schedules/{id}/pause
+POST /api/v1/schedules/{id}/resume
+POST /api/v1/schedules/{id}/trigger
+Authorization: Bearer <your-token>
+```
+
+**Response (200 OK):**
+```json
+{
+  "job_id": "uuid",
+  "action": "paused",
+  "status": "ok"
+}
+```
+
+##### Delete Schedule
+```http
+DELETE /api/v1/schedules/{id}
+Authorization: Bearer <your-token>
+```
+
+**Response (200 OK):**
+```json
+{
+  "job_id": "uuid",
+  "deleted": true
+}
+```
+
+##### Get Schedule History
+```http
+GET /api/v1/schedules/{id}/history
+Authorization: Bearer <your-token>
+```
+
+**Response (200 OK):**
+```json
+{
+  "job_id": "uuid",
+  "history": [
+    {
+      "run_id": "uuid",
+      "started_at": "2026-03-03T09:00:00Z",
+      "completed_at": "2026-03-03T09:01:23Z",
+      "status": "completed",
+      "error": null,
+      "execution_time_ms": 83000
+    }
+  ]
+}
+```
+
+##### Get Next Runs
+```http
+GET /api/v1/schedules/{id}/next?count=5
+Authorization: Bearer <your-token>
+```
+
+**Response (200 OK):**
+```json
+{
+  "job_id": "uuid",
+  "next_runs": [
+    "2026-03-04T09:00:00Z",
+    "2026-03-05T09:00:00Z"
+  ]
+}
+```
+
+##### Scheduler Health
+```http
+GET /api/v1/health/scheduler
+```
+
+Returns scheduler-specific health and statistics.
+
+---
+
+#### Channel Adapter API
+
+All channel endpoints require authentication. Connects agents to Slack, Microsoft Teams, and Mattermost.
+
+##### List Channels
+```http
+GET /api/v1/channels
+Authorization: Bearer <your-token>
+```
+
+**Response (200 OK):**
+```json
+[
+  {
+    "id": "uuid",
+    "name": "slack-general",
+    "platform": "slack",
+    "status": "running"
+  }
+]
+```
+
+##### Register Channel
+```http
+POST /api/v1/channels
+Authorization: Bearer <your-token>
+```
+
+**Request Body:**
+```json
+{
+  "name": "slack-general",
+  "platform": "slack",
+  "config": {
+    "webhook_url": "https://hooks.slack.com/...",
+    "channel": "#general"
+  }
+}
+```
+
+Supported platforms: `slack`, `teams`, `mattermost`.
+
+**Response (200 OK):**
+```json
+{
+  "id": "uuid",
+  "name": "slack-general",
+  "platform": "slack",
+  "status": "registered"
+}
+```
+
+##### Get / Update / Delete Channel
+```http
+GET    /api/v1/channels/{id}
+PUT    /api/v1/channels/{id}
+DELETE /api/v1/channels/{id}
+Authorization: Bearer <your-token>
+```
+
+##### Start / Stop Channel
+```http
+POST /api/v1/channels/{id}/start
+POST /api/v1/channels/{id}/stop
+Authorization: Bearer <your-token>
+```
+
+**Response (200 OK):**
+```json
+{
+  "id": "uuid",
+  "action": "started",
+  "status": "ok"
+}
+```
+
+##### Channel Health
+```http
+GET /api/v1/channels/{id}/health
+Authorization: Bearer <your-token>
+```
+
+**Response (200 OK):**
+```json
+{
+  "id": "uuid",
+  "connected": true,
+  "platform": "slack",
+  "workspace_name": "my-team",
+  "channels_active": 3,
+  "last_message_at": "2026-03-03T15:42:00Z",
+  "uptime_secs": 86400
+}
+```
+
+##### Identity Mappings
+```http
+GET  /api/v1/channels/{id}/mappings
+POST /api/v1/channels/{id}/mappings
+Authorization: Bearer <your-token>
+```
+
+Maps platform users to Symbiont identities for agent interactions.
+
+##### Channel Audit Log
+```http
+GET /api/v1/channels/{id}/audit
+Authorization: Bearer <your-token>
+```
+
+---
+
+### Scheduler Features
+
+**Real Task Execution:**
+- Process spawning with secure execution environments
+- Resource monitoring (memory, CPU) with 5-second intervals
+- Health checks and automatic failure detection
+- Support for ephemeral, persistent, scheduled, and event-driven execution modes
+
+**Graceful Shutdown:**
+- 30-second graceful termination period
+- Force termination for unresponsive processes
+- Resource cleanup and metrics persistence
+- Queue cleanup and state synchronization
+
+### Enhanced Context Management
+
+**Advanced Search Capabilities:**
+```json
+{
+  "query_type": "keyword|temporal|similarity|hybrid",
+  "search_terms": ["term1", "term2"],
+  "time_range": {
+    "start": "2024-01-01T00:00:00Z",
+    "end": "2024-01-31T23:59:59Z"
+  },
+  "memory_types": ["factual", "procedural", "episodic"],
+  "relevance_threshold": 0.7,
+  "max_results": 10
+}
+```
+
+**Importance Calculation:**
+- Multi-factor scoring with access frequency, recency, and user feedback
+- Memory type weighting and age decay factors
+- Trust score calculation for shared knowledge
+
+**Access Control Integration:**
+- Policy engine connected to context operations
+- Agent-scoped access with secure boundaries
+- Knowledge sharing with granular permissions
 
 ---
 
@@ -709,7 +1235,7 @@ The API uses standard HTTP status codes and returns detailed error information:
 
 2. Set the authentication token for agent endpoints:
    ```bash
-   export API_AUTH_TOKEN="your-secret-token"
+   export API_AUTH_TOKEN="<your-token>"
    ```
 
 3. Start the runtime server:
@@ -724,7 +1250,7 @@ The API uses standard HTTP status codes and returns detailed error information:
 
 5. Test authenticated agent endpoint:
    ```bash
-   curl -H "Authorization: Bearer your-secret-token" \
+   curl -H "Authorization: Bearer $API_AUTH_TOKEN" \
         http://127.0.0.1:8080/api/v1/agents
    ```
 

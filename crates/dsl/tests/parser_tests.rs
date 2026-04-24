@@ -2,7 +2,11 @@ use std::fs;
 use std::path::Path;
 
 // Import the functions we want to test from main.rs
-use dsl::{extract_metadata, parse_dsl, print_ast};
+use dsl::{
+    extract_channel_definitions, extract_memory_definitions, extract_metadata,
+    extract_webhook_definitions, extract_with_blocks, parse_dsl, print_ast, MemoryStoreType,
+    SandboxTier, WebhookProvider, WithBlock,
+};
 
 #[cfg(test)]
 mod parser_tests {
@@ -217,7 +221,11 @@ mod parser_tests {
                 let entry = entry.expect("Should read directory entry");
                 let path = entry.path();
 
-                if path.extension().and_then(|s| s.to_str()) == Some("dsl") {
+                if path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|ext| ext == "dsl" || ext == "symbi")
+                {
                     let filename = path.file_name().unwrap().to_str().unwrap();
 
                     if filename.starts_with("valid_") {
@@ -244,7 +252,11 @@ mod parser_tests {
                 let entry = entry.expect("Should read directory entry");
                 let path = entry.path();
 
-                if path.extension().and_then(|s| s.to_str()) == Some("dsl") {
+                if path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|ext| ext == "dsl" || ext == "symbi")
+                {
                     let filename = path.file_name().unwrap().to_str().unwrap();
 
                     if filename.starts_with("invalid_") {
@@ -352,5 +364,496 @@ mod parser_tests {
 
         let result = parse_dsl(&large_dsl);
         assert!(result.is_ok(), "Parser should handle large inputs");
+    }
+
+    #[test]
+    fn test_parse_agent_with_sandbox_tier() {
+        let agent_dsl = r#"agent code_runner(script: String) -> Output {
+    with sandbox = "e2b", timeout = 60.seconds {
+        return execute(script);
+    }
+}"#;
+
+        let result = parse_dsl(agent_dsl);
+        assert!(
+            result.is_ok(),
+            "Agent with sandbox should parse successfully"
+        );
+
+        let tree = result.unwrap();
+        let with_blocks =
+            extract_with_blocks(&tree, agent_dsl).expect("Should extract with blocks");
+
+        assert_eq!(with_blocks.len(), 1, "Should have one with block");
+        let with_block = &with_blocks[0];
+
+        assert_eq!(with_block.sandbox_tier, Some(SandboxTier::E2B));
+        assert_eq!(with_block.timeout, Some(60));
+        assert_eq!(with_block.attributes.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_agent_with_docker_sandbox() {
+        let agent_dsl = r#"agent data_processor {
+    with sandbox = "docker" {
+        let result = process_data();
+        return result;
+    }
+}"#;
+
+        let tree = parse_dsl(agent_dsl).expect("Should parse successfully");
+        let with_blocks =
+            extract_with_blocks(&tree, agent_dsl).expect("Should extract with blocks");
+
+        assert_eq!(with_blocks.len(), 1);
+        assert_eq!(with_blocks[0].sandbox_tier, Some(SandboxTier::Docker));
+    }
+
+    #[test]
+    fn test_parse_agent_with_all_sandbox_tiers() {
+        let test_cases = vec![
+            ("docker", SandboxTier::Docker),
+            ("gvisor", SandboxTier::GVisor),
+            ("firecracker", SandboxTier::Firecracker),
+            ("e2b", SandboxTier::E2B),
+        ];
+
+        for (tier_str, expected_tier) in test_cases {
+            let agent_dsl = format!(
+                r#"agent test_agent {{
+    with sandbox = "{}" {{
+        return success();
+    }}
+}}"#,
+                tier_str
+            );
+
+            let tree = parse_dsl(&agent_dsl).expect("Should parse successfully");
+            let with_blocks =
+                extract_with_blocks(&tree, &agent_dsl).expect("Should extract with blocks");
+
+            assert_eq!(with_blocks.len(), 1);
+            assert_eq!(with_blocks[0].sandbox_tier, Some(expected_tier));
+        }
+    }
+
+    #[test]
+    fn test_sandbox_tier_validation() {
+        assert_eq!(
+            WithBlock::parse_sandbox_tier("docker"),
+            Ok(SandboxTier::Docker)
+        );
+        assert_eq!(
+            WithBlock::parse_sandbox_tier("DOCKER"),
+            Ok(SandboxTier::Docker)
+        );
+        assert_eq!(
+            WithBlock::parse_sandbox_tier("\"gvisor\""),
+            Ok(SandboxTier::GVisor)
+        );
+        assert_eq!(
+            WithBlock::parse_sandbox_tier("firecracker"),
+            Ok(SandboxTier::Firecracker)
+        );
+        assert_eq!(WithBlock::parse_sandbox_tier("e2b"), Ok(SandboxTier::E2B));
+
+        // Test invalid values
+        assert!(WithBlock::parse_sandbox_tier("invalid_tier").is_err());
+        assert!(WithBlock::parse_sandbox_tier("").is_err());
+    }
+
+    #[test]
+    fn test_agent_with_parameters_and_sandbox() {
+        let agent_dsl = r#"agent code_runner(script: String, language: String) -> ExecutionResult {
+    with sandbox = "firecracker", timeout = 120.seconds {
+        return execute_code(script, language);
+    }
+}"#;
+
+        let tree = parse_dsl(agent_dsl).expect("Should parse agent with parameters and sandbox");
+        let with_blocks =
+            extract_with_blocks(&tree, agent_dsl).expect("Should extract with blocks");
+
+        assert_eq!(with_blocks.len(), 1);
+        assert_eq!(with_blocks[0].sandbox_tier, Some(SandboxTier::Firecracker));
+        assert_eq!(with_blocks[0].timeout, Some(120));
+    }
+
+    #[test]
+    fn test_multiple_with_blocks() {
+        let agent_dsl = r#"agent complex_agent {
+    with sandbox = "docker" {
+        let step1 = process_input();
+    }
+    
+    with sandbox = "e2b", timeout = 30.seconds {
+        let step2 = secure_process(step1);
+        return step2;
+    }
+}"#;
+
+        let tree = parse_dsl(agent_dsl).expect("Should parse agent with multiple with blocks");
+        let with_blocks =
+            extract_with_blocks(&tree, agent_dsl).expect("Should extract with blocks");
+
+        assert_eq!(with_blocks.len(), 2);
+        assert_eq!(with_blocks[0].sandbox_tier, Some(SandboxTier::Docker));
+        assert_eq!(with_blocks[1].sandbox_tier, Some(SandboxTier::E2B));
+        assert_eq!(with_blocks[1].timeout, Some(30));
+    }
+
+    #[test]
+    fn test_invalid_sandbox_tier_error() {
+        let agent_dsl = r#"agent test_agent {
+    with sandbox = "invalid_sandbox" {
+        return error();
+    }
+}"#;
+
+        let tree = parse_dsl(agent_dsl).expect("Should parse even with invalid sandbox");
+        let result = extract_with_blocks(&tree, agent_dsl);
+
+        assert!(
+            result.is_err(),
+            "Should return error for invalid sandbox tier"
+        );
+        assert!(result.unwrap_err().contains("Invalid sandbox tier"));
+    }
+
+    #[test]
+    fn test_with_block_timeout_parsing() {
+        let test_cases = vec![
+            ("30.seconds", Some(30)),
+            ("60", Some(60)),
+            ("\"120\"", Some(120)),
+        ];
+
+        for (timeout_str, expected) in test_cases {
+            let agent_dsl = format!(
+                r#"agent test_agent {{
+    with timeout = {} {{
+        return result();
+    }}
+}}"#,
+                timeout_str
+            );
+
+            let tree = parse_dsl(&agent_dsl).expect("Should parse successfully");
+            let with_blocks =
+                extract_with_blocks(&tree, &agent_dsl).expect("Should extract with blocks");
+
+            assert_eq!(with_blocks.len(), 1);
+            assert_eq!(with_blocks[0].timeout, expected);
+        }
+    }
+
+    // ── Channel definition tests ──────────────────────────────────────
+
+    #[test]
+    fn test_channel_definition_parsing() {
+        let dsl = r#"
+        channel slack_ops {
+            platform: "slack"
+            workspace: "acme-corp"
+            default_agent: "compliance_check"
+            dlp_profile: "hipaa"
+            audit_level: "full"
+            default_deny: true
+        }
+        "#;
+
+        let tree = parse_dsl(dsl).expect("should parse");
+        let channels = extract_channel_definitions(&tree, dsl).unwrap();
+        assert_eq!(channels.len(), 1);
+
+        let c = &channels[0];
+        assert_eq!(c.name, "slack_ops");
+        assert_eq!(c.platform.as_deref(), Some("slack"));
+        assert_eq!(c.workspace.as_deref(), Some("acme-corp"));
+        assert_eq!(c.default_agent.as_deref(), Some("compliance_check"));
+        assert_eq!(c.dlp_profile.as_deref(), Some("hipaa"));
+        assert_eq!(c.audit_level.as_deref(), Some("full"));
+        assert!(c.default_deny);
+        assert!(c.channels.is_empty());
+        assert!(c.policy_rules.is_empty());
+        assert!(c.data_classification.is_empty());
+    }
+
+    #[test]
+    fn test_channel_with_array_channels() {
+        let dsl = r##"
+        channel slack_ops {
+            platform: "slack"
+            channels: ["#ops-agents", "#compliance"]
+        }
+        "##;
+
+        let tree = parse_dsl(dsl).expect("should parse");
+        let channels = extract_channel_definitions(&tree, dsl).unwrap();
+        assert_eq!(channels.len(), 1);
+
+        let c = &channels[0];
+        assert_eq!(c.channels.len(), 2);
+        assert_eq!(c.channels[0], "#ops-agents");
+        assert_eq!(c.channels[1], "#compliance");
+    }
+
+    #[test]
+    fn test_channel_with_policy_block() {
+        let dsl = r#"
+        channel slack_ops {
+            platform: "slack"
+
+            policy channel_guard {
+                allow: invoke("compliance_check")
+                deny: invoke("deploy_prod")
+                audit: all_interactions
+            }
+        }
+        "#;
+
+        let tree = parse_dsl(dsl).expect("should parse");
+        let channels = extract_channel_definitions(&tree, dsl).unwrap();
+        assert_eq!(channels.len(), 1);
+
+        let c = &channels[0];
+        assert_eq!(c.policy_rules.len(), 3);
+        assert_eq!(c.policy_rules[0].action, "allow");
+        assert!(c.policy_rules[0].expression.contains("compliance_check"));
+        assert_eq!(c.policy_rules[1].action, "deny");
+        assert!(c.policy_rules[1].expression.contains("deploy_prod"));
+        assert_eq!(c.policy_rules[2].action, "audit");
+        assert_eq!(c.policy_rules[2].expression, "all_interactions");
+    }
+
+    #[test]
+    fn test_channel_with_data_classification() {
+        let dsl = r#"
+        channel slack_ops {
+            platform: "slack"
+
+            data_classification {
+                pii: redact
+                phi: block
+                api_key: redact
+                public: allow
+            }
+        }
+        "#;
+
+        let tree = parse_dsl(dsl).expect("should parse");
+        let channels = extract_channel_definitions(&tree, dsl).unwrap();
+        assert_eq!(channels.len(), 1);
+
+        let c = &channels[0];
+        assert_eq!(c.data_classification.len(), 4);
+        assert_eq!(c.data_classification[0].category, "pii");
+        assert_eq!(c.data_classification[0].action, "redact");
+        assert_eq!(c.data_classification[1].category, "phi");
+        assert_eq!(c.data_classification[1].action, "block");
+        assert_eq!(c.data_classification[2].category, "api_key");
+        assert_eq!(c.data_classification[2].action, "redact");
+        assert_eq!(c.data_classification[3].category, "public");
+        assert_eq!(c.data_classification[3].action, "allow");
+    }
+
+    #[test]
+    fn test_channel_missing_platform() {
+        let dsl = r#"
+        channel bad_channel {
+            workspace: "acme-corp"
+            default_agent: "some_agent"
+        }
+        "#;
+
+        let tree = parse_dsl(dsl).expect("should parse");
+        let result = extract_channel_definitions(&tree, dsl);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must specify 'platform'"));
+    }
+
+    #[test]
+    fn test_multiple_channel_definitions() {
+        let dsl = r#"
+        channel slack_ops {
+            platform: "slack"
+            workspace: "acme-corp"
+        }
+        channel teams_eng {
+            platform: "teams"
+            workspace: "engineering"
+        }
+        "#;
+
+        let tree = parse_dsl(dsl).expect("should parse");
+        let channels = extract_channel_definitions(&tree, dsl).unwrap();
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].name, "slack_ops");
+        assert_eq!(channels[0].platform.as_deref(), Some("slack"));
+        assert_eq!(channels[1].name, "teams_eng");
+        assert_eq!(channels[1].platform.as_deref(), Some("teams"));
+    }
+
+    #[test]
+    fn test_channel_with_schedule() {
+        let dsl = r#"
+        schedule morning_report {
+            cron: "0 7 * * 1-5",
+            agent: "compliance_reporter"
+        }
+
+        channel slack_ops {
+            platform: "slack"
+            workspace: "acme-corp"
+        }
+        "#;
+
+        let tree = parse_dsl(dsl).expect("should parse");
+
+        // Both should parse without interference
+        let schedules =
+            dsl::extract_schedule_definitions(&tree, dsl).expect("schedules should parse");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].name, "morning_report");
+
+        let channels = extract_channel_definitions(&tree, dsl).unwrap();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].name, "slack_ops");
+    }
+
+    // ── Memory definition tests ──────────────────────────────────────
+
+    #[test]
+    fn test_memory_definition_parsing() {
+        let dsl = r#"
+        memory agent_memory {
+            store    markdown
+            path     "data/agents"
+            retention 90d
+        }
+        "#;
+        let tree = parse_dsl(dsl).expect("should parse");
+        let memories = extract_memory_definitions(&tree, dsl).unwrap();
+        assert_eq!(memories.len(), 1);
+        let m = &memories[0];
+        assert_eq!(m.name, "agent_memory");
+        assert_eq!(m.store, MemoryStoreType::Markdown);
+        assert_eq!(m.path, std::path::PathBuf::from("data/agents"));
+        assert_eq!(m.retention, std::time::Duration::from_secs(90 * 86400));
+        assert!(m.search.is_none());
+    }
+
+    #[test]
+    fn test_memory_definition_with_search_config() {
+        let dsl = r#"
+        memory agent_memory {
+            store    markdown
+            path     "data/agents"
+            retention 90d
+            search {
+                vector_weight  0.7
+                keyword_weight 0.3
+            }
+        }
+        "#;
+        let tree = parse_dsl(dsl).expect("should parse");
+        let memories = extract_memory_definitions(&tree, dsl).unwrap();
+        assert_eq!(memories.len(), 1);
+        let m = &memories[0];
+        let search = m.search.as_ref().unwrap();
+        assert!((search.vector_weight - 0.7).abs() < f64::EPSILON);
+        assert!((search.keyword_weight - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_memory_definition_defaults() {
+        let dsl = r#"
+        memory minimal {
+            store markdown
+        }
+        "#;
+        let tree = parse_dsl(dsl).expect("should parse");
+        let memories = extract_memory_definitions(&tree, dsl).unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].path, std::path::PathBuf::from("data/agents"));
+        assert_eq!(
+            memories[0].retention,
+            std::time::Duration::from_secs(90 * 86400)
+        );
+    }
+
+    // ── Webhook definition tests ──────────────────────────────────────
+
+    #[test]
+    fn test_webhook_definition_parsing() {
+        let dsl = r#"
+        webhook github_events {
+            path     "/hooks/github"
+            provider github
+            secret   "secret://vault/github-webhook-secret"
+            agent    code_review_agent
+        }
+        "#;
+        let tree = parse_dsl(dsl).expect("should parse");
+        let webhooks = extract_webhook_definitions(&tree, dsl).unwrap();
+        assert_eq!(webhooks.len(), 1);
+        let w = &webhooks[0];
+        assert_eq!(w.name, "github_events");
+        assert_eq!(w.path, "/hooks/github");
+        assert_eq!(w.provider, WebhookProvider::GitHub);
+        assert_eq!(w.secret, "secret://vault/github-webhook-secret");
+        assert_eq!(w.agent.as_deref(), Some("code_review_agent"));
+        assert!(w.filter.is_none());
+    }
+
+    #[test]
+    fn test_webhook_definition_with_filter() {
+        let dsl = r#"
+        webhook github_prs {
+            path     "/hooks/github"
+            provider github
+            secret   "my-secret"
+            agent    pr_agent
+            filter {
+                json_path "$.action"
+                equals    "opened"
+            }
+        }
+        "#;
+        let tree = parse_dsl(dsl).expect("should parse");
+        let webhooks = extract_webhook_definitions(&tree, dsl).unwrap();
+        assert_eq!(webhooks.len(), 1);
+        let f = webhooks[0].filter.as_ref().unwrap();
+        assert_eq!(f.json_path, "$.action");
+        assert_eq!(f.equals.as_deref(), Some("opened"));
+    }
+
+    #[test]
+    fn test_webhook_definition_custom_provider() {
+        let dsl = r#"
+        webhook custom_hook {
+            path     "/hooks/custom"
+            provider custom
+            secret   "test-secret"
+        }
+        "#;
+        let tree = parse_dsl(dsl).expect("should parse");
+        let webhooks = extract_webhook_definitions(&tree, dsl).unwrap();
+        assert_eq!(webhooks[0].provider, WebhookProvider::Custom);
+        assert!(webhooks[0].agent.is_none());
+    }
+
+    #[test]
+    fn test_webhook_definition_missing_path_fails() {
+        let dsl = r#"
+        webhook no_path {
+            provider github
+            secret   "test"
+        }
+        "#;
+        let tree = parse_dsl(dsl).expect("should parse");
+        let result = extract_webhook_definitions(&tree, dsl);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("path"));
     }
 }

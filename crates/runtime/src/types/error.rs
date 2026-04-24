@@ -40,6 +40,9 @@ pub enum RuntimeError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Authentication failed: {0}")]
+    Authentication(String),
 }
 
 /// Configuration-related errors
@@ -65,7 +68,7 @@ pub enum ResourceError {
     Insufficient(String),
 
     #[error("Resource allocation failed for agent {agent_id}: {reason}")]
-    AllocationFailed { agent_id: AgentId, reason: String },
+    AllocationFailed { agent_id: AgentId, reason: Box<str> },
 
     #[error("Resource limit exceeded: {0}")]
     LimitExceeded(String),
@@ -86,19 +89,19 @@ pub enum ResourceError {
     AllocationExists { agent_id: AgentId },
 
     #[error("Insufficient resources for requirements: {requirements:?}")]
-    InsufficientResources { requirements: String },
+    InsufficientResources { requirements: Box<str> },
 
     #[error("Policy error: {0}")]
     PolicyError(String),
 
     #[error("Policy violation: {reason}")]
-    PolicyViolation { reason: String },
+    PolicyViolation { reason: Box<str> },
 
     #[error("Resource allocation queued: {reason}")]
-    AllocationQueued { reason: String },
+    AllocationQueued { reason: Box<str> },
 
     #[error("Escalation required: {reason}")]
-    EscalationRequired { reason: String },
+    EscalationRequired { reason: Box<str> },
 }
 
 /// Security-related errors
@@ -129,10 +132,13 @@ pub enum SecurityError {
 /// Communication system errors
 #[derive(Error, Debug, Clone)]
 pub enum CommunicationError {
-    #[error("Message delivery failed for message {message_id}: {reason}")]
+    #[error("Message delivery failed for message {}: {reason}", .message_id.map(|m| m.to_string()).unwrap_or_else(|| "<unknown>".to_string()))]
     DeliveryFailed {
-        message_id: MessageId,
-        reason: String,
+        /// ID of the affected message, if known. `None` for transport-level
+        /// failures that occur before a message was assigned an ID (e.g. a
+        /// remote HTTP request that never reached the bus).
+        message_id: Option<MessageId>,
+        reason: Box<str>,
     },
 
     #[error("Connection failed: {0}")]
@@ -157,7 +163,7 @@ pub enum CommunicationError {
     ShuttingDown,
 
     #[error("Event processing failed: {reason}")]
-    EventProcessingFailed { reason: String },
+    EventProcessingFailed { reason: Box<str> },
 
     #[error("Agent not registered: {agent_id}")]
     AgentNotRegistered { agent_id: AgentId },
@@ -166,10 +172,22 @@ pub enum CommunicationError {
     MessageNotFound { message_id: MessageId },
 
     #[error("Request timeout: request {request_id} timed out after {timeout:?}")]
-    RequestTimeout { request_id: RequestId, timeout: Duration },
+    RequestTimeout {
+        request_id: RequestId,
+        timeout: Duration,
+    },
 
     #[error("Request cancelled: {request_id}")]
     RequestCancelled { request_id: RequestId },
+
+    #[error("Policy denied: {reason}")]
+    PolicyDenied { reason: Box<str> },
+
+    #[error("Signature verification failed for message {message_id}: {reason}")]
+    SignatureInvalid {
+        message_id: MessageId,
+        reason: Box<str>,
+    },
 }
 
 /// Policy enforcement errors
@@ -194,7 +212,7 @@ pub enum PolicyError {
     EngineUnavailable(String),
 
     #[error("Invalid policy: {reason}")]
-    InvalidPolicy { reason: String },
+    InvalidPolicy { reason: Box<str> },
 }
 
 /// Sandbox orchestration errors
@@ -229,19 +247,28 @@ pub enum SandboxError {
 #[derive(Error, Debug, Clone)]
 pub enum SchedulerError {
     #[error("Agent scheduling failed for {agent_id}: {reason}")]
-    SchedulingFailed { agent_id: AgentId, reason: String },
+    SchedulingFailed { agent_id: AgentId, reason: Box<str> },
 
     #[error("Agent not found: {agent_id}")]
     AgentNotFound { agent_id: AgentId },
 
     #[error("Scheduler overloaded: {0}")]
-    Overloaded(String),
+    Overloaded(Box<str>),
 
     #[error("Invalid priority: {0}")]
     InvalidPriority(String),
 
     #[error("Scheduler shutdown in progress")]
     ShuttingDown,
+
+    #[error("Serialization failed: {0}")]
+    SerializationFailed(String),
+}
+
+impl From<serde_json::Error> for SchedulerError {
+    fn from(error: serde_json::Error) -> Self {
+        SchedulerError::SerializationFailed(format!("JSON serialization error: {}", error))
+    }
 }
 
 /// Lifecycle management errors
