@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use clap::ArgMatches;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,12 +7,89 @@ use symbi_channel_adapter::{
     MattermostConfig, PlatformSettings, SlackConfig, TeamsConfig,
 };
 use symbi_runtime::api::server::{HttpApiConfig, HttpApiServer};
-use symbi_runtime::http_input::llm_client::LlmClient;
 use symbi_runtime::http_input::{start_http_input, HttpInputConfig};
-use symbi_runtime::types::AgentId;
+use symbi_runtime::types::{AgentId, SecurityTier};
 use symbi_runtime::AgentRuntime;
 use symbi_runtime::RuntimeConfig;
 use symbi_runtime::SecretsConfig;
+
+mod chat_response;
+use chat_response::LlmAgentInvoker;
+
+/// Map an approval-channel platform string to a [`ChatPlatform`].
+/// Returns `None` for unrecognised platform identifiers.
+fn parse_platform(s: &str) -> Option<ChatPlatform> {
+    match s.to_lowercase().as_str() {
+        "slack" => Some(ChatPlatform::Slack),
+        "teams" => Some(ChatPlatform::Teams),
+        "mattermost" => Some(ChatPlatform::Mattermost),
+        _ => None,
+    }
+}
+
+/// Resolve the same validated execution boundary used by the CLI tool runner.
+pub(super) fn resolve_security_tier(source: &str, selector: &str) -> Result<SecurityTier, String> {
+    use symbi_runtime::sandbox::command::{CommandBoundary, CommandTier};
+    let settings = dsl::resolve_execution_settings(source, selector)?;
+    let boundary = CommandBoundary::load_for_agent(Path::new("."), &settings)?;
+    Ok(match boundary.tier {
+        CommandTier::DevelopmentHost => SecurityTier::None,
+        CommandTier::Docker => SecurityTier::Tier1,
+        CommandTier::GVisor => SecurityTier::Tier2,
+        CommandTier::Firecracker => SecurityTier::Tier3,
+        CommandTier::E2B => SecurityTier::Hosted,
+        // No SecurityTier names the landlock tier, so it cannot be reported
+        // for a registered agent. Refuse rather than mapping it onto a
+        // neighboring tier, which would misreport the isolation in use.
+        CommandTier::Landlock => {
+            return Err(
+                "the landlock tier cannot be selected for a registered agent; \
+                        declare it in [sandbox] for direct runs"
+                    .into(),
+            )
+        }
+    })
+}
+
+/// A schedule may name an agent in its own file or a separate agent file.
+/// Resolve the actual source before reading its boundary; another definition's
+/// sandbox settings must never be used merely because it contains a schedule.
+#[cfg(feature = "cron")]
+fn scheduled_agent_source(
+    agents_dir: &Path,
+    current_file: &Path,
+    source: &str,
+    name: &str,
+) -> Result<String, String> {
+    if let Ok(settings) = dsl::resolve_execution_settings(source, name) {
+        if settings.agent_name == name
+            || current_file.file_stem().and_then(|s| s.to_str()) == Some(name)
+        {
+            return Ok(source.to_owned());
+        }
+    }
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return Err("invalid scheduled agent name".into());
+    }
+    for extension in [dsl::SYMBI_EXTENSION, dsl::LEGACY_DSL_EXTENSION] {
+        let path = agents_dir.join(format!("{name}.{extension}"));
+        match fs::read_to_string(&path) {
+            Ok(selected) => {
+                dsl::resolve_execution_settings(&selected, name)?;
+                return Ok(selected);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot read scheduled agent: {error}")),
+        }
+    }
+    Err(format!("scheduled agent {name:?} is unavailable"))
+}
 
 pub async fn run(matches: &ArgMatches) {
     // Initialize tracing for structured logging
@@ -40,6 +116,8 @@ pub async fn run(matches: &ArgMatches) {
         .unwrap_or_default();
     let http_audit = matches.get_flag("http-audit");
     let serve_agents_md = matches.get_flag("serve-agents-md");
+    let insecure_allow_all = matches.get_flag("insecure-allow-all")
+        || std::env::var("SYMBI_INSECURE_ALLOW_ALL").as_deref() == Ok("1");
     let preset = matches.get_one::<String>("preset");
     let slack_token = matches.get_one::<String>("slack-token");
     let slack_signing_secret = matches.get_one::<String>("slack-signing-secret");
@@ -131,18 +209,38 @@ pub async fn run(matches: &ArgMatches) {
     );
     if std::env::var("SYMBIONT_MASTER_KEY").is_err() {
         eprintln!(
-            "⚠  SYMBIONT_MASTER_KEY not set — crypto operations will fail. Set it or use dev mode."
+            "⚠  SYMBIONT_MASTER_KEY not set — crypto operations will fail.\n\
+             \x20  Generate one:  export SYMBIONT_MASTER_KEY=$(openssl rand -hex 32)\n\
+             \x20  Or run `symbi init`, which writes a key to .env for you."
         );
     }
 
     if agents_found.len() > 1 {
         println!("→ Auto-routing by agent name:");
         for agent in &agents_found {
-            let name = agent.trim_end_matches(".dsl");
+            let name = dsl::strip_symbi_extension(agent).unwrap_or(agent);
             println!("    /webhook/{} → {}", name, agent);
         }
     } else if let Some(agent) = agents_found.first() {
         println!("→ Auto-routing /webhook → {}", agent);
+    } else {
+        // No agents/ directory or no agent files. Point the user at init so
+        // they don't end up with a runtime that literally does nothing.
+        let has_dir = Path::new("agents").is_dir();
+        if !has_dir {
+            eprintln!(
+                "\n⚠  No agents/ directory found — the runtime will start with no agents loaded."
+            );
+        } else {
+            eprintln!(
+                "\n⚠  agents/ directory is empty — the runtime will start with no agents loaded."
+            );
+        }
+        eprintln!("   To scaffold a starter project:");
+        eprintln!("     symbi init --profile assistant     # governed assistant agent");
+        eprintln!("     symbi init --profile dev-agent     # CliExecutor agent for coding tasks");
+        eprintln!("     symbi init --catalog list          # browse pre-built agents");
+        eprintln!();
     }
 
     if let Some(preset_name) = preset {
@@ -259,29 +357,34 @@ pub async fn run(matches: &ArgMatches) {
         use symbi_runtime::{CronScheduler, CronSchedulerConfig};
 
         let cron_config = CronSchedulerConfig::default();
-        let cron_agent_sched = std::sync::Arc::new(
-            symbi_runtime::DefaultAgentScheduler::new(symbi_runtime::SchedulerConfig::default())
-                .await
-                .expect("failed to create cron agent scheduler"),
-        );
-
-        match CronScheduler::new(cron_config, cron_agent_sched).await {
-            Ok(cron_sched) => {
-                let cron_arc = Arc::new(cron_sched);
-                let schedule_count = load_dsl_schedules(&cron_arc).await;
-                if schedule_count > 0 {
-                    println!(
-                        "✓ {} scheduled job(s) loaded from DSL files",
-                        schedule_count
-                    );
+        if let Some(ref rt) = runtime {
+            match CronScheduler::new_with_guards(
+                cron_config,
+                rt.scheduler.clone(),
+                rt.agentpin_verifier.clone(),
+                None,
+            )
+            .await
+            {
+                Ok(cron_sched) => {
+                    let cron_arc = Arc::new(cron_sched);
+                    let schedule_count = load_dsl_schedules(&cron_arc).await;
+                    if schedule_count > 0 {
+                        println!(
+                            "✓ {} scheduled job(s) loaded from DSL files",
+                            schedule_count
+                        );
+                    }
+                    println!("✓ CronScheduler started");
+                    Some(cron_arc)
                 }
-                println!("✓ CronScheduler started");
-                Some(cron_arc)
+                Err(e) => {
+                    eprintln!("⚠️  Failed to start CronScheduler: {}", e);
+                    None
+                }
             }
-            Err(e) => {
-                eprintln!("⚠️  Failed to start CronScheduler: {}", e);
-                None
-            }
+        } else {
+            None
         }
     };
 
@@ -295,26 +398,134 @@ pub async fn run(matches: &ArgMatches) {
         (rt, _) => rt,
     };
 
+    // Build the escalation queue (one shared instance) and read its config.
+    // Escalation config is sourced from symbi.toml / symbi.quick.toml when present;
+    // parse failures fall back to defaults (no approval channels).
+    let escalation_cfg = ["symbi.toml", "symbi.quick.toml"]
+        .iter()
+        .filter(|p| Path::new(p).exists())
+        .find_map(|p| symbi_runtime::config::Config::from_file(p).ok())
+        .and_then(|c| c.escalation)
+        .unwrap_or_default();
+    let escalation_queue = Arc::new(symbi_runtime::escalation::EscalationQueue::new());
+    let escalation_timeout = std::time::Duration::from_secs(
+        std::env::var("SYMBIONT_ESCALATION_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(escalation_cfg.timeout_seconds),
+    );
+    let require_approval_tools: Vec<String> = std::env::var("SYMBIONT_REQUIRE_APPROVAL_TOOLS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // The governed policy-gate ladder (permissive-if-opted-in -> Cedar ->
+    // fail-closed), wrapped so flagged tool calls are held for human
+    // approval. Built unconditionally, so no entry point that acts on model
+    // output in this process can end up permissive by omission.
+    //
+    // One ladder per surface, not one gate for the process. Coordinator Chat
+    // only gates what the model says back to an operator; the HTTP input
+    // server dispatches real tool calls on behalf of unattended callers.
+    // Sharing a single gate meant every grant written for either had to be
+    // held by both. Each surface now also layers `policies/<surface>/*.cedar`
+    // on top of the shared `policies/*.cedar` set, so a permit can be scoped
+    // to the surface it was actually written for.
+    if insecure_allow_all {
+        eprintln!("\n");
+        eprintln!("================================================================");
+        eprintln!("WARNING: --insecure-allow-all / SYMBI_INSECURE_ALLOW_ALL=1 is set");
+        eprintln!("Policy gate is in PERMISSIVE mode.");
+        eprintln!("Every LLM-proposed tool call and delegation will be allowed.");
+        eprintln!("This is only safe for local development. Do NOT use in production.");
+        eprintln!("================================================================\n");
+    }
+    // Both gates share the one escalation queue, so a held action reaches the
+    // same approvers (chat interceptor / Gate panel) whichever surface raised
+    // it. Only the policy surface differs.
+    let escalation_gate_config = symbi_runtime::escalation::EscalationGateConfig {
+        require_approval_tools: require_approval_tools.clone(),
+        timeout: escalation_timeout,
+    };
+    let policy_gate =
+        symbi_runtime::reasoning::governed_gate(symbi_runtime::reasoning::GateOptions {
+            policies_dir: PathBuf::from("policies"),
+            surface: Some("coordinator".to_string()),
+            insecure_allow_all,
+            escalation: Some((escalation_queue.clone(), escalation_gate_config.clone())),
+        })
+        .await;
+    let http_input_policy_gate =
+        symbi_runtime::reasoning::governed_gate(symbi_runtime::reasoning::GateOptions {
+            policies_dir: PathBuf::from("policies"),
+            surface: Some("http-input".to_string()),
+            insecure_allow_all,
+            escalation: Some((escalation_queue.clone(), escalation_gate_config)),
+        })
+        .await;
+
     // Start chat adapters if any are configured
     let any_adapter = slack_token.is_some() || teams_tenant_id.is_some() || mm_server_url.is_some();
-    let mut channel_manager: Option<ChannelAdapterManager> = None;
+    let mut channel_manager: Option<Arc<ChannelAdapterManager>> = None;
 
     if any_adapter {
-        // Build the AgentInvoker bridge (shared across all adapters)
-        let dsl_sources = scan_agent_dsl_sources();
-        let llm_client = LlmClient::from_env().map(Arc::new);
-
-        if llm_client.is_none() {
-            eprintln!("⚠️  No LLM API key found — agent responses will be stubs");
+        let provider =
+            symbi_runtime::reasoning::providers::cloud::CloudInferenceProvider::from_env().map(
+                |provider| {
+                    Arc::new(provider)
+                        as Arc<dyn symbi_runtime::reasoning::inference::InferenceProvider>
+                },
+            );
+        if provider.is_none() {
+            eprintln!("No LLM provider configured; chat invocations will be refused");
         }
-
-        let invoker: Arc<dyn AgentInvoker> = Arc::new(LlmAgentInvoker {
-            llm_client,
-            dsl_sources: Arc::new(dsl_sources),
-        });
+        let invoker: Arc<dyn AgentInvoker> = match std::env::current_dir()
+            .map_err(|error| error.to_string())
+            .and_then(|project| LlmAgentInvoker::new(project, provider, policy_gate.clone()))
+        {
+            Ok(invoker) => Arc::new(invoker),
+            Err(error) => {
+                eprintln!("Chat response initialization failed: {error}");
+                return;
+            }
+        };
 
         let logger = Arc::new(BasicInteractionLogger::new(None));
         let mut manager = ChannelAdapterManager::new(invoker, logger);
+
+        // Wire the escalation command interceptor BEFORE registering any adapter
+        // (adapter command handlers are built at register time). Authorization is
+        // scoped per (platform, channel_id): a sender may only resolve held actions
+        // from a configured approval channel that lists them — never cross-channel
+        // or from an arbitrary channel the bot also reads.
+        if !escalation_cfg.approval_channels.is_empty() {
+            let mut channel_approvers: symbi_runtime::escalation::ChannelApprovers =
+                std::collections::HashMap::new();
+            for c in &escalation_cfg.approval_channels {
+                if let Some(platform) = parse_platform(&c.platform) {
+                    channel_approvers
+                        .entry((platform, c.channel_id.clone()))
+                        .or_default()
+                        .extend(c.approvers.iter().cloned());
+                } else {
+                    eprintln!(
+                        "⚠️  escalation.approval_channels: unknown platform '{}' (channel {}) — skipped",
+                        c.platform, c.channel_id
+                    );
+                }
+            }
+            manager.set_interceptor(Arc::new(
+                symbi_runtime::escalation::EscalationCommandInterceptor::new(
+                    escalation_queue.clone(),
+                    channel_approvers,
+                ),
+            ));
+        }
 
         // Register Slack adapter if --slack.token is provided
         if let Some(token) = slack_token {
@@ -329,7 +540,7 @@ pub async fn run(matches: &ArgMatches) {
             let default_agent = slack_agent.cloned().or_else(|| {
                 agents_found
                     .first()
-                    .map(|f| f.strip_suffix(".dsl").unwrap_or(f).to_string())
+                    .map(|f| dsl::strip_symbi_extension(f).unwrap_or(f).to_string())
             });
 
             let slack_config = SlackConfig {
@@ -399,7 +610,7 @@ pub async fn run(matches: &ArgMatches) {
             let default_agent = teams_agent.cloned().or_else(|| {
                 agents_found
                     .first()
-                    .map(|f| f.strip_suffix(".dsl").unwrap_or(f).to_string())
+                    .map(|f| dsl::strip_symbi_extension(f).unwrap_or(f).to_string())
             });
 
             let teams_config = TeamsConfig {
@@ -462,7 +673,7 @@ pub async fn run(matches: &ArgMatches) {
             let default_agent = mm_agent.cloned().or_else(|| {
                 agents_found
                     .first()
-                    .map(|f| f.strip_suffix(".dsl").unwrap_or(f).to_string())
+                    .map(|f| dsl::strip_symbi_extension(f).unwrap_or(f).to_string())
             });
 
             let mm_config = MattermostConfig {
@@ -503,6 +714,27 @@ pub async fn run(matches: &ArgMatches) {
             }
         }
 
+        // Adapters are registered; share the manager and subscribe one chat
+        // notifier per approval channel so held actions are announced.
+        let manager = Arc::new(manager);
+        for ch in &escalation_cfg.approval_channels {
+            if let Some(platform) = parse_platform(&ch.platform) {
+                escalation_queue
+                    .subscribe(Arc::new(
+                        symbi_runtime::escalation::ChatEscalationNotifier::new(
+                            manager.clone(),
+                            platform,
+                            ch.channel_id.clone(),
+                        ),
+                    ))
+                    .await;
+            } else {
+                eprintln!(
+                    "⚠️  Unknown approval channel platform '{}' — notifier skipped",
+                    ch.platform
+                );
+            }
+        }
         channel_manager = Some(manager);
     }
 
@@ -525,7 +757,8 @@ pub async fn run(matches: &ArgMatches) {
         serve_agents_md,
     };
 
-    let mut api_server = HttpApiServer::new(api_config);
+    let mut api_server =
+        HttpApiServer::new(api_config).with_escalation_queue(escalation_queue.clone());
     if let Some(ref rt) = runtime {
         api_server = api_server.with_runtime_provider(rt.clone());
 
@@ -533,14 +766,23 @@ pub async fn run(matches: &ArgMatches) {
         if let Some(cloud_provider) =
             symbi_runtime::reasoning::providers::cloud::CloudInferenceProvider::from_env()
         {
-            let coordinator_state =
-                Arc::new(symbi_runtime::api::coordinator::CoordinatorState::new(
+            let delegation_registry = match symbi_runtime::reasoning::delegation_executor::RegisteredDelegationRegistry::load(Path::new(".")) {
+                Ok(registry) => registry,
+                Err(error) => {
+                    eprintln!("Cannot load the governed delegation registry: {error}");
+                    return;
+                }
+            };
+            let coordinator_state = Arc::new(
+                symbi_runtime::api::coordinator::CoordinatorState::new(
                     Arc::new(cloud_provider),
-                    Arc::new(
-                        symbi_runtime::reasoning::policy_bridge::DefaultPolicyGate::permissive(),
-                    ),
+                    policy_gate.clone(),
                     rt.clone(),
-                ));
+                )
+                .with_rag("symbi-coordinator")
+                .await
+                .with_registered_delegation(delegation_registry),
+            );
             api_server = api_server.with_coordinator(coordinator_state);
             println!("✓ Coordinator Chat enabled on /ws/chat");
         } else {
@@ -554,17 +796,32 @@ pub async fn run(matches: &ArgMatches) {
                 eprintln!("✗ API server error: {}", e);
             }
         },
-        _ = start_http_input(http_config, runtime.clone(), secrets_config) => {},
+        _ = start_http_input(http_config, runtime.clone(), secrets_config, Some(http_input_policy_gate.clone())) => {},
         _ = tokio::signal::ctrl_c() => {}
     }
 
-    // Shutdown Slack adapter
-    if let Some(ref mut manager) = channel_manager {
-        let results = manager.shutdown().await;
-        for (name, result) in results {
-            match result {
-                Ok(()) => println!("✓ {} adapter stopped", name),
-                Err(e) => eprintln!("⚠️  {} adapter stop error: {}", name, e),
+    // Shutdown chat adapters. We try to reclaim unique ownership of the manager
+    // for the `&mut` shutdown. Note: when approval channels are configured, the
+    // escalation queue (still held by the running api_server / coordinator) keeps
+    // notifier Arc clones of the manager alive, so `try_unwrap` will fail and the
+    // adapters stop on process exit instead — graceful cleanup only, not required
+    // for correctness. The no-chat / no-approval-channel path reclaims cleanly.
+    drop(escalation_queue);
+    if let Some(manager) = channel_manager.take() {
+        match Arc::try_unwrap(manager) {
+            Ok(mut manager) => {
+                let results = manager.shutdown().await;
+                for (name, result) in results {
+                    match result {
+                        Ok(()) => println!("✓ {} adapter stopped", name),
+                        Err(e) => eprintln!("⚠️  {} adapter stop error: {}", name, e),
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "⚠️  Channel manager still referenced — adapters will stop on process exit"
+                );
             }
         }
     }
@@ -654,23 +911,48 @@ async fn load_dsl_schedules(cron: &symbi_runtime::CronScheduler) -> usize {
     let mut count = 0;
     if let Ok(entries) = fs::read_dir(agents_dir) {
         for entry in entries.flatten() {
-            if entry.path().extension().is_some_and(|ext| ext == "dsl") {
+            if dsl::is_symbi_file(&entry.path()) {
                 if let Ok(source) = fs::read_to_string(entry.path()) {
                     match dsl::parse_dsl(&source) {
                         Ok(tree) => match dsl::extract_schedule_definitions(&tree, &source) {
                             Ok(schedules) => {
                                 for sched_def in schedules {
                                     if let Some(ref cron_expr) = sched_def.cron {
+                                        let name = sched_def
+                                            .agent
+                                            .clone()
+                                            .unwrap_or_else(|| sched_def.name.clone());
+                                        let selected_source = match scheduled_agent_source(
+                                            agents_dir,
+                                            &entry.path(),
+                                            &source,
+                                            &name,
+                                        ) {
+                                            Ok(source) => source,
+                                            Err(error) => {
+                                                eprintln!(
+                                                    "  ⚠ Invalid scheduled agent '{name}': {error}"
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        let security_tier = match resolve_security_tier(
+                                            &selected_source,
+                                            &name,
+                                        ) {
+                                            Ok(tier) => tier,
+                                            Err(error) => {
+                                                eprintln!("  ⚠ Invalid scheduled sandbox for '{name}': {error}");
+                                                continue;
+                                            }
+                                        };
                                         let agent_config = symbi_runtime::types::AgentConfig {
                                             id: symbi_runtime::types::AgentId::new(),
-                                            name: sched_def
-                                                .agent
-                                                .unwrap_or_else(|| sched_def.name.clone()),
-                                            dsl_source: source.clone(),
+                                            name,
+                                            dsl_source: selected_source,
                                             execution_mode:
                                                 symbi_runtime::types::ExecutionMode::Ephemeral,
-                                            security_tier:
-                                                symbi_runtime::types::SecurityTier::Tier1,
+                                            security_tier,
                                             resource_limits:
                                                 symbi_runtime::types::ResourceLimits::default(),
                                             capabilities: vec![],
@@ -690,7 +972,10 @@ async fn load_dsl_schedules(cron: &symbi_runtime::CronScheduler) -> usize {
                                             job.policy_ids.push(policy.clone());
                                         }
 
-                                        match cron.add_job(job).await {
+                                        match cron
+                                            .add_source_job(&entry.path().to_string_lossy(), job)
+                                            .await
+                                        {
                                             Ok(id) => {
                                                 println!(
                                                     "  → {} ({} {}) [{}]",
@@ -742,7 +1027,7 @@ async fn load_agents_into_registry(runtime: &AgentRuntime) -> Vec<(String, Agent
     let mut agents = Vec::new();
     if let Ok(entries) = fs::read_dir(agents_dir) {
         for entry in entries.flatten() {
-            if entry.path().extension().is_some_and(|ext| ext == "dsl") {
+            if dsl::is_symbi_file(&entry.path()) {
                 if let Ok(source) = fs::read_to_string(entry.path()) {
                     let name = entry
                         .path()
@@ -750,12 +1035,20 @@ async fn load_agents_into_registry(runtime: &AgentRuntime) -> Vec<(String, Agent
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_default();
 
+                    let security_tier = match resolve_security_tier(&source, &name) {
+                        Ok(tier) => tier,
+                        Err(error) => {
+                            eprintln!("  ⚠ Invalid agent execution settings for '{name}': {error}");
+                            continue;
+                        }
+                    };
+
                     let agent_config = symbi_runtime::types::AgentConfig {
                         id: symbi_runtime::types::AgentId::new(),
                         name: name.clone(),
                         dsl_source: source,
                         execution_mode: symbi_runtime::types::ExecutionMode::Ephemeral,
-                        security_tier: symbi_runtime::types::SecurityTier::Tier1,
+                        security_tier: security_tier.clone(),
                         resource_limits: symbi_runtime::types::ResourceLimits::default(),
                         capabilities: vec![symbi_runtime::types::Capability::Computation],
                         policies: vec![],
@@ -763,9 +1056,9 @@ async fn load_agents_into_registry(runtime: &AgentRuntime) -> Vec<(String, Agent
                         priority: symbi_runtime::types::Priority::Normal,
                     };
 
-                    match runtime.scheduler.schedule_agent(agent_config).await {
+                    match runtime.scheduler.register_agent(agent_config).await {
                         Ok(id) => {
-                            println!("  → {} [{}]", name, id);
+                            println!("  → {} [{}] sandbox={}", name, id, security_tier);
                             agents.push((name, id));
                         }
                         Err(e) => {
@@ -786,11 +1079,9 @@ fn scan_agents_directory() -> Vec<String> {
     if agents_dir.exists() && agents_dir.is_dir() {
         if let Ok(entries) = fs::read_dir(agents_dir) {
             for entry in entries.flatten() {
-                if let Some(ext) = entry.path().extension() {
-                    if ext == "dsl" {
-                        if let Some(name) = entry.path().file_name() {
-                            agents.push(name.to_string_lossy().to_string());
-                        }
+                if dsl::is_symbi_file(&entry.path()) {
+                    if let Some(name) = entry.path().file_name() {
+                        agents.push(name.to_string_lossy().to_string());
                     }
                 }
             }
@@ -800,93 +1091,33 @@ fn scan_agents_directory() -> Vec<String> {
     agents
 }
 
-/// Scan agents/ directory and return (filename, content) pairs for DSL files.
-fn scan_agent_dsl_sources() -> Vec<(String, String)> {
-    let agents_dir = Path::new("agents");
-    let mut sources = Vec::new();
+#[cfg(all(test, feature = "cron"))]
+mod execution_selection_tests {
+    use super::*;
 
-    if !agents_dir.exists() || !agents_dir.is_dir() {
-        return sources;
-    }
-
-    if let Ok(entries) = fs::read_dir(agents_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "dsl") {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    let filename = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    sources.push((filename, content));
-                }
-            }
-        }
-    }
-
-    sources
-}
-
-/// Bridge between the channel adapter's `AgentInvoker` trait and the LLM client.
-///
-/// Builds a system prompt from DSL sources (same logic as the HTTP input server)
-/// and calls the LLM client for chat completion.
-struct LlmAgentInvoker {
-    llm_client: Option<Arc<LlmClient>>,
-    dsl_sources: Arc<Vec<(String, String)>>,
-}
-
-#[async_trait]
-impl AgentInvoker for LlmAgentInvoker {
-    async fn invoke(&self, agent_name: &str, input: &str) -> Result<String, String> {
-        let llm = match &self.llm_client {
-            Some(client) => client,
-            None => {
-                return Ok(format!(
-                    "No LLM provider configured. Set OPENROUTER_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY. (agent: {})",
-                    agent_name
-                ));
-            }
-        };
-
-        // Build system prompt from DSL sources (mirrors server.rs logic)
-        let mut system_parts: Vec<String> = Vec::new();
-
-        if !self.dsl_sources.is_empty() {
-            system_parts.push(
-                "You are an AI agent operating within the Symbiont runtime. \
-                 Your behavior is governed by the following agent definitions:"
-                    .to_string(),
-            );
-            for (filename, content) in self.dsl_sources.iter() {
-                system_parts.push(format!("\n--- {} ---\n{}", filename, content));
-            }
-            system_parts.push(
-                "\nFollow the capabilities, constraints, and policies defined above. \
-                 Provide thorough, professional analysis. If a request violates your \
-                 constraints, politely decline and explain why."
-                    .to_string(),
-            );
-        } else {
-            system_parts.push(
-                "You are an AI agent operating within the Symbiont runtime. \
-                 Provide thorough, professional analysis based on the input provided."
-                    .to_string(),
-            );
-        }
-
-        let system_prompt = system_parts.join("\n");
-
-        tracing::info!(
-            agent = %agent_name,
-            provider = %llm.provider(),
-            model = %llm.model(),
-            input_len = input.len(),
-            "Invoking LLM for chat agent"
+    #[test]
+    fn schedule_binds_to_its_named_source_and_preserves_legacy_extension() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("coordinator.symbi");
+        let source = r#"agent coordinator() { with sandbox = "docker" {} }"#;
+        let target = r#"agent worker() { with sandbox = "gvisor" {} }"#;
+        fs::write(root.path().join("worker.dsl"), target).unwrap();
+        assert_eq!(
+            scheduled_agent_source(root.path(), &current, source, "worker").unwrap(),
+            target
         );
-
-        llm.chat_completion(&system_prompt, input)
-            .await
-            .map_err(|e| format!("LLM error: {}", e))
+        assert_eq!(
+            scheduled_agent_source(root.path(), &current, source, "coordinator").unwrap(),
+            source
+        );
+        for name in ["../worker", "missing", "", "/worker"] {
+            assert!(scheduled_agent_source(root.path(), &current, source, name).is_err());
+        }
+        fs::write(
+            root.path().join("worker.symbi"),
+            "agent worker() { with sandbox = }",
+        )
+        .unwrap();
+        assert!(scheduled_agent_source(root.path(), &current, source, "worker").is_err());
     }
 }

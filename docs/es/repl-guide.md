@@ -1,7 +1,22 @@
 # Guia del REPL de Symbiont
 
+> **Estado de ejecucion de la rama:** Los builtins asincronos conservan la identidad
+> de quien los invoca. El puente congela su raiz de proyecto, y las llamadas
+> predeterminadas a `reason()` / `tool_call()` requieren diarios de ejecucion
+> protegidos y devuelven referencias publicas de auditoria. Las llamadas directas de
+> inferencia tambien requieren diarios; `:audit` lista sus referencias publicas. Las
+> declaraciones de funciones y de comportamientos persisten entre entradas, y los
+> comportamientos en ejecucion conservan una instantanea de sus auxiliares. La
+> sintaxis heredada del REPL no implementa la seleccion canonica de sandbox por
+> agente. Los requisitos explicitos de tier, sandbox, recursos y politicas de
+> ejecucion que no estan soportados ahora hacen fallar el registro. Consulta el
+> [contexto de invocacion del DSL](/dsl-invocation-context) y la
+> [guia de la rama](/containment-branch-guide) para conocer la cobertura actual.
+
 ## Otros idiomas
 
+
+> **¿Buscas una TUI interactiva?** [`symbi shell`](/symbi-shell) (Beta) envuelve el mismo motor `repl_core` que cubre esta guia, mas un orquestador LLM, un catalogo completo de comandos (`/spawn`, `/run`, `/chain`, …) y attach remoto. Usa el REPL cuando quieras una superficie JSON-RPC scriptable para integracion con IDEs; usa la shell cuando quieras autoria conversacional contra el mismo runtime.
 
 ## Caracteristicas
 
@@ -29,27 +44,49 @@ symbi repl --stdio
 
 ### Uso Basico
 
-```rust
-# Define an agent
-agent GreetingAgent {
-  name: "Greeting Agent"
-  version: "1.0.0"
-  description: "A simple greeting agent"
-}
+Introduce cada declaracion en una sola linea:
 
-# Define a behavior
-behavior Greet {
-  input { name: string }
-  output { greeting: string }
-  steps {
-    let greeting = format("Hello, {}!", name)
-    return greeting
-  }
-}
+```text
+agent Greeter {}
+function greet(value: string) { return upper(value) }
+behavior Welcome { steps { return greet(args) } }
+:agents
+:agent start <id>
+:agent execute <id> Welcome hello
+```
 
-# Execute expressions
-let message = "Welcome to Symbiont"
-print(message)
+Sustituye `<id>` por el UUID impreso para `Greeter`. El ultimo comando devuelve
+`HELLO`. La declaracion y el arranque no ejecutan el comportamiento. Los
+argumentos opcionales del comando llegan como una sola cadena llamada `args`. Las
+definiciones persisten; las variables locales y los argumentos no pasan a la
+siguiente invocacion. Un registro de modulo fallido no reemplaza las definiciones
+anteriores. Los errores de ejecucion siguen siendo visibles y el cliente puede
+aceptar el siguiente comando. Los diagnosticos de `print()` van a stderr con
+independencia de la respuesta estructurada.
+
+El lenguaje canonico `agent name(...) { with ... }` que usa `symbi run` es una
+ruta de analisis distinta. Los niveles de seguridad y los modos de sandbox
+heredados del REPL no son su configuracion de ejecucion. El registro rechaza los
+modos explicitos heredados de tier/sandbox, los recursos con contenido y las
+politicas de ejecucion antes de publicar cualquier definicion. Los bloques de
+restricciones duplicados y las listas de capacidades duplicadas tambien fallan al
+analizarse. Las declaraciones solo de capacidades conservan sus comprobaciones
+existentes. Los efectos de las herramientas usan el limite del proyecto y el
+despachador gobernado; sin una puerta configurada que lo permita, las peticiones
+de herramientas se deniegan. Las llamadas directas al LLM, las de composicion y
+las de patrones requieren un diario firmado para cada llamada al proveedor. Sus
+tipos de resultado existentes no cambian; usa `:audit` para las referencias
+publicas. La comunicacion requiere una puerta configurada y un destinatario
+registrado. `send_to` confirma un arranque duradero, mientras que su diario
+terminal registra la finalizacion posterior. `race` devuelve el primer exito y
+cancela las llamadas pendientes. Estos controles no establecen la seleccion
+canonica de fuentes ni presupuestos agregados de inferencia.
+
+Para reproducir las pruebas de humo de RPC y de terminal despues de compilar el
+workspace:
+
+```bash
+python3 scripts/test-repl-session.py --binary target/debug/repl-cli --report /tmp/repl-session.json
 ```
 
 ## Comandos del REPL
@@ -59,6 +96,7 @@ print(message)
 | Comando | Descripcion |
 |---------|-------------|
 | `:agents` | Listar todos los agentes |
+| `:audit` | Listar las referencias de auditoria recientes de inferencia directa y el numero de referencias omitidas |
 | `:agent list` | Listar todos los agentes |
 | `:agent start <id>` | Iniciar un agente |
 | `:agent stop <id>` | Detener un agente |
@@ -116,54 +154,30 @@ print(message)
 ### Definiciones de Agentes
 
 ```rust
-agent DataAnalyzer {
-  name: "Data Analysis Agent"
-  version: "2.1.0"
-  description: "Analyzes datasets with privacy protection"
+metadata {
+  version = "2.1.0"
+  description = "Analyzes datasets with privacy protection"
+}
 
-  security {
-    capabilities: ["data_read", "analysis"]
-    sandbox: true
+agent data_analyzer(data: DataSet, options: AnalysisOptions) -> AnalysisResults {
+  capabilities = ["data_read", "analysis"]
+
+  policy privacy {
+    allow: read(data) if true
+    deny: write(any)
   }
 
-  resources {
-    memory: 512MB
-    cpu: 2
-    storage: 1GB
+  with memory = "ephemeral", sandbox = "tier1" {
+    return analyze(data, options);
   }
 }
 ```
 
-### Definiciones de Comportamiento
-
-```rust
-behavior AnalyzeData {
-  input {
-    data: DataSet
-    options: AnalysisOptions
-  }
-  output {
-    results: AnalysisResults
-  }
-
-  steps {
-    # Check data privacy requirements
-    require capability("data_read")
-
-    if (data.contains_pii) {
-      return error("Cannot process data with PII")
-    }
-
-    # Perform analysis
-    # NOTE: analyze() is a planned built-in function (not yet implemented).
-    # This example illustrates the intended behavior definition pattern.
-    let results = analyze(data, options)
-    emit analysis_completed { results: results }
-
-    return results
-  }
-}
-```
+El comportamiento del agente vive en el bloque `with` del agente (y en las
+definiciones de `function`) — no existe un constructo `behavior` separado. Las
+reglas de politica (`allow` / `deny` / `require` / `audit`) controlan lo que el
+agente puede hacer. Consulta la [Guia del DSL](dsl-guide.md) y la
+[Especificacion del DSL](dsl-specification.md) para la gramatica completa.
 
 ### Funciones Integradas
 
@@ -251,7 +265,6 @@ agent SecureAgent {
   name: "Secure Agent"
   security {
     capabilities: ["filesystem", "network"]
-    sandbox: true
   }
 }
 
@@ -444,13 +457,8 @@ agent DataProcessor {
 
   security {
     capabilities: ["data_read", "data_write"]
-    sandbox: true
   }
 
-  resources {
-    memory: 256MB
-    cpu: 1
-  }
 }
 
 behavior ProcessCsv {

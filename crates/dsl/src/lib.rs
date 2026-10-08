@@ -4,9 +4,41 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tree_sitter::{Language, Node, Parser, Tree};
+
+mod conversational_agent;
+pub mod execution_policy;
+pub use execution_policy::ExecutionPolicy;
+mod execution_settings;
+pub use conversational_agent::{conversational_agent_names, ConversationalAgent};
+pub mod format;
+pub use execution_settings::{resolve_execution_settings, AgentExecutionSettings};
+
+/// Canonical file extension for Symbiont agent definitions.
+pub const SYMBI_EXTENSION: &str = "symbi";
+
+/// Legacy file extension for Symbiont agent definitions. Continues to be
+/// recognized indefinitely for backward compatibility; new files should
+/// use `SYMBI_EXTENSION`.
+pub const LEGACY_DSL_EXTENSION: &str = "dsl";
+
+/// Returns true if the given path has a Symbiont agent definition extension
+/// (either canonical `.symbi` or legacy `.dsl`).
+pub fn is_symbi_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext == SYMBI_EXTENSION || ext == LEGACY_DSL_EXTENSION)
+}
+
+/// Strip a recognized Symbiont agent extension (`.symbi` or `.dsl`) from a
+/// filename, returning the stem. Returns `None` if the name has neither
+/// extension.
+pub fn strip_symbi_extension(name: &str) -> Option<&str> {
+    name.strip_suffix(".symbi")
+        .or_else(|| name.strip_suffix(".dsl"))
+}
 
 /// Maximum AST traversal depth. The Symbi DSL produces shallow trees in
 /// practice (top-level block → attribute list → value); 256 gives generous
@@ -83,7 +115,7 @@ pub fn parse_dsl(source_code: &str) -> Result<Tree, Box<dyn std::error::Error>> 
     let language = unsafe { tree_sitter_symbiont() };
 
     let mut parser = Parser::new();
-    parser.set_language(language)?;
+    parser.set_language(&language)?;
 
     let tree = parser
         .parse(source_code, None)
@@ -98,7 +130,7 @@ pub fn print_ast(node: Node, source: &str, depth: usize) {
     let node_text = if node.child_count() == 0 {
         let start = node.start_byte();
         let end = node.end_byte();
-        format!(" \"{}\"", &source[start..end].replace('\n', "\\n"))
+        format!(" \"{}\"", source[start..end].replace('\n', "\\n"))
     } else {
         String::new()
     };
@@ -111,7 +143,7 @@ pub fn print_ast(node: Node, source: &str, depth: usize) {
         if node.is_error() { " [ERROR]" } else { "" }
     );
 
-    for i in 0..node.child_count() {
+    for i in 0u32..node.child_count() as u32 {
         if let Some(child) = node.child(i) {
             print_ast(child, source, depth + 1);
         }
@@ -146,13 +178,16 @@ impl WithBlock {
     pub fn parse_sandbox_tier(value: &str) -> Result<SandboxTier, String> {
         // Remove quotes if present
         let cleaned_value = value.trim_matches('"');
+        // Accept both backend names and the tier-number aliases used throughout
+        // the docs and example agents (tier1=Docker, tier2=gVisor, tier3=Firecracker).
         match cleaned_value.to_lowercase().as_str() {
-            "docker" => Ok(SandboxTier::Docker),
-            "gvisor" => Ok(SandboxTier::GVisor),
-            "firecracker" => Ok(SandboxTier::Firecracker),
+            "docker" | "tier1" => Ok(SandboxTier::Docker),
+            "gvisor" | "tier2" => Ok(SandboxTier::GVisor),
+            "firecracker" | "tier3" => Ok(SandboxTier::Firecracker),
             "e2b" => Ok(SandboxTier::E2B),
             _ => Err(format!(
-                "Invalid sandbox tier: {}. Valid options are: docker, gvisor, firecracker, e2b",
+                "Invalid sandbox tier: {}. Valid options are: docker (tier1), \
+                 gvisor (tier2), firecracker (tier3), e2b",
                 value
             )),
         }
@@ -189,10 +224,11 @@ pub fn extract_metadata(tree: &Tree, source: &str) -> HashMap<String, String> {
         }
         if node.kind() == "metadata_block" {
             // Extract metadata key-value pairs
-            for i in 0..node.child_count() {
+            for i in 0u32..node.child_count() as u32 {
                 if let Some(child) = node.child(i) {
                     if child.kind() == "metadata_pair" {
-                        if let (Some(key_node), Some(value_node)) = (child.child(0), child.child(2))
+                        if let (Some(key_node), Some(value_node)) =
+                            (child.child(0u32), child.child(2u32))
                         {
                             let key =
                                 source[key_node.start_byte()..key_node.end_byte()].to_string();
@@ -206,7 +242,7 @@ pub fn extract_metadata(tree: &Tree, source: &str) -> HashMap<String, String> {
         }
 
         // Recursively traverse children
-        for i in 0..node.child_count() {
+        for i in 0u32..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 traverse_for_metadata(child, source, metadata, depth + 1);
             }
@@ -238,11 +274,11 @@ pub fn extract_with_blocks(tree: &Tree, source: &str) -> Result<Vec<WithBlock>, 
             let mut with_block = WithBlock::new();
 
             // Extract with attributes
-            for i in 0..node.child_count() {
+            for i in 0u32..node.child_count() as u32 {
                 if let Some(child) = node.child(i) {
                     if child.kind() == "with_attribute" {
                         if let (Some(name_node), Some(value_node)) =
-                            (child.child(0), child.child(2))
+                            (child.child(0u32), child.child(2u32))
                         {
                             let name =
                                 source[name_node.start_byte()..name_node.end_byte()].to_string();
@@ -257,10 +293,10 @@ pub fn extract_with_blocks(tree: &Tree, source: &str) -> Result<Vec<WithBlock>, 
 
                             // Parse specific attributes
                             match name.as_str() {
-                                "sandbox" => match WithBlock::parse_sandbox_tier(&value) {
-                                    Ok(tier) => with_block.sandbox_tier = Some(tier),
-                                    Err(e) => return Err(e),
-                                },
+                                "sandbox" => {
+                                    with_block.sandbox_tier =
+                                        Some(WithBlock::parse_sandbox_tier(&value)?);
+                                }
                                 "timeout" => {
                                     let timeout_str = value.trim_matches('"');
                                     // Normalize DSL time suffixes to humantime units
@@ -296,7 +332,7 @@ pub fn extract_with_blocks(tree: &Tree, source: &str) -> Result<Vec<WithBlock>, 
         }
 
         // Recursively traverse children
-        for i in 0..node.child_count() {
+        for i in 0u32..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 traverse_for_with_blocks(child, source, with_blocks, depth + 1)?;
             }
@@ -375,16 +411,18 @@ pub fn extract_schedule_definitions(
         if node.kind() == "schedule_definition" {
             // Child 0 = "schedule" keyword, Child 1 = identifier, then "{", properties, "}"
             let name_node = node
-                .child(1)
+                .child(1u32)
                 .ok_or_else(|| "schedule_definition missing name".to_string())?;
             let name = source[name_node.start_byte()..name_node.end_byte()].to_string();
             let mut sched = ScheduleDefinition::new(name);
 
-            for i in 0..node.child_count() {
+            for i in 0u32..node.child_count() as u32 {
                 if let Some(child) = node.child(i) {
                     if child.kind() == "schedule_property" {
                         // Child 0 = key identifier, child 1 = ":", child 2 = value
-                        if let (Some(key_node), Some(val_node)) = (child.child(0), child.child(2)) {
+                        if let (Some(key_node), Some(val_node)) =
+                            (child.child(0u32), child.child(2u32))
+                        {
                             let key =
                                 source[key_node.start_byte()..key_node.end_byte()].to_string();
                             let raw_value =
@@ -431,7 +469,7 @@ pub fn extract_schedule_definitions(
         }
 
         // Recurse into children.
-        for i in 0..node.child_count() {
+        for i in 0u32..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 traverse_for_schedules(child, source, schedules, depth + 1)?;
             }
@@ -522,19 +560,19 @@ pub fn extract_memory_definitions(
         if node.kind() == "memory_definition" {
             // Child 0 = "memory" keyword, Child 1 = identifier, then "{", properties, "}"
             let name_node = node
-                .child(1)
+                .child(1u32)
                 .ok_or_else(|| "memory_definition missing name".to_string())?;
             let name = source[name_node.start_byte()..name_node.end_byte()].to_string();
             let mut mem = MemoryDefinition::new(name);
 
-            for i in 0..node.child_count() {
+            for i in 0u32..node.child_count() as u32 {
                 if let Some(child) = node.child(i) {
                     match child.kind() {
                         "memory_property" => {
                             // memory_property: identifier value (space-separated, NO colon)
                             // child(0) = key, child(1) = value
                             if let (Some(key_node), Some(val_node)) =
-                                (child.child(0), child.child(1))
+                                (child.child(0u32), child.child(1u32))
                             {
                                 let key =
                                     source[key_node.start_byte()..key_node.end_byte()].to_string();
@@ -571,13 +609,13 @@ pub fn extract_memory_definitions(
                         "memory_search_block" => {
                             // memory_search_block: 'search' '{' repeat(memory_search_property) '}'
                             let mut search = MemorySearchConfig::default();
-                            for j in 0..child.child_count() {
+                            for j in 0u32..child.child_count() as u32 {
                                 if let Some(prop_node) = child.child(j) {
                                     if prop_node.kind() == "memory_search_property" {
                                         // memory_search_property: identifier value (space-separated)
                                         // child(0) = key, child(1) = value
                                         if let (Some(key_node), Some(val_node)) =
-                                            (prop_node.child(0), prop_node.child(1))
+                                            (prop_node.child(0u32), prop_node.child(1u32))
                                         {
                                             let key = source
                                                 [key_node.start_byte()..key_node.end_byte()]
@@ -626,7 +664,7 @@ pub fn extract_memory_definitions(
         }
 
         // Recurse into children.
-        for i in 0..node.child_count() {
+        for i in 0u32..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 traverse_for_memories(child, source, memories, depth + 1)?;
             }
@@ -760,7 +798,7 @@ pub fn extract_webhook_definitions(
             "webhook_property" => {
                 // webhook_property: identifier value (space-separated, NO colon)
                 // child(0) = key, child(1) = value
-                if let (Some(key_node), Some(val_node)) = (node.child(0), node.child(1)) {
+                if let (Some(key_node), Some(val_node)) = (node.child(0u32), node.child(1u32)) {
                     let key = source[key_node.start_byte()..key_node.end_byte()].to_string();
                     let raw_value = source[val_node.start_byte()..val_node.end_byte()].to_string();
                     let value = raw_value.trim_matches('"').to_string();
@@ -772,8 +810,8 @@ pub fn extract_webhook_definitions(
                 // (e.g. `provider github`), it wraps the pair in an ERROR node
                 // with two identifier children. We also recurse to find any
                 // webhook_property nodes nested inside the ERROR node.
-                let mut i = 0;
-                while i < node.child_count() {
+                let mut i: u32 = 0;
+                while i < node.child_count() as u32 {
                     if let Some(child) = node.child(i) {
                         if child.kind() == "identifier" {
                             // Check if next sibling is also an identifier (unquoted value pair)
@@ -815,13 +853,13 @@ pub fn extract_webhook_definitions(
         if node.kind() == "webhook_definition" {
             // Child 0 = "webhook" keyword, Child 1 = identifier, then "{", properties, "}"
             let name_node = node
-                .child(1)
+                .child(1u32)
                 .ok_or_else(|| "webhook_definition missing name".to_string())?;
             let name = source[name_node.start_byte()..name_node.end_byte()].to_string();
             let mut webhook = WebhookDefinition::new(name);
             let mut has_path = false;
 
-            for i in 0..node.child_count() {
+            for i in 0u32..node.child_count() as u32 {
                 if let Some(child) = node.child(i) {
                     if child.kind() == "webhook_filter_block" {
                         // webhook_filter_block: 'filter' '{' repeat(webhook_filter_property) '}'
@@ -829,13 +867,13 @@ pub fn extract_webhook_definitions(
                         let mut equals = None;
                         let mut contains = None;
 
-                        for j in 0..child.child_count() {
+                        for j in 0u32..child.child_count() as u32 {
                             if let Some(prop_node) = child.child(j) {
                                 if prop_node.kind() == "webhook_filter_property" {
                                     // webhook_filter_property: identifier value (space-separated)
                                     // child(0) = key, child(1) = value
                                     if let (Some(key_node), Some(val_node)) =
-                                        (prop_node.child(0), prop_node.child(1))
+                                        (prop_node.child(0u32), prop_node.child(1u32))
                                     {
                                         let key = source
                                             [key_node.start_byte()..key_node.end_byte()]
@@ -878,7 +916,7 @@ pub fn extract_webhook_definitions(
         }
 
         // Recurse into children.
-        for i in 0..node.child_count() {
+        for i in 0u32..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 traverse_for_webhooks(child, source, webhooks, depth + 1)?;
             }
@@ -954,7 +992,7 @@ pub fn extract_channel_definitions(
 
     fn extract_array_strings(node: Node, source: &str) -> Vec<String> {
         let mut items = Vec::new();
-        for i in 0..node.child_count() {
+        for i in 0u32..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 if child.kind() == "expression" || child.kind() == "string" {
                     // For expression nodes, look for the string child
@@ -984,18 +1022,18 @@ pub fn extract_channel_definitions(
         }
         if node.kind() == "channel_definition" {
             let name_node = node
-                .child(1)
+                .child(1u32)
                 .ok_or_else(|| "channel_definition missing name".to_string())?;
             let name = source[name_node.start_byte()..name_node.end_byte()].to_string();
             let mut chan = ChannelDefinition::new(name);
 
-            for i in 0..node.child_count() {
+            for i in 0u32..node.child_count() as u32 {
                 if let Some(child) = node.child(i) {
                     match child.kind() {
                         "channel_property" => {
                             // Child 0 = key identifier, child 1 = ":", child 2 = value or array
                             if let (Some(key_node), Some(val_node)) =
-                                (child.child(0), child.child(2))
+                                (child.child(0u32), child.child(2u32))
                             {
                                 let key =
                                     source[key_node.start_byte()..key_node.end_byte()].to_string();
@@ -1028,12 +1066,12 @@ pub fn extract_channel_definitions(
                         }
                         "channel_policy_block" => {
                             // Extract nested policy rules
-                            for j in 0..child.child_count() {
+                            for j in 0u32..child.child_count() as u32 {
                                 if let Some(rule_node) = child.child(j) {
                                     if rule_node.kind() == "policy_rule" {
                                         // Child 0 = action keyword, child 1 = ":", child 2 = expression
                                         if let (Some(action_node), Some(expr_node)) =
-                                            (rule_node.child(0), rule_node.child(2))
+                                            (rule_node.child(0u32), rule_node.child(2u32))
                                         {
                                             let action = source
                                                 [action_node.start_byte()..action_node.end_byte()]
@@ -1050,12 +1088,12 @@ pub fn extract_channel_definitions(
                         }
                         "channel_data_classification_block" => {
                             // Extract data classification rules
-                            for j in 0..child.child_count() {
+                            for j in 0u32..child.child_count() as u32 {
                                 if let Some(rule_node) = child.child(j) {
                                     if rule_node.kind() == "data_classification_rule" {
                                         // Child 0 = category, child 1 = ":", child 2 = action
                                         if let (Some(cat_node), Some(act_node)) =
-                                            (rule_node.child(0), rule_node.child(2))
+                                            (rule_node.child(0u32), rule_node.child(2u32))
                                         {
                                             let category = source
                                                 [cat_node.start_byte()..cat_node.end_byte()]
@@ -1084,7 +1122,7 @@ pub fn extract_channel_definitions(
         }
 
         // Recurse into children.
-        for i in 0..node.child_count() {
+        for i in 0u32..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 traverse_for_channels(child, source, channels, depth + 1)?;
             }
@@ -1095,6 +1133,88 @@ pub fn extract_channel_definitions(
 
     traverse_for_channels(root_node, source, &mut channels, 0)?;
     Ok(channels)
+}
+
+/// Extract the agent name from `agent NAME(...) { ... }`.
+///
+/// Returns the name text of the first `agent_definition` node found, or `None`
+/// if the file declares no agent.
+pub fn extract_agent_name(tree: &Tree, source: &str) -> Option<String> {
+    fn find(node: Node, source: &str, depth: usize) -> Option<String> {
+        if depth > MAX_AST_DEPTH {
+            return None;
+        }
+        if node.kind() == "agent_definition" {
+            for i in 0u32..node.child_count() as u32 {
+                if let Some(c) = node.child(i) {
+                    if c.kind() == "identifier" {
+                        return Some(source[c.start_byte()..c.end_byte()].to_string());
+                    }
+                }
+            }
+        }
+        for i in 0u32..node.child_count() as u32 {
+            if let Some(c) = node.child(i) {
+                if let Some(found) = find(c, source, depth + 1) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    find(tree.root_node(), source, 0)
+}
+
+/// Extract capability strings from a `capabilities = [ ... ]` declaration.
+///
+/// Quotes are stripped from each string value. Returns an empty `Vec` if no
+/// `capabilities_declaration` is present in the file.
+///
+/// Note: the grammar wraps each array element as `array` → `expression` →
+/// `value` → `string`, so this function collects `string` leaf nodes
+/// recursively within the `array` child of `capabilities_declaration`.
+pub fn extract_capabilities(tree: &Tree, source: &str) -> Vec<String> {
+    /// Collect all `string` leaf nodes within a subtree.
+    fn collect_strings(node: Node, source: &str, out: &mut Vec<String>, depth: usize) {
+        if depth > MAX_AST_DEPTH {
+            return;
+        }
+        if node.kind() == "string" {
+            let raw = &source[node.start_byte()..node.end_byte()];
+            out.push(raw.trim_matches('"').to_string());
+            return;
+        }
+        for i in 0u32..node.child_count() as u32 {
+            if let Some(c) = node.child(i) {
+                collect_strings(c, source, out, depth + 1);
+            }
+        }
+    }
+
+    fn walk(node: Node, source: &str, out: &mut Vec<String>, depth: usize) {
+        if depth > MAX_AST_DEPTH {
+            return;
+        }
+        if node.kind() == "capabilities_declaration" {
+            for i in 0u32..node.child_count() as u32 {
+                if let Some(arr) = node.child(i) {
+                    if arr.kind() == "array" {
+                        collect_strings(arr, source, out, 0);
+                    }
+                }
+            }
+            return;
+        }
+        for i in 0u32..node.child_count() as u32 {
+            if let Some(c) = node.child(i) {
+                walk(c, source, out, depth + 1);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(tree.root_node(), source, &mut out, 0);
+    out
 }
 
 /// A structured diagnostic emitted by error analysis
@@ -1146,7 +1266,7 @@ fn collect_errors(node: Node, source: &str, depth: usize, diagnostics: &mut Vec<
         });
     }
 
-    for i in 0..node.child_count() {
+    for i in 0u32..node.child_count() as u32 {
         if let Some(child) = node.child(i) {
             collect_errors(child, source, depth + 1, diagnostics);
         }
@@ -1156,6 +1276,21 @@ fn collect_errors(node: Node, source: &str, depth: usize, diagnostics: &mut Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extension_helpers() {
+        assert!(is_symbi_file(Path::new("foo.symbi")));
+        assert!(is_symbi_file(Path::new("foo.dsl")));
+        assert!(is_symbi_file(Path::new("agents/bar.symbi")));
+        assert!(!is_symbi_file(Path::new("foo.txt")));
+        assert!(!is_symbi_file(Path::new("foo")));
+        assert!(!is_symbi_file(Path::new("foo.SYMBI")));
+
+        assert_eq!(strip_symbi_extension("agent.symbi"), Some("agent"));
+        assert_eq!(strip_symbi_extension("agent.dsl"), Some("agent"));
+        assert_eq!(strip_symbi_extension("agent"), None);
+        assert_eq!(strip_symbi_extension("agent.txt"), None);
+    }
 
     #[test]
     fn test_basic_parsing() {
@@ -1219,6 +1354,24 @@ mod tests {
             Ok(SandboxTier::Firecracker)
         );
         assert_eq!(WithBlock::parse_sandbox_tier("e2b"), Ok(SandboxTier::E2B));
+
+        // Tier-number aliases (case-insensitive) used by docs + example agents.
+        assert_eq!(
+            WithBlock::parse_sandbox_tier("tier1"),
+            Ok(SandboxTier::Docker)
+        );
+        assert_eq!(
+            WithBlock::parse_sandbox_tier("Tier1"),
+            Ok(SandboxTier::Docker)
+        );
+        assert_eq!(
+            WithBlock::parse_sandbox_tier("tier2"),
+            Ok(SandboxTier::GVisor)
+        );
+        assert_eq!(
+            WithBlock::parse_sandbox_tier("Tier3"),
+            Ok(SandboxTier::Firecracker)
+        );
 
         // Test with quotes
         assert_eq!(
@@ -1347,6 +1500,41 @@ mod tests {
         assert_eq!(schedules.len(), 2);
         assert_eq!(schedules[0].name, "job_a");
         assert_eq!(schedules[1].name, "job_b");
+    }
+
+    #[test]
+    fn extract_agent_name_returns_first_identifier() {
+        let src = "agent my_agent(x: String) -> Out {\n  capabilities = [\"read\"]\n}\n";
+        let tree = parse_dsl(src).unwrap();
+        assert_eq!(extract_agent_name(&tree, src), Some("my_agent".to_string()));
+    }
+
+    #[test]
+    fn extract_agent_name_none_without_agent() {
+        let src = "metadata { version = \"1.0.0\" }\n";
+        let tree = parse_dsl(src).unwrap();
+        assert_eq!(extract_agent_name(&tree, src), None);
+    }
+
+    #[test]
+    fn extract_capabilities_returns_strings_unquoted() {
+        let src = "agent a {\n  capabilities = [\"read\", \"write\", \"analyze\"]\n}\n";
+        let tree = parse_dsl(src).unwrap();
+        assert_eq!(
+            extract_capabilities(&tree, src),
+            vec![
+                "read".to_string(),
+                "write".to_string(),
+                "analyze".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_empty_when_absent() {
+        let src = "agent a {\n}\n";
+        let tree = parse_dsl(src).unwrap();
+        assert!(extract_capabilities(&tree, src).is_empty());
     }
 
     #[test]

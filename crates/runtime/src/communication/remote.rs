@@ -189,6 +189,8 @@ pub fn parse_envelope(m: &Value) -> Result<SecureMessage, CommunicationError> {
         },
         ttl: Duration::from_secs(ttl_seconds),
         timestamp,
+        session_id: None,
+        protocol_label: None,
     })
 }
 
@@ -198,12 +200,7 @@ fn truncate_for_error(s: &str, limit: usize) -> String {
     if s.len() <= limit {
         return s.to_string();
     }
-    // Walk back from the limit to the nearest char boundary.
-    let mut end = limit;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
+    format!("{}…", crate::text_util::truncate_utf8(s, limit))
 }
 
 fn check_base_url_security(base_url: &str, has_token: bool) -> Result<(), String> {
@@ -606,6 +603,8 @@ impl CommunicationBus for RemoteCommunicationBus {
             },
             ttl,
             timestamp: SystemTime::now(),
+            session_id: None,
+            protocol_label: None,
         }
     }
 }
@@ -630,7 +629,12 @@ mod tests {
         );
     }
 
+    // Serialized against the TLS-env-mutating tests below: this constructs a
+    // non-loopback `http://` bus with a token, so a concurrent test that sets
+    // `SYMBIONT_REMOTE_BUS_REQUIRE_TLS=1` (process-global) would make `new`
+    // reject the URL and drop the token, flaking the `has_token: true` assert.
     #[test]
+    #[serial_test::serial(remote_bus_tls_env)]
     fn test_debug_hides_token() {
         let bus = RemoteCommunicationBus::new(
             "http://example.com",

@@ -10,12 +10,15 @@ use symbi_runtime::integrations::policy_engine::engine::{
 use symbi_runtime::lifecycle::{DefaultLifecycleController, LifecycleConfig, LifecycleController};
 use symbi_runtime::reasoning::agent_registry::AgentRegistry;
 use symbi_runtime::reasoning::inference::InferenceProvider;
+use symbi_runtime::reasoning::policy_bridge::ReasoningPolicyGate;
 use symbi_runtime::types::agent::AgentConfig;
 use symbi_runtime::types::security::Capability;
 use symbi_runtime::types::AgentId;
 
 /// The RuntimeBridge manages a simulated, in-process Symbiont runtime environment.
 pub struct RuntimeBridge {
+    project_root: std::result::Result<std::path::PathBuf, String>,
+    audit_references: Arc<crate::dsl::inference_audit::AuditReferenceLog>,
     lifecycle_controller: Arc<Mutex<Option<Arc<DefaultLifecycleController>>>>,
     context_manager: Arc<Mutex<Option<Arc<StandardContextManager>>>>,
     policy_engine: Arc<Mutex<OpaPolicyEngine>>,
@@ -27,6 +30,19 @@ pub struct RuntimeBridge {
     comm_bus: Arc<Mutex<Option<Arc<dyn CommunicationBus + Send + Sync>>>>,
     /// Communication policy gate (deny-by-default; replaced via set_comm_policy).
     comm_policy: Arc<Mutex<Arc<CommunicationPolicyGate>>>,
+    /// Policy gate for the reasoning builtins (`tool_call`, `reason`,
+    /// `delegate`). `None` until a caller installs one via
+    /// [`Self::set_reasoning_policy_gate`]; the builtins themselves fall
+    /// back to the non-permissive `DefaultPolicyGate::new()` in that case
+    /// (see `reasoning_builtins::builtin_reason`/`builtin_tool_call`), so
+    /// leaving this unset is fail-closed, never permissive.
+    reasoning_policy_gate: Arc<Mutex<Option<Arc<dyn ReasoningPolicyGate>>>>,
+    /// Active session id shared across all clones of the reasoning context.
+    #[cfg(feature = "session")]
+    active_session: Arc<Mutex<Option<symbi_session::monitor::SessionId>>>,
+    /// Registry that owns the SessionMonitor; minted once per bridge.
+    #[cfg(feature = "session")]
+    session_registry: Arc<symbi_runtime::session::SessionRegistry>,
 }
 
 impl Default for RuntimeBridge {
@@ -66,8 +82,11 @@ impl RuntimeBridge {
         let agent_registry = Arc::new(AgentRegistry::new());
         let comm_bus = Arc::new(Mutex::new(None));
         let comm_policy = Arc::new(Mutex::new(comm_policy_gate));
+        let reasoning_policy_gate = Arc::new(Mutex::new(None));
 
         Self {
+            project_root: crate::dsl::reasoning_builtins::capture_project_root(),
+            audit_references: Arc::new(Default::default()),
             lifecycle_controller,
             context_manager,
             policy_engine,
@@ -75,7 +94,23 @@ impl RuntimeBridge {
             agent_registry,
             comm_bus,
             comm_policy,
+            reasoning_policy_gate,
+            #[cfg(feature = "session")]
+            active_session: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "session")]
+            session_registry: Arc::new(symbi_runtime::session::SessionRegistry::new()),
         }
+    }
+
+    /// Select a project before sharing the bridge or constructing an evaluator.
+    pub fn with_project_root(
+        mut self,
+        project: impl AsRef<std::path::Path>,
+    ) -> crate::error::Result<Self> {
+        let context = crate::dsl::reasoning_builtins::ReasoningBuiltinContext::default()
+            .with_project_root(project)?;
+        self.project_root = context.project_root;
+        Ok(self)
     }
 
     /// Set the inference provider for reasoning builtins.
@@ -83,9 +118,69 @@ impl RuntimeBridge {
         *self.inference_provider.lock().unwrap() = Some(provider);
     }
 
+    /// Install the policy gate that governs the `reason`, `tool_call`, and
+    /// `delegate` DSL builtins. Callers that have wired Cedar/escalation
+    /// governance (e.g. `symbi-shell`'s startup ladder) should call this so
+    /// the same gate reaches DSL script execution, not just the
+    /// orchestrator/fleet-runner paths. Without a call to this, builtins
+    /// fall back to the fail-closed `DefaultPolicyGate::new()` default —
+    /// never permissive.
+    pub fn set_reasoning_policy_gate(&self, gate: Arc<dyn ReasoningPolicyGate>) {
+        *self.reasoning_policy_gate.lock().unwrap() = Some(gate);
+    }
+
     /// Get the agent registry.
     pub fn agent_registry(&self) -> Arc<AgentRegistry> {
         Arc::clone(&self.agent_registry)
+    }
+
+    /// Public references for independently verifying direct inference journals.
+    pub fn audit_references(
+        &self,
+    ) -> crate::error::Result<crate::dsl::inference_audit::AuditReferenceSnapshot> {
+        self.audit_references.snapshot()
+    }
+
+    /// Register an agent (name + system prompt + tool names) into the shared
+    /// registry so it can be delegated to. Returns the minted agent id.
+    pub async fn register_agent(
+        &self,
+        name: &str,
+        system_prompt: &str,
+        tools: Vec<String>,
+    ) -> AgentId {
+        self.agent_registry
+            .spawn_agent(name, system_prompt, tools, None)
+            .await
+    }
+
+    /// Governed single-turn delegation to a registered agent by name. Runs the
+    /// communication policy gate (and session conformance when a session is
+    /// open) before invoking the agent. Returns the agent's reply text.
+    pub async fn delegate(&self, target: &str, message: &str) -> crate::error::Result<String> {
+        let ctx = self.reasoning_context();
+        crate::dsl::agent_composition::governed_ask(&ctx, target, message, None).await
+    }
+
+    /// Governed multi-turn delegation: like `delegate`, but the caller supplies a
+    /// full conversation (agent system prompt + history + new user turn). Runs the
+    /// comm-policy gate before completing against the provider.
+    pub async fn delegate_threaded(
+        &self,
+        target: &str,
+        conversation: &symbi_runtime::reasoning::conversation::Conversation,
+    ) -> crate::error::Result<String> {
+        let ctx = self.reasoning_context();
+        crate::dsl::agent_composition::governed_ask_conversation(&ctx, target, conversation).await
+    }
+
+    /// The system prompt of a registered agent, if present (used to seed a
+    /// per-agent conversation thread).
+    pub async fn agent_system_prompt(&self, name: &str) -> Option<String> {
+        self.agent_registry
+            .get_agent(name)
+            .await
+            .map(|a| a.system_prompt)
     }
 
     /// Get the communication bus (if initialized).
@@ -108,16 +203,24 @@ impl RuntimeBridge {
         let comm_bus = self.comm_bus.lock().unwrap().clone();
         let comm_policy = Some(self.comm_policy.lock().unwrap().clone());
         crate::dsl::reasoning_builtins::ReasoningBuiltinContext {
+            project_root: self.project_root.clone(),
             provider,
             agent_registry: Some(Arc::clone(&self.agent_registry)),
             sender_agent_id: None,
             comm_bus,
             comm_policy,
-            // RuntimeBridge today does not own a ReasoningPolicyGate; the
-            // reasoning builtin will fall back to DefaultPolicyGate::new()
-            // (production-default). Callers embedding the runtime should
-            // install their concrete gate directly via the SDK.
-            reasoning_policy_gate: None,
+            // Populated by `set_reasoning_policy_gate` when a caller has
+            // wired real governance; `None` here makes the builtins fall
+            // back to `DefaultPolicyGate::new()` (fail-closed default).
+            reasoning_policy_gate: self.reasoning_policy_gate.lock().unwrap().clone(),
+            tool_executor: None,
+            reasoning_journal: None,
+            reasoning_config: None,
+            audit_references: self.audit_references.clone(),
+            #[cfg(feature = "session")]
+            active_session: self.active_session.clone(),
+            #[cfg(feature = "session")]
+            session_monitor: Some(self.session_registry.monitor()),
         }
     }
 
@@ -199,36 +302,92 @@ impl RuntimeBridge {
             .map_err(|e| e.to_string())
     }
 
-    /// Register an event handler for an agent (stub implementation)
-    pub async fn register_event_handler(
+    /// Open a session: establish the protocol on the registry, attach the monitor to
+    /// the shared communication gate, and set the active session so the DSL builtins
+    /// tag + enforce subsequent inter-agent messages.
+    ///
+    /// NOTE (v1a): the gate is rebuilt as permissive + monitor; merging pre-existing
+    /// per-message rules with the session monitor is a documented v1b refinement.
+    /// v1a also assumes a single active session per bridge — calling this again
+    /// overwrites the active-session cell (the prior session's FSMs remain in the
+    /// registry but are no longer the active one). Multi-session support is v1b.
+    #[cfg(feature = "session")]
+    pub fn open_session(
         &self,
-        agent_id: &str,
-        event_name: &str,
-        _event_type: &str,
-    ) -> Result<(), String> {
-        tracing::info!(
-            "Registered event handler '{}' for agent {}",
-            event_name,
-            agent_id
-        );
-        Ok(())
+        global: &symbi_session::Global,
+        binding: symbi_runtime::session::RoleBinding,
+        ttl: std::time::Duration,
+    ) -> Result<symbi_session::monitor::SessionId, symbi_runtime::session::RegistryError> {
+        let sid = self.session_registry.open(global, binding, ttl)?;
+        let gate = symbi_runtime::communication::policy_gate::CommunicationPolicyGate::permissive()
+            .with_session_monitor(self.session_registry.monitor())
+            .with_transcript(self.session_registry.transcript());
+        self.set_comm_policy(std::sync::Arc::new(gate));
+        *self.active_session.lock().unwrap() = Some(sid.clone());
+        Ok(sid)
     }
 
-    /// Emit an event from an agent (stub implementation)
-    pub async fn emit_event(
+    /// The protocol transcript for this bridge's session(s) — offline-verifiable.
+    #[cfg(feature = "session")]
+    pub fn session_transcript(
         &self,
-        agent_id: &str,
-        event_name: &str,
-        _data: &serde_json::Value,
-    ) -> Result<(), String> {
-        tracing::info!("Agent {} emitted event: {}", agent_id, event_name);
-        Ok(())
+    ) -> std::sync::Arc<std::sync::Mutex<symbi_runtime::session::SessionTranscript>> {
+        self.session_registry.transcript()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "session")]
+    #[test]
+    fn reasoning_context_has_no_session_by_default() {
+        let bridge = RuntimeBridge::new_permissive_for_dev();
+        let ctx = bridge.reasoning_context();
+        assert!(ctx.active_session.lock().unwrap().is_none());
+        assert!(ctx.session_monitor.is_some()); // monitor always available; no session open yet
+    }
+
+    #[tokio::test]
+    async fn delegate_to_unknown_agent_errors_with_name() {
+        let bridge = RuntimeBridge::new_permissive_for_dev();
+        let err = bridge.delegate("nope", "hi").await.unwrap_err();
+        assert!(
+            format!("{err}").contains("nope"),
+            "error should name the missing agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_threaded_unknown_agent_errors() {
+        let bridge = RuntimeBridge::new_permissive_for_dev();
+        let conv = symbi_runtime::reasoning::conversation::Conversation::with_system("x");
+        let err = bridge.delegate_threaded("nope", &conv).await.unwrap_err();
+        assert!(format!("{err}").contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn agent_system_prompt_roundtrips() {
+        let bridge = RuntimeBridge::new_permissive_for_dev();
+        bridge.register_agent("w", "You are w.", vec![]).await;
+        assert_eq!(
+            bridge.agent_system_prompt("w").await.as_deref(),
+            Some("You are w.")
+        );
+        assert!(bridge.agent_system_prompt("missing").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn register_then_registry_has_agent() {
+        let bridge = RuntimeBridge::new_permissive_for_dev();
+        bridge
+            .register_agent("helper", "You are helper.", vec![])
+            .await;
+        let ctx = bridge.reasoning_context();
+        let reg = ctx.agent_registry.as_ref().unwrap();
+        assert!(reg.has_agent("helper").await);
+    }
 
     #[tokio::test]
     async fn test_reasoning_context_before_init_has_no_bus() {
@@ -252,6 +411,8 @@ mod tests {
             recipient,
             message_type: MessageType::Direct(recipient),
             topic: None,
+            session_id: None,
+            protocol_label: None,
         };
         assert!(
             policy.evaluate(&request).is_err(),
@@ -271,6 +432,8 @@ mod tests {
             recipient,
             message_type: MessageType::Direct(recipient),
             topic: None,
+            session_id: None,
+            protocol_label: None,
         };
         assert!(policy.evaluate(&request).is_ok());
     }
@@ -309,5 +472,62 @@ mod tests {
         let ctx = bridge.reasoning_context();
         let retrieved = ctx.comm_policy.expect("policy should be set");
         assert!(Arc::ptr_eq(&retrieved, &new_policy));
+    }
+
+    #[cfg(feature = "session")]
+    #[test]
+    fn open_session_records_conforming_messages_to_transcript() {
+        use crate::dsl::agent_composition::check_comm_policy;
+        use std::time::Duration;
+        use symbi_runtime::session::RoleBinding;
+        use symbi_runtime::types::communication::MessageType;
+        use symbi_runtime::types::AgentId;
+        use symbi_session::examples::coordinator_pipeline;
+
+        let bridge = RuntimeBridge::new_permissive_for_dev();
+        let (g, _r) = coordinator_pipeline();
+        let (c, v, p) = (AgentId::new(), AgentId::new(), AgentId::new());
+        let rb = RoleBinding::new()
+            .bind(c, "Coordinator")
+            .bind(v, "Validator")
+            .bind(p, "Processor");
+        let _sid = bridge
+            .open_session(&g, rb, Duration::from_secs(60))
+            .unwrap();
+        let ctx = bridge.reasoning_context();
+
+        check_comm_policy(&ctx, c, v, MessageType::Direct(v), None).unwrap();
+        check_comm_policy(&ctx, v, c, MessageType::Direct(c), None).unwrap();
+
+        let t = bridge.session_transcript();
+        let guard = t.lock().unwrap();
+        assert!(
+            guard.len() >= 2,
+            "transcript should have the conforming transitions"
+        );
+        assert!(guard.verify());
+    }
+
+    #[cfg(feature = "session")]
+    #[test]
+    fn open_session_attaches_monitor_and_sets_active_session() {
+        use std::time::Duration;
+        use symbi_runtime::session::RoleBinding;
+        use symbi_runtime::types::AgentId;
+        use symbi_session::examples::coordinator_pipeline;
+
+        let bridge = RuntimeBridge::new_permissive_for_dev();
+        let (g, _r) = coordinator_pipeline();
+        let (c, v, p) = (AgentId::new(), AgentId::new(), AgentId::new());
+        let rb = RoleBinding::new()
+            .bind(c, "Coordinator")
+            .bind(v, "Validator")
+            .bind(p, "Processor");
+        let sid = bridge
+            .open_session(&g, rb, Duration::from_secs(60))
+            .unwrap();
+        let ctx = bridge.reasoning_context();
+        assert_eq!(ctx.active_session.lock().unwrap().as_ref(), Some(&sid));
+        assert!(ctx.session_monitor.is_some());
     }
 }

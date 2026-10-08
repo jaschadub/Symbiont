@@ -20,8 +20,14 @@ use governor::{
 use std::{
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Once, OnceLock},
 };
+
+/// Fires the loud "ApiKeyStore configured but empty — falling back to
+/// legacy env-var auth" error exactly once per process. See
+/// SECURITY_AUDIT.md L3.
+#[cfg(feature = "http-api")]
+static EMPTY_KEYSTORE_FALLBACK_WARN: Once = Once::new();
 
 #[cfg(feature = "http-api")]
 use dashmap::DashMap;
@@ -206,7 +212,10 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
                     // Attach the validated key to request extensions so handlers
                     // can enforce per-agent authorization (e.g. sender spoofing,
                     // inbox theft on messaging endpoints).
+                    let caller =
+                        super::invocations::AuthenticatedCaller::verified(token, Some(&validated));
                     let mut request = request;
+                    request.extensions_mut().insert(caller);
                     request.extensions_mut().insert(validated);
                     Ok(next.run(request).await)
                 }
@@ -216,6 +225,19 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
                 }
             };
         }
+        // Empty keystore + configured — this is a misconfiguration; the
+        // operator wired up a key store but populated zero records, and
+        // we're about to silently fall through to the legacy
+        // SYMBIONT_API_TOKEN env-var path. Log loudly exactly once per
+        // process so this surfaces in ops dashboards. See
+        // SECURITY_AUDIT.md L3.
+        EMPTY_KEYSTORE_FALLBACK_WARN.call_once(|| {
+            tracing::error!(
+                "ApiKeyStore is configured but contains no records — falling back to legacy \
+                 SYMBIONT_API_TOKEN env-var auth. This is a misconfiguration; populate the \
+                 keystore or remove its configuration."
+            );
+        });
     }
 
     // --- Legacy fallback: static SYMBIONT_API_TOKEN env var ---
@@ -256,6 +278,9 @@ pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, S
          Argon2 hashing, and key rotation. Set SYMBIONT_REFUSE_LEGACY_API_TOKEN=1 \
          once migration is complete to disable the env-var fallback."
     );
+    let caller = super::invocations::AuthenticatedCaller::verified(token, None);
+    let mut request = request;
+    request.extensions_mut().insert(caller);
     Ok(next.run(request).await)
 }
 

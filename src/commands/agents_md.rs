@@ -39,7 +39,7 @@ fn generate(dir: &str, output_path: &str) {
         std::process::exit(1);
     }
 
-    // Collect and parse all .dsl files
+    // Collect and parse all `.symbi` (and legacy `.dsl`) agent files
     let mut agents = Vec::new();
 
     let mut entries: Vec<_> = std::fs::read_dir(&agents_dir)
@@ -48,7 +48,7 @@ fn generate(dir: &str, output_path: &str) {
             std::process::exit(1);
         })
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "dsl"))
+        .filter(|e| dsl::is_symbi_file(&e.path()))
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
@@ -58,7 +58,7 @@ fn generate(dir: &str, output_path: &str) {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let name = filename.strip_suffix(".dsl").unwrap_or(&filename);
+        let name = dsl::strip_symbi_extension(&filename).unwrap_or(&filename);
 
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
@@ -96,7 +96,7 @@ fn generate(dir: &str, output_path: &str) {
     }
 
     if agents.is_empty() {
-        eprintln!("No .dsl files found in {}", agents_dir.display());
+        eprintln!("No .symbi files found in {}", agents_dir.display());
         std::process::exit(1);
     }
 
@@ -319,12 +319,15 @@ fn build_generated_section(agents: &[AgentInfo]) -> String {
     out.push_str("```bash\n");
     out.push_str("# MCP (Claude Code, Cursor, etc.)\n");
     out.push_str("symbi mcp\n\n");
-    out.push_str("# HTTP API\n");
+    out.push_str("# HTTP API (generate once; retain the UUID for retries)\n");
+    out.push_str("INVOCATION_ID=$(cat /proc/sys/kernel/random/uuid)\n");
     out.push_str("curl -X POST http://localhost:8080/api/v1/agents/<id>/execute \\\n");
-    out.push_str("  -H 'Authorization: Bearer $TOKEN' \\\n");
+    out.push_str("  -H \"Authorization: Bearer $TOKEN\" \\\n");
+    out.push_str("  -H \"Idempotency-Key: $INVOCATION_ID\" \\\n");
+    out.push_str("  -H 'Content-Type: application/json' \\\n");
     out.push_str("  -d '{\"input\": \"your prompt\"}'\n\n");
     out.push_str("# DSL parse\n");
-    out.push_str("symbi dsl -f agents/<name>.dsl\n");
+    out.push_str("symbi dsl -f agents/<name>.symbi\n");
     out.push_str("```\n");
 
     out.push_str(AUTO_END);
@@ -365,33 +368,6 @@ pub fn extract_auto_section(content: &str) -> Option<&str> {
     }
     let section_start = start + AUTO_START.len();
     Some(content[section_start..end].trim())
-}
-
-/// Strip sensitive content from AGENTS.md for filtered serving.
-/// Removes content between sensitive markers.
-#[allow(dead_code)]
-pub fn strip_sensitive(content: &str) -> String {
-    let mut result = content.to_string();
-    while let (Some(start), Some(end)) = (result.find(SENSITIVE_START), result.find(SENSITIVE_END))
-    {
-        if end <= start {
-            break;
-        }
-        let end_pos = end + SENSITIVE_END.len();
-        let end_pos = if result[end_pos..].starts_with('\n') {
-            end_pos + 1
-        } else {
-            end_pos
-        };
-        // Also remove the sensitive-start marker's preceding newline if present
-        let start_pos = if start > 0 && result.as_bytes()[start - 1] == b'\n' {
-            start - 1
-        } else {
-            start
-        };
-        result = format!("{}{}", &result[..start_pos], &result[end_pos..]);
-    }
-    result
 }
 
 // --- Source-text fallback extraction ---
@@ -713,16 +689,6 @@ mod tests {
     #[test]
     fn test_extract_auto_section_missing() {
         assert!(extract_auto_section("no markers here").is_none());
-    }
-
-    #[test]
-    fn test_strip_sensitive() {
-        let content = "## Agents\n\n<!-- agents-md:sensitive-start -->\n### Sandbox\nsecret stuff\n<!-- agents-md:sensitive-end -->\n\n## Channels\npublic";
-        let result = strip_sensitive(content);
-        assert!(!result.contains("secret stuff"));
-        assert!(!result.contains("Sandbox"));
-        assert!(result.contains("## Agents"));
-        assert!(result.contains("## Channels"));
     }
 
     #[test]

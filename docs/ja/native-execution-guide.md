@@ -15,6 +15,8 @@ Symbiontは、最高のパフォーマンスと最小限の依存関係が求め
 - リソース制限の強制なし
 - ホストシステムへの直接アクセス
 
+> **`native-sandbox` 機能はリリースビルドではコンパイルされません。** これは `not(debug_assertions)` 下の `compile_error!` でガードされているため、リリースバイナリにネイティブランナーが含まれることは決してありません。これはデバッグ専用の開発補助機能です。
+
 **以下の場合にのみ使用してください**：
 - 信頼されたコードによるローカル開発
 - 信頼されたエージェントを使用する管理された環境
@@ -63,26 +65,22 @@ graph LR
 ### オプション1：TOML設定
 
 ```toml
-# config.toml
+# symbiont.toml
 
 [security]
 # ネイティブ実行を許可（デフォルト：false）
 allow_native_execution = true
-# デフォルトのサンドボックスティア
-default_sandbox_tier = "None"  # または "Tier1"、"Tier2"、"Tier3"
 
-[security.native_execution]
-# ネイティブモードでもリソース制限を適用
-enforce_resource_limits = true
-# 最大メモリ（MB）
-max_memory_mb = 2048
-# 最大CPUコア数
-max_cpu_cores = 4.0
-# 最大実行時間（秒）
-max_execution_time_seconds = 300
-# ネイティブ実行の作業ディレクトリ
+# ネイティブ実行は独立したトップレベルセクションです（[security] の下にネストしません）。
+[native_execution]
+enabled = true
+default_executable = "python3"
 working_directory = "/tmp/symbiont-native"
-# 許可されたコマンド/実行ファイル
+# ネイティブモードでもOSリソース制限を適用
+enforce_resource_limits = true
+max_memory_mb = 2048              # Option<u64>
+max_cpu_seconds = 300             # Option<u64> — コア数ではなくCPU時間
+max_execution_time_seconds = 300  # ウォールクロックタイムアウト
 allowed_executables = ["python3", "node", "bash"]
 ```
 
@@ -99,13 +97,14 @@ timeout_seconds = 30
 max_body_size = 10485760
 
 [database]
-# デフォルト：LanceDB 組み込み（ゼロ設定、外部サービス不要）
-vector_backend = "lancedb"
-vector_data_path = "./data/vector_db"
+# 埋め込みベクトルの次元数。LanceDB（デフォルトの組み込みバックエンド）は
+# これ以上の設定を必要としません。バックエンドはビルド時に `vector-lancedb`
+# （デフォルト）または `vector-qdrant` Cargo フィーチャーで選択されます。
+# `vector_backend` という設定キーはありません。実行時に切り替えるには
+# SYMBIONT_VECTOR_BACKEND 環境変数を使用してください。
 vector_dimension = 384
 
-# オプション：Qdrant（LanceDBの代わりにQdrantを使用する場合はコメント解除）
-# vector_backend = "qdrant"
+# Qdrant バックエンドで実行する場合に使用（SYMBIONT_VECTOR_BACKEND=qdrant）：
 # qdrant_url = "http://localhost:6333"
 # qdrant_collection = "symbiont"
 
@@ -150,34 +149,37 @@ allowed_executables = ["python3", "python", "node", "bash", "sh"]
 | `max_execution_time_seconds` | u64 | `300` | ウォールクロックタイムアウト |
 | `allowed_executables` | Vec<String> | `[bash, python3, etc.]` | 実行ファイルホワイトリスト |
 
-### オプション2：環境変数
+### オプション2：実行時の安全ガード（環境変数）
+
+`SYMBIONT_NATIVE_*` / `SYMBIONT_ALLOW_NATIVE_EXECUTION` /
+`SYMBIONT_DEFAULT_SANDBOX_TIER` といった設定は存在しません。ネイティブ実行は
+上記の `[native_execution]` 設定セクションを通じて構成します。ネイティブ関連の
+環境変数は2つの実行時安全ガードのみであり、ネイティブ（ゼロ分離）ランナーを
+実際に実行するには、その両方を設定する必要があります：
 
 ```bash
-export SYMBIONT_ALLOW_NATIVE_EXECUTION=true
-export SYMBIONT_DEFAULT_SANDBOX_TIER=None
-export SYMBIONT_NATIVE_MAX_MEMORY_MB=2048
-export SYMBIONT_NATIVE_MAX_CPU_CORES=4.0
-export SYMBIONT_NATIVE_WORKING_DIR=/tmp/symbiont-native
+export SYMBI_UNSAFE_NATIVE_SANDBOX=1   # ネイティブランナーを承認
+export SYMBIONT_ALLOW_UNISOLATED=1     # SandboxTier::None を許可
 ```
 
 ### オプション3：エージェントレベルの設定
 
 ```symbi
-agent NativeWorker {
-  metadata {
-    name: "Local Development Agent"
-    version: "1.0.0"
+metadata {
+  version = "1.0.0"
+  description = "Local Development Agent"
+}
+
+agent native_worker(task: String) -> String {
+  capabilities = ["local_filesystem", "network"]
+
+  policy dev_only {
+    allow: ["local_filesystem", "network"] if true
   }
 
-  security {
-    tier: None
-    sandbox: Permissive
-    capabilities: ["local_filesystem", "network"]
-  }
-
-  on trigger "local_processing" {
-    // ホスト上で直接実行
-    execute_native("python3 process.py")
+  # tier 0 = サンドボックスなし（ホスト実行）。上記のオプトインが必要です
+  with sandbox = "none" {
+    return process(task);
   }
 }
 ```
@@ -194,7 +196,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 開発用にネイティブ実行を有効化
     let mut config = Config::default();
     config.security.allow_native_execution = true;
-    config.security.default_sandbox_tier = SecurityTier::None;
 
     let orchestrator = SandboxOrchestrator::new(config)?;
 
@@ -210,20 +211,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### 例2：CLIフラグ
+### 例2：ネイティブランナーでのビルドと実行
+
+`--native` という CLI フラグは存在しません。ネイティブ（ホスト）実行には、3つの明示的なオプトインが必要です：
+
+1. **`native-sandbox` 機能付きでビルドする — デバッグビルドのみ。** この機能はIsolationを一切提供せず、リリースビルドでは `compile_error!` でガードされています：
+
+   ```bash
+   cargo build --features native-sandbox    # デバッグのみ。リリースはコンパイルされません
+   ```
+
+2. **2つのランタイムガードの両方を承認する：**
+
+   ```bash
+   export SYMBI_UNSAFE_NATIVE_SANDBOX=1   # ネイティブランナーを承認
+   export SYMBIONT_ALLOW_UNISOLATED=1     # 非開発実行で SandboxTier::None を許可
+   ```
+
+3. **エージェントDSLでティア0（サンドボックスなし）を選択する：**
+
+   ```
+   with sandbox = "none" {
+       // ...
+   }
+   ```
+
+   リソース制限（メモリ/CPU/タイムアウト）は CLI フラグではなく、`with` ブロック / 設定から取得されます（上記参照）。
+
+その後、通常どおり実行します：
 
 ```bash
-# ネイティブ実行で起動
-symbiont run agent.dsl --native
-
-# または明示的なティアを指定
-symbiont run agent.dsl --sandbox-tier=none
-
-# リソース制限付き
-symbiont run agent.dsl --native \
-  --max-memory=1024 \
-  --max-cpu=2.0 \
-  --timeout=300
+symbi run agent.symbi
 ```
 
 ### 例3：混合実行
@@ -303,23 +321,31 @@ Unixシステムでは、ネイティブ実行でもいくつかの制限を強�
 ### ステップ1：設定の更新
 
 ```diff
-# config.toml
+# symbiont.toml
 [security]
-- default_sandbox_tier = "Tier1"
-+ default_sandbox_tier = "None"
 + allow_native_execution = true
+
++ [native_execution]
++ enabled = true
 ```
 
-### ステップ2：Docker依存関係の削除
+次に、DSLでエージェントごとにティア0（サンドボックスなし）を選択します：
+
+```
+with sandbox = "none" { ... }
+```
+
+### ステップ2：ビルドと実行（デバッグのみ）
 
 ```bash
 # もう不要
 # docker build -t symbi:latest .
 # docker run ...
 
-# 直接実行
-cargo build --release
-./target/release/symbiont run agent.dsl
+# native-sandbox機能はデバッグ専用です（リリースビルドではcompile_error!）：
+cargo build --features native-sandbox
+SYMBI_UNSAFE_NATIVE_SANDBOX=1 SYMBIONT_ALLOW_UNISOLATED=1 \
+  ./target/debug/symbi run agent.symbi
 ```
 
 ### ハイブリッドアプローチ
@@ -349,7 +375,9 @@ Dockerは環境変数を自動的にIsolationしていました。ネイティ�
 ```bash
 export AGENT_API_KEY="xxx"
 export AGENT_DB_URL="postgresql://..."
-symbiont run agent.dsl --native
+export SYMBI_UNSAFE_NATIVE_SANDBOX=1
+export SYMBIONT_ALLOW_UNISOLATED=1
+symbi run agent.symbi   # エージェントは次を宣言する必要があります: with sandbox = "none" { ... }
 ```
 
 ## パフォーマンス比較

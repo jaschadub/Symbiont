@@ -2,6 +2,7 @@ pub mod agents;
 pub mod authoring;
 pub mod channels;
 pub mod deploy;
+pub mod gate;
 pub mod operations;
 pub mod orchestration;
 pub mod registry;
@@ -87,18 +88,13 @@ fn intercept_help(command: &str, args: &str) -> Option<CommandResult> {
             "/race <agent1,agent2,...> <input>\n  \
              Run agents in parallel; first successful reply wins, others are cancelled."
         }
-        "/exec" => "/exec <command>\n  Execute a shell command inside the sandboxed dev agent.",
         "/monitor" => "/monitor [agent]\n  Stream live status for the given agent (or all agents).",
         "/logs" => "/logs [agent]\n  Show recent logs for the given agent (or all agents).",
         "/doctor" => "/doctor\n  Diagnose the local runtime environment.",
         "/audit" => "/audit [filter]\n  Show recent audit trail entries, optionally filtered.",
-        "/cron" => "/cron [list|add|remove|history] …\n  Manage cron-scheduled agent runs.",
+        "/cron" => "/cron [list|add|pause|resume|history] …\n  /cron run <job-id> [invocation-id] starts work or checks the supplied retry ID.",
         "/tools" => "/tools [list|add|remove] …\n  Manage ToolClad tools available to agents.",
         "/skills" => "/skills [list|install|remove] …\n  Manage skills available to agents.",
-        "/verify" => {
-            "/verify <artifact>\n  Verify a signed artifact (tool manifest, skill, etc.) \
-             against its SchemaPin signature."
-        }
         "/channels" => "/channels\n  List registered channel adapters (Slack, Mattermost, …).",
         "/connect" => "/connect <channel> [options]\n  Register a new channel adapter.",
         "/disconnect" => "/disconnect <channel>\n  Remove a channel adapter.",
@@ -114,7 +110,19 @@ fn intercept_help(command: &str, args: &str) -> Option<CommandResult> {
         "/resume-agent" => "/resume-agent <agent>\n  Resume a paused agent.",
         "/stop" => "/stop <agent>\n  Stop the given agent.",
         "/destroy" => "/destroy <agent>\n  Destroy the given agent and its state.",
-        "/agents" => "/agents\n  List active agents.",
+        "/agents" => {
+            "/agents [list|load <dir>|reload]\n  \
+             Manage the loaded agent fleet. `list` (default) shows loaded \
+             agents; `load <dir>` registers agents from a directory; `reload` \
+             re-scans ./agents."
+        }
+        "/agent" => {
+            "/agent use|clear|status\n  \
+             Set the active addressee for plain-text input. `use <name>` talks \
+             to that agent (`use orchestrator` returns to ORCH); `clear` returns \
+             to ORCH (`clear <name>` drops that agent's thread); `status` (default) \
+             shows the current addressee."
+        }
         "/context" => "/context\n  Show the current context window / token usage.",
         "/compact" => {
             "/compact [limit]\n  Compact the conversation history to fit within a budget."
@@ -146,8 +154,10 @@ pub fn dispatch(app: &mut App, command: &str, args: &str) -> Option<CommandResul
         "/dsl" => Some(session::dsl_toggle(app)),
         "/model" => Some(session::model(app, args)),
         "/cost" => Some(session::cost(app)),
+        "/tokens" | "/usage" => Some(session::tokens(app)),
         "/status" => Some(session::status(app)),
-        "/agents" => Some(agents::agents(app)),
+        "/agents" => Some(agents::agents_command(app, args)),
+        "/agent" => Some(agents::agent_focus_command(app, args)),
         "/debug" => Some(agents::debug(app, args)),
         "/stop" => Some(agents::stop(app, args)),
         "/pause" => Some(agents::pause(app, args)),
@@ -165,7 +175,6 @@ pub fn dispatch(app: &mut App, command: &str, args: &str) -> Option<CommandResul
         "/debate" => Some(orchestration::debate(app, args)),
         "/parallel" => Some(orchestration::parallel(app, args)),
         "/race" => Some(orchestration::race(app, args)),
-        "/exec" => Some(orchestration::exec(app, args)),
 
         // Operations
         "/monitor" => Some(operations::monitor(app, args)),
@@ -179,7 +188,6 @@ pub fn dispatch(app: &mut App, command: &str, args: &str) -> Option<CommandResul
         // Tools
         "/tools" => Some(tools::tools(app, args)),
         "/skills" => Some(tools::skills(app, args)),
-        "/verify" => Some(tools::verify(app, args)),
 
         // Channels
         "/channels" => Some(channels::channels(app)),
@@ -195,6 +203,7 @@ pub fn dispatch(app: &mut App, command: &str, args: &str) -> Option<CommandResul
         // Remote attach
         "/attach" => Some(remote::attach(app, args)),
         "/detach" => Some(remote::detach(app)),
+        "/gate" => Some(gate::gate(app, args)),
 
         // Context management
         "/compact" => Some(session::compact(app, args)),

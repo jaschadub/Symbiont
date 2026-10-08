@@ -22,7 +22,7 @@ http://127.0.0.1:8080/api/v1
 
 ### Authentication
 
-Agent management endpoints require Bearer token authentication. Set the `API_AUTH_TOKEN` environment variable and include the token in the Authorization header:
+Runtime routes other than health probes require Bearer authentication. Configure a private API key store or the legacy operator token `SYMBIONT_API_TOKEN`.
 
 ```
 Authorization: Bearer <your-token>
@@ -30,7 +30,7 @@ Authorization: Bearer <your-token>
 
 **Protected Endpoints:**
 - All `/api/v1/agents/*` endpoints require authentication
-- `/api/v1/health`, `/api/v1/workflows/execute`, and `/api/v1/metrics` endpoints do not require authentication
+- Only health probes are public. Workflow submission and metrics require administrative authority.
 
 ### Available Endpoints
 
@@ -67,21 +67,25 @@ Returns the current system health status and basic runtime information.
 POST /api/v1/workflows/execute
 ```
 
-Execute a workflow with specified parameters.
+Administrators submit raw DSL source in `workflow_id`; `parameters` is the invocation input. Omit `agent_id` to allocate a registration, or supply an ID to create or replace it. Agent-scoped keys receive `403 ADMIN_REQUIRED` here and can invoke their registered source through `/agents/{id}/execute`. A `queued` response acknowledges admission; match `execution_id` in `/agents/{id}/history` for the eventual outcome. See the [workflow contract](../crates/runtime/API_REFERENCE.md#execute-workflow) for source selection, validation and migration details.
 
 **Request Body:**
 ```json
 {
-  "workflow_id": "string",
+  "workflow_id": "agent report() { with sandbox = \"docker\" {} }",
   "parameters": {},
-  "agent_id": "optional-agent-id"
+  "agent_id": null
 }
 ```
 
 **Response (200 OK):**
 ```json
 {
-  "result": "workflow execution result"
+  "status": "queued",
+  "workflow_id": "agent report() { with sandbox = \"docker\" {} }",
+  "agent_id": "19b183f7-97c4-4e42-9c62-5e9c940bfae3",
+  "execution_id": "c7022f13-7140-4a09-8e30-b1941e0cbb32",
+  "metadata": {}
 }
 ```
 
@@ -112,28 +116,29 @@ GET /api/v1/agents/{id}/status
 Authorization: Bearer <your-token>
 ```
 
-Get detailed status information for a specific agent including real-time execution metrics.
+Get scheduler status for a specific agent. CPU and memory are nullable; the
+current scheduler has no per-agent sampler and returns `null` for internal and
+external agents. Clients must not present these values as zero usage.
 
 **Response (200 OK):**
 ```json
 {
   "agent_id": "uuid",
-  "state": "running|ready|waiting|failed|completed|terminated",
+  "state": "Running",
   "last_activity": "2024-01-15T10:30:00Z",
-  "scheduled_at": "2024-01-15T10:00:00Z",
   "resource_usage": {
-    "memory_usage": 268435456,
-    "cpu_usage": 15.5,
+    "memory_bytes": null,
+    "cpu_percent": null,
     "active_tasks": 1
   },
-  "execution_context": {
-    "execution_mode": "ephemeral|persistent|scheduled|event_driven",
-    "process_id": 12345,
-    "uptime": "00:15:30",
-    "health_status": "healthy|unhealthy"
-  }
+  "execution_mode": "Ephemeral"
 }
 ```
+
+`active_tasks` counts tasks owned by the scheduler. `last_activity` is not a
+resource sample timestamp. Fleet Overview displays **Not sampled** for missing
+CPU and memory; [Worker capacity](worker-capacity.md) provides separately sampled
+worker usage and reserved capacity. These worker values are not per-agent totals.
 
 **New Agent States:**
 - `running`: Agent is actively executing with a running process
@@ -210,10 +215,13 @@ Delete an existing agent from the runtime.
 ##### Execute Agent
 ```http
 POST /api/v1/agents/{id}/execute
+Idempotency-Key: <UUID retained for retries>
 Authorization: Bearer <your-token>
 ```
 
-Trigger execution of a specific agent.
+Submit one invocation of the selected agent. Reuse the UUID and request to retrieve
+a saved completion or an explicit active/unresolved/reconciled/conflict outcome. See
+[scheduler retry states](scheduler-idempotency.md).
 
 **Request Body:**
 ```json
@@ -224,7 +232,7 @@ Trigger execution of a specific agent.
 ```json
 {
   "execution_id": "uuid",
-  "status": "execution_started"
+  "status": "queued"
 }
 ```
 
@@ -432,22 +440,42 @@ cargo build --features cloud-llm
 **Environment Variables:**
 - `OPENROUTER_API_KEY` — Your OpenRouter API key (required)
 - `OPENROUTER_MODEL` — Model to use (default: `google/gemini-2.0-flash-001`)
+- `OPENROUTER_REFERER` — Optional. Sets the `HTTP-Referer` header on OpenRouter requests (app attribution). Leave unset for unattributed traffic.
+- `OPENROUTER_TITLE` — Optional. Sets the `X-Title` header. See [OpenRouter app attribution](https://openrouter.ai/docs/app-attribution).
 
 The cloud LLM provider integrates with the reasoning loop's `execute_actions()` pipeline. It supports streaming responses, automatic retries with exponential backoff, and token usage tracking.
 
+#### AWS Bedrock Provider (`bedrock`)
+
+Use Bedrock-hosted models via the Converse API for agent reasoning:
+
+```bash
+cargo build --features bedrock
+
+# For reasoning loop integration, also enable cloud-llm
+cargo build --features bedrock,cloud-llm
+```
+
+**Environment Variables:**
+- `BEDROCK_MODEL_ID` — Bedrock model identifier (e.g. `anthropic.claude-3-5-sonnet-20241022-v2:0`)
+- `AWS_REGION` — AWS region (or `AWS_DEFAULT_REGION`)
+- AWS credentials from standard chain: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` (optional), shared credentials file, or IAM role
+
+The Bedrock provider integrates with `LlmClient` and `CloudInferenceProvider` for agent reasoning. It uses the Converse API (non-streaming, SigV4-signed) with tool-use support for tool-capable models. The `bedrock` feature automatically includes `http-input` and pulls in AWS SDK dependencies (`aws-config`, `aws-sigv4`, `aws-credential-types`); default builds are unaffected.
+
 #### Standalone Agent Mode (`standalone-agent`)
 
-Combines cloud LLM inference with Composio tool access for cloud-native agents:
+Meta-feature that enables cloud LLM inference for cloud-native agents:
 
 ```bash
 cargo build --features standalone-agent
-# Enables: cloud-llm + composio
+# Enables: cloud-llm
 ```
 
 **Environment Variables:**
 - `OPENROUTER_API_KEY` — OpenRouter API key
-- `COMPOSIO_API_KEY` — Composio API key
-- `COMPOSIO_MCP_URL` — Composio MCP server URL
+
+> **Note:** Composio MCP and SymbiBot integration were removed in this version due to security concerns — see SECURITY_AUDIT.md C3 for context.
 
 #### Cedar Policy Engine (`cedar`)
 
@@ -676,7 +704,10 @@ POST /api/v1/schedules/{id}/pause
 POST /api/v1/schedules/{id}/resume
 POST /api/v1/schedules/{id}/trigger
 Authorization: Bearer <your-token>
+Idempotency-Key: <invocation-uuid>
 ```
+
+Manual triggers require an administrative token and an `Idempotency-Key` UUID. They return `queued`, a saved result, or an explicit `in_progress` / `unresolved` / `reconciled` / `conflict` state. Reuse the same UUID for retries. Pause and resume retain the action response below; unresolved occurrences prevent resume. See [cron recovery](cron-recovery.md).
 
 **Response (200 OK):**
 ```json
@@ -1224,33 +1255,97 @@ The API uses standard HTTP status codes and returns detailed error information:
 
 ---
 
+## CLI subcommands
+
+Beyond the long-lived HTTP surface, `symbi` exposes several CLI-only subcommands for one-shot operations. The full catalogue is in `symbi --help`; the ones most relevant to integration and policy enforcement are:
+
+### `symbi schemapin`
+
+TOFU (Trust-On-First-Use) integrity pinning for MCP server configurations. Designed to be called from SessionStart hooks so that an MCP server's configuration hash can't silently change between sessions without the operator approving it.
+
+```bash
+# Verify the pinned hash for one or all MCP servers in .mcp.json
+symbi schemapin verify [--mcp-server <NAME>] [--config <PATH>]
+
+# Pin the current config hash for a server
+symbi schemapin pin --mcp-server <NAME> [--config <PATH>] [--force]
+
+# List every pinned server under ~/.symbiont/schemapin/mcp/
+symbi schemapin list
+
+# Remove a pin record
+symbi schemapin unpin --mcp-server <NAME>
+```
+
+Pins are stored under `~/.symbiont/schemapin/mcp/` as JSON records. `verify` exits 0 on match, non-zero on mismatch or missing pin — suitable for use in pre-session scripts.
+
+### `symbi policy`
+
+Cedar policy evaluation against tool-call events. Reads a single event as JSON, decides `allow` / `deny` against a policy directory, and exits with a status code suitable for scripting.
+
+```bash
+# Evaluate an event read from stdin
+echo '{"principal":"Agent::\"dev\"", "action":"write", "resource":{...}}' \
+  | symbi policy evaluate --stdin --policies ./policies
+
+# Evaluate an event read from a file
+symbi policy evaluate --input event.json --policies ./policies
+
+# Emit structured JSON only (suitable for programmatic use)
+symbi policy evaluate --stdin --policies ./policies --json
+```
+
+Default output is the bare verdict on stdout with structured detail on stderr; pass `--json` to collapse everything to stdout JSON. This is the same Cedar decision logic the runtime uses inline — useful for shift-left policy testing in CI and for debugging denials outside a running runtime.
+
+### `symbi agents-md`
+
+Regenerate `AGENTS.md` from the current `agents/*.symbi` files (legacy `.dsl` is also picked up). Runs automatically during `symbi init`; call it manually after adding or editing agent definitions.
+
+```bash
+symbi agents-md generate --dir . --output AGENTS.md
+```
+
+### `symbi fmt`
+
+Canonical-format `.symbi` files. Reuses the tree-sitter parse tree from `symbi-dsl` to emit a stable layout suitable for pre-commit hooks, CI gates, and editor save actions.
+
+```bash
+# Rewrite files in place
+symbi fmt agents/*.symbi
+
+# CI gate — exit 2 if anything would change, no writes
+symbi fmt --check agents/*.symbi
+
+# Stdio mode for editor integration
+cat broken.symbi | symbi fmt --stdin
+```
+
+Exit codes: `0` no changes (or wrote successfully), `1` an I/O or syntax error occurred and no file was rewritten, `2` `--check` saw drift or invalid argument combination. The formatter refuses to format files containing syntax errors.
+
 ## Getting Started
 
 ### Runtime HTTP API
 
-1. Ensure the runtime is built with the `http-api` feature:
+1. Build the `symbi` binary (the `http-api` feature is on by default in the binary crate):
    ```bash
-   cargo build --features http-api
+   cargo build --release
    ```
 
-2. Set the authentication token for agent endpoints:
+2. Start the runtime — the API listens on `:8080` and HTTP Input on `:8081`:
    ```bash
-   export API_AUTH_TOKEN="<your-token>"
+   ./target/release/symbi up --http-bind 0.0.0.0
    ```
 
-3. Start the runtime server:
-   ```bash
-   ./target/debug/symbiont-runtime --http-api
-   ```
+   For a scaffolded project and the recommended Docker flow, see [Getting Started](/getting-started).
 
-4. Verify the server is running:
+3. Verify the server is running:
    ```bash
    curl http://127.0.0.1:8080/api/v1/health
    ```
 
-5. Test authenticated agent endpoint:
+4. Test an authenticated endpoint — `symbi up` prints the generated bearer token at startup (or set one explicitly with `--http.token`):
    ```bash
-   curl -H "Authorization: Bearer $API_AUTH_TOKEN" \
+   curl -H "Authorization: Bearer $SYMBI_HTTP_TOKEN" \
         http://127.0.0.1:8080/api/v1/agents
    ```
 
@@ -1267,3 +1362,9 @@ For API support and questions:
 - Review the [Runtime Architecture documentation](runtime-architecture.md)
 - Check the [Security Model documentation](security-model.md)
 - File issues on the project's GitHub repository
+
+A reconciled invocation returns HTTP 409 and its separately signed operator
+`resolution`; it never returns a manufactured runtime completion. Cron history
+retains `Reconciled` status, the original error and audit, and the resolution
+object. The job remains paused until explicit resume. See
+[operator reconciliation](invocation-reconciliation.md).

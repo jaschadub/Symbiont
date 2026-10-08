@@ -1,6 +1,6 @@
 [package]
 name = "symbi-runtime"
-version = "1.10.0"
+version = "1.21.1"
 edition = "2021"
 authors = ["Jascha Wanger / ThirdKey.ai"]
 description = "Agent Runtime System for the Symbi platform"
@@ -8,6 +8,28 @@ license = "Apache-2.0"
 repository = "https://github.com/thirdkeyai/symbiont"
 keywords = ["agent", "runtime", "ai", "symbiont", "automation"]
 categories = ["development-tools", "api-bindings"]
+
+# These deps are flagged as unused by `cargo machete` but are actually
+# referenced through feature gates, dev-dependencies activated via
+# `--features`, or build-script wiring that machete doesn't see. Keep
+# this list minimal — only add an entry after confirming the dep is
+# wired through a feature or `[target.'cfg(...)']` block.
+[package.metadata.cargo-machete]
+ignored = [
+    "candle-core",          # `embedding-models` feature
+    "candle-nn",            # `embedding-models` feature
+    "candle-transformers",  # `embedding-models` feature
+    "tokenizers",           # `embedding-models` feature
+    "hf-hub",               # `embedding-models` feature
+    "tower",                # `http-api` / `http-input` features
+    "tokio-tungstenite",    # `http-api` feature (websockets)
+    "openssl",              # `vendored-openssl` feature for static linking
+    "humantime-serde",      # used as serde `with = "humantime_serde"` attribute
+    "symbi-dsl",            # imported as `dsl::` (renamed via crate alias)
+    "criterion",            # benchmark-only dev-dep
+    "tokio-test",           # async test harness, used in `#[tokio::test]` indirectly
+    "aws-lc-rs",            # `fips` feature
+]
 
 
 [[example]]
@@ -18,6 +40,22 @@ path = "examples/basic_agent.rs"
 name = "full_system"
 path = "examples/full_system.rs"
 
+[[example]]
+name = "context_example"
+path = "examples/context_example.rs"
+
+[[example]]
+name = "rag_example"
+path = "examples/rag_example.rs"
+
+[[example]]
+name = "context_persistence"
+path = "examples/context_persistence.rs"
+
+[[example]]
+name = "communication_policy_gate"
+path = "examples/communication_policy_gate.rs"
+
 [[bin]]
 name = "symbi-mcp"
 path = "src/bin/symbiont_mcp.rs"
@@ -26,13 +64,24 @@ path = "src/bin/symbiont_mcp.rs"
 name = "symbi-eval"
 path = "src/bin/symbi_eval.rs"
 required-features = ["cloud-llm"]
+
+[[bin]]
+name = "echo_mcp_server"
+path = "tests/fixtures/echo_mcp_server.rs"
+required-features = ["mcp-client"]
 [dependencies]
-symbi-dsl = { path = "../dsl", version = "1.10.0" }
+symbi-sandbox-guest = { path = "../sandbox-guest", version = "1.21.1" }
+symbi-sandbox-supervisor = { path = "../sandbox-supervisor", version = "1.21.1" }
+symbi-dsl = { path = "../dsl", version = "1.21.1" }
+symbi-session = { path = "../symbi-session", version = "1.21.1", optional = true }
+symbi-invis-strip = { path = "../symbi-invis-strip", version = "0.3.0" }
+symbi-channel-adapter = { path = "../channel-adapter", version = "0.1.6", default-features = false }
 tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 serde_yaml = "0.9"
-uuid = { version = "1.0", features = ["v4", "serde"] }
+uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
 thiserror = "1.0"
 anyhow = "1.0"
 tracing = "0.1"
@@ -41,7 +90,6 @@ async-trait = "0.1"
 arc-swap = "1"
 dashmap = "5.0"
 parking_lot = "0.12"
-crossbeam = "0.8"
 ed25519-dalek = { version = "2.1", features = ["serde"] }
 aes-gcm = "0.10"
 rand = "0.8"
@@ -69,14 +117,11 @@ regex = "1.0"
 humantime-serde = "1.1"
 clap = { version = "4.0", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }
-git2 = "0.20"
-octocrab = "0.49"
 toml = "0.8"
 url = "2.4"
 base64 = "0.21"
-base64ct = "1"
 schemapin = "1.3.0"
-agentpin = { version = "0.2.0", features = ["fetch"] }
+agentpin = { version = "0.3.0", features = ["fetch"] }
 jsonschema = "0.28"
 sha2 = "0.10"
 hmac = "0.12"
@@ -87,10 +132,10 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 vaultrs = "0.7"
 sysinfo = "0.30"
 rlimit = { version = "0.10", optional = true }
-libc = { version = "0.2", optional = true }
+libc = "0.2"
 dotenvy = "0.15"
 fd-lock = "4.0"
-pty-process = { version = "0.4", optional = true }
+shlex = "1.3"
 # OS keychain access dependencies
 keyring = { version = "2.0", optional = true }
 
@@ -100,20 +145,38 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 # Cedar policy engine (optional)
 cedar-policy = { version = "4", optional = true }
 
+# MCP client transport (stdio child-process). Gated behind `mcp-client`;
+# the default build does not pull rmcp's client/child-process transport.
+# `server` + `macros` + `transport-io` are also enabled here (rather than in a
+# separate feature) because the `echo_mcp_server` test fixture bin — a real
+# rmcp *server* used to exercise the client end-to-end over stdio — is itself
+# gated on `mcp-client` and shares this same dependency declaration.
+rmcp = { version = "1.4", default-features = false, features = ["client", "transport-child-process", "server", "macros", "transport-io"], optional = true }
+# JSON schema derive for the `echo_mcp_server` test fixture's tool params.
+# rmcp's own `server` feature (enabled above) already depends on schemars
+# transitively; this adds a direct `schemars::` path for our own crate code.
+schemars = { version = "1.0", optional = true }
+
 # HTTP API dependencies (optional)
 axum = { version = "0.7", features = ["ws"], optional = true }
 tower = { version = "0.4", optional = true }
 tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
-jsonwebtoken = { version = "10", optional = true }
+jsonwebtoken = { version = "10", features = ["rust_crypto"], optional = true }
 tokio-tungstenite = { version = "0.21", optional = true }
 governor = { version = "0.10", optional = true }
 utoipa = { version = "4.2", features = ["axum_extras", "chrono"], optional = true }
 utoipa-swagger-ui = { version = "6.0", features = ["axum"], optional = true }
 
+# AWS Bedrock dependencies (optional)
+aws-config = { version = "1.8.18", optional = true }
+aws-sigv4 = { version = "1.4.5", optional = true }
+aws-credential-types = { version = "1.2.14", optional = true }
+aws-lc-rs = { version = "1", optional = true }
+
 # Metrics/telemetry dependencies (optional)
-opentelemetry = { version = "0.31", optional = true }
-opentelemetry_sdk = { version = "0.31", features = ["metrics"], optional = true }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["metrics", "grpc-tonic", "http-proto", "http-json"], optional = true }
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32", features = ["metrics"], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "grpc-tonic", "http-proto", "http-json"], optional = true }
 
 # Enterprise features removed for OSS build
 
@@ -125,7 +188,12 @@ serial_test = "3.0"
 filetime = "0.2"
 
 [features]
-default = ["keychain", "vector-lancedb"]
+# Cedar ships in the default set so `cargo install symbi` / the published
+# Docker image come with the in-tree policy backend the runtime auto-wires
+# from `policies/*.cedar`. Disable with `--no-default-features` (and re-add
+# the features you want) for builds that pin a different `ReasoningPolicyGate`
+# such as `OpaPolicyGateBridge` or a custom impl.
+default = ["keychain", "vector-lancedb", "cedar"]
 vector-lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
 vector-qdrant = ["dep:qdrant-client"]
 embedding-models = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
@@ -133,19 +201,23 @@ http-api = ["axum", "tower", "tower-http", "tokio-tungstenite", "governor", "uto
 http-input = ["axum", "tower", "tower-http", "dep:jsonwebtoken"]
 keychain = ["keyring"]
 cron = ["dep:cron", "dep:chrono-tz", "dep:rusqlite"]
-native-sandbox = ["rlimit", "libc"]
-cli-executor = ["libc"]
-toolclad-session = ["dep:pty-process"]
+native-sandbox = ["rlimit"]
+cli-executor = []
+toolclad-session = []  # Interactive PTYs are allocated inside the selected container.
+toolclad-browser = []  # CDP browser backend seam; empty until the driver dep lands. Not in default/full — no build implies browser execution works.
+mcp-client = ["dep:rmcp", "dep:schemars"]  # MCP client (stdio child-process transport) — toml already a non-optional dep; schemars backs the echo_mcp_server test fixture's tool params
 metrics = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 cedar = ["dep:cedar-policy"]  # Cedar policy engine for formal authorization
-composio = []  # Composio MCP integration — uses reqwest (already required) for SSE
+session = ["dep:symbi-session"]  # Experimental: multiparty session-type protocol monitor (off by default)
 orga-adaptive = []  # Advanced reasoning loop primitives (tool curation, stuck-loop detection, pre-hydration, scoped conventions)
 cloud-llm = ["http-input"]  # Cloud LLM inference (Anthropic, OpenAI) — gates CloudInferenceProvider
-standalone-agent = ["cloud-llm", "composio"]  # One-liner for standalone cloud agents
+standalone-agent = ["cloud-llm"]  # One-liner for standalone cloud agents
+bedrock = ["http-input", "dep:aws-config", "dep:aws-sigv4", "dep:aws-credential-types"]  # AWS Bedrock LLM provider (LlmClient lives under http_input)
+fips = ["dep:aws-lc-rs", "aws-lc-rs/fips"]  # Route crypto ops through aws-lc-rs FIPS (default impl uses ed25519-dalek)
 enterprise = []  # Enterprise sandbox variants (gVisor, Firecracker)
 enterprise-compaction = []  # Enterprise compaction tiers (Tier 2: semantic, Tier 3: vector)
 vendored-openssl = ["openssl"]
-full = ["vector-lancedb", "vector-qdrant", "embedding-models", "http-api", "http-input", "keychain", "cron", "metrics", "composio", "cedar", "cloud-llm", "toolclad-session"]
+full = ["vector-lancedb", "vector-qdrant", "embedding-models", "http-api", "http-input", "keychain", "cron", "metrics", "cedar", "cloud-llm", "toolclad-session"]
 minimal = []  # Minimal build for faster CI
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -153,6 +225,7 @@ security-framework = { version = "2.9", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 secret-service = { version = "3.0", optional = true }
+landlock = "0.4.7"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3", features = ["wincred"], optional = true }

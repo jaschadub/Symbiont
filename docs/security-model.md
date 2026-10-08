@@ -8,6 +8,17 @@ Comprehensive security architecture ensuring zero-trust, policy-driven protectio
 
 ## Overview
 
+**Containment coverage:** 1.21.0 adds selected Docker/gVisor effect
+boundaries, exact prepared-call approvals, protected journals on covered entry
+points and independent worker ownership. See the [containment guide](containment-branch-guide.md)
+for implemented paths and deployment assumptions. The architecture and tier
+configuration below are not evidence of complete enforcement across all paths.
+Firecracker oneshot commands, parsers, MCP stdio, PTY sessions and managed CLI
+workers use a versioned guest transport and independent VMM ownership. Managed
+VMs receive only runtime-issued tool/inference capabilities. Isolated browser
+execution remains unavailable. [Firecracker setup](firecracker-setup.md) describes guest and
+host deployment requirements; Docker tests do not validate a VM deployment.
+
 Symbiont implements a security-first architecture designed for regulated and high-assurance environments. The security model is built on zero-trust principles with comprehensive policy enforcement, multi-tier sandboxing, and cryptographic auditability.
 
 ### Security Principles
@@ -22,34 +33,155 @@ Symbiont implements a security-first architecture designed for regulated and hig
 
 ## Multi-Tier Sandboxing
 
-The runtime implements two isolation tiers based on risk assessment:
+The runtime ships three host-isolation tiers (Tier 1 → Tier 3) plus one hosted-execution backend (E2B). The tiers form a monotonically increasing isolation ladder; E2B is **not** a peer on that ladder — it executes on third-party infrastructure and is documented separately below.
 
 ```mermaid
 graph TB
     A[Risk Assessment Engine] --> B{Risk Level}
-    
+
     B -->|Low Risk| C[Tier 1: Docker]
-    B -->|Medium/High Risk| D[Tier 2: gVisor]
-    
+    B -->|Medium Risk| D[Tier 2: gVisor]
+    B -->|High Risk| E[Tier 3: Firecracker]
+
+    A -.->|Opt-in via DSL| H[Hosted: E2B]
+
     subgraph "Tier 1: Container Isolation"
         C1[Container Runtime]
         C2[Resource Limits]
         C3[Network Isolation]
         C4[Read-only Filesystem]
     end
-    
+
     subgraph "Tier 2: User-space Kernel"
         D1[System Call Interception]
         D2[Memory Protection]
         D3[I/O Virtualization]
         D4[Enhanced Isolation]
     end
-    
+
+    subgraph "Tier 3: microVM"
+        E1[KVM Hardware Virtualization]
+        E2[Dedicated Kernel]
+        E3[Read-only Rootfs]
+        E4[Per-execution Lifecycle]
+    end
+
+    subgraph "Hosted: third-party cloud"
+        H1[No on-host isolation]
+        H2[Trust assumption: provider]
+        H3[Quick-start, no setup]
+    end
+
     C --> C1
     D --> D1
+    E --> E1
+    H --> H1
 ```
 
-> **Note**: Additional isolation tiers with hardware virtualization are available in Enterprise editions.
+> **Every host-isolation tier — landlock, Docker, gVisor, and Firecracker — ships in the OSS runtime.** Operators pick the tier per agent via the DSL `with { sandbox = ... }` block, or set a project default via `[sandbox] tier = "..."` in `symbiont.toml`. E2B is opt-in only via the DSL (`with { sandbox = "e2b" }`) and is intentionally not exposed as an `[sandbox] tier` value.
+>
+> Strong isolation is a baseline, not an upsell. The tiers stay in the open-source
+> runtime so the community can read, audit and reproduce the boundary it depends on.
+> Guest attestation is the clearest case: a fingerprint over sources you cannot read
+> attests to nothing, so the guest service is open source precisely because it is a
+> security control.
+
+<a id="landlock-daemon-free"></a>
+
+### Landlock (native workers)
+
+Named `landlock`, not numbered. This optional Linux backend uses native processes
+and an externally managed delegated supervisor. It needs no container image or
+container daemon. Docker remains the default. See
+[service setup and migration](landlock-supervision.md).
+
+**Configuration:** `[sandbox] tier = "landlock"` in `symbiont.toml`. Read-only
+and writable ceilings come from `[sandbox.roots]`, shared with the other
+backends. `[sandbox.landlock]` carries `abi_floor`, `require_network`, memory, CPU,
+PID, lifetime and output limits, plus its `supervisor` configuration.
+The default and minimum supported ABI is now 6, even when an older configuration
+sets a lower floor. A higher configured floor still applies. Native little-endian
+x86_64 or aarch64 and working seccomp filtering are required.
+
+**Use cases:**
+- A workstation or desktop where running a container daemon per agent is not
+  reasonable
+- Confining a local process's filesystem reach, sockets and outgoing signals without
+  provisioning an image
+
+**Security features:**
+- Filesystem confinement to declared roots, enforced by the kernel
+- Landlock ABI-6 scopes prevent signals and abstract Unix socket connections to
+  processes outside the worker's domain. Signals within the domain remain usable.
+- With the default `require_network = true`, seccomp denies new sockets, covering
+  TCP, UDP and pathname Unix sockets. Private Unix **stream** socket pairs remain
+  usable. Datagram pairs are denied because they can send to unrelated pathname
+  sockets. `io_uring` operations and alternate syscall ABIs are refused so they
+  cannot bypass this restriction.
+- `require_network = false` explicitly permits new IPv4/IPv6 sockets. It does not
+  permit host Unix sockets, other socket families, datagram pairs or `io_uring`.
+  This option grants IP network access, including loopback; it is not an egress
+  allowlist.
+- A base read/execute grant for system executable and library directories, needed
+  before any dynamically linked program can start. It carries no writable path,
+  nothing under a home directory and no broad `/etc` grant.
+- Rulesets demand full enforcement. The crate's default is best-effort, which
+  silently ignores what the kernel does not support; that default is not used.
+- Rules and the syscall filter are constructed in the parent against open
+  filesystem objects. Replacing a root after preparation cannot redirect its
+  grant. The child installs the restrictions and marks descriptors above stderr
+  close-on-exec using raw syscalls. Missing declared roots fail preparation;
+  absent optional system paths may be omitted. Failed installation aborts spawn.
+- Extra inherited file, socket and ring descriptors close at exec. Stdin, stdout
+  and stderr remain explicit capabilities: SDK callers must supply only intended
+  channels. The shipping MCP path uses pipes. This does not revoke capabilities
+  an operator deliberately passes through stdio or grants through readable roots.
+
+**Migration.** Hosts with ABI 4 or 5 now fail closed; lowering `abi_floor` cannot
+restore the weaker boundary. Workloads requiring Unix services, datagram pairs,
+`io_uring` or compatibility executables must use a suitable supervised backend.
+Audit descriptors include boundary version 3, shared admission and cgroup supervision, the effective ABI requirement,
+signal/socket scopes, socket policy, ring refusal and inherited-descriptor policy.
+
+**Current coverage.** MCP stdio without declared files and the SDK's low-level
+`CliExecutor` launch path use this backend. Public one-shot commands, custom
+output parsers, interactive PTYs, declared-file staging and the shipping managed
+CLI setup do not yet support it. Selecting Landlock on those paths fails rather
+than switching to unrestricted execution.
+
+**Grant lifetime.** A domain cannot be relaxed once applied. The SDK CLI child
+receives its domain once at spawn, including write access to its working
+directory. Direct roots authorize the configured hierarchy for that lifetime;
+they do not snapshot file contents or restrict writes to new-file publication.
+MCP discovery and calls without declared files clear the configured host roots.
+Governed MCP and low-level SDK CLI workers retain durable shared CPU/memory/worker
+reservations until cgroup removal. Delegated cgroups enforce resource limits and
+stop descendants even when they leave the process group. The independent service
+manager handles supervisor failure and watchdog expiry. The raw `PreparedDomain`
+primitive only applies kernel access controls and does not acquire a lease.
+
+**Fail-closed.** The required Landlock ABI and native architecture are checked
+before authorization. Ruleset construction or installation failures, including
+unavailable seccomp filtering, abort spawn before the worker executable starts.
+There is no partial application or fallback to unrestricted host execution.
+
+**Not available for registered agents.** No `SecurityTier` names landlock, so a
+scheduled or HTTP-registered agent cannot declare it; those paths refuse it
+rather than mapping it onto a neighboring tier and misreporting the isolation
+in use. Select it in `[sandbox]` for direct runs.
+
+**Validation.** `crates/runtime/tests/landlock_sandbox.rs` exercises real restricted
+children, including replaced read/write roots and legitimate access through the
+original objects, socket and signal restrictions, inherited descriptors, private
+stream IPC, explicit IP access and alternate syscall ABI refusal.
+`scripts/test-landlock-boundary.py --binary /path/to/symbi
+--report /path/to/report.json` exercises shipping signed MCP dispatch, useful
+output, filesystem/TCP/UDP/Unix socket and signal denials, required audit and
+unsupported-kernel refusal with local synthetic fixtures. Protected observers
+independently check for delivered messages and signals. These checks do not
+establish adaptive escape resistance. The separate
+`scripts/test-landlock-supervision.py` exercises real cgroup lifecycle failures. See the
+[kernel's Landlock contract](https://docs.kernel.org/userspace-api/landlock.html).
 
 ### Tier 1: Docker Isolation
 
@@ -109,7 +241,70 @@ gvisor_security:
 - Memory corruption prevention
 - Side-channel attack mitigation
 
-> **Enterprise Feature**: Advanced isolation with hardware virtualization (Firecracker) is available in Enterprise editions for maximum security requirements.
+**Prerequisites:** Install [`runsc`](https://gvisor.dev/docs/user_guide/install/) and register it as a Docker runtime in `/etc/docker/daemon.json`. `symbi doctor` reports whether `runsc` is reachable.
+
+### Tier 3: Firecracker microVM
+
+**Use Cases:**
+- Highest-isolation workloads (untrusted code, multi-tenant, regulated data)
+- Where syscall-filter granularity (gVisor) is insufficient and a real kernel boundary is required
+- Per-execution VM lifecycle for stronger blast-radius containment
+
+**Security Features:**
+- Hardware virtualization via KVM
+- Per-execution microVM with operator-supplied kernel + rootfs
+- Read-only root filesystem by default
+- No shared kernel surface with the host
+- **Guest attestation:** the handshake checks the protocol version and a fingerprint
+  of the guest service sources, and refuses a stale or mismatched image before any
+  command is sent
+- **Independent VMM ownership:** a supervisor outside the reasoning loop owns VM
+  lifetime, so a VM cannot outlive its supervisor, and an orphaned VM is reclaimed
+  against a verified process identity rather than a reusable PID
+- **Unprivileged guest workload:** commands run as a non-root guest user with
+  `no_new_privs` and explicit process and file-descriptor limits
+
+**Configuration:** `[sandbox.firecracker]` in `symbiont.toml`:
+
+```toml
+[sandbox]
+tier = "tier3"
+
+[sandbox.firecracker]
+kernel_image_path = "/var/lib/firecracker/vmlinux"
+rootfs_path       = "/var/lib/firecracker/rootfs.ext4"
+vcpus             = 1
+mem_mib           = 512
+rootfs_read_only  = true
+```
+
+**Prerequisites:** Operator must supply (a) a Firecracker-compatible kernel image and (b) a root filesystem image with the matching compiled guest service. **See [`docs/firecracker-setup.md`](firecracker-setup.md) for a step-by-step quickstart, the in-VM init contract, and a hardening checklist.** `symbi doctor` reports whether the `firecracker` binary is reachable.
+
+Once you have both artifacts, scaffold a tier3 project with:
+
+```bash
+symbi init --profile assistant --sandbox tier3 \
+  --firecracker-kernel /var/lib/firecracker/vmlinux \
+  --firecracker-rootfs /var/lib/firecracker/rootfs.ext4
+```
+
+`symbi init` validates that both files exist before writing `symbiont.toml`, so misconfigurations surface at scaffold time rather than first agent run.
+
+### Hosted execution: E2B
+
+**E2B is a hosted cloud-sandbox backend, not a host-isolation tier.** It sits outside the Tier 1 → Tier 3 ladder and is documented here for completeness.
+
+**What it is:** Code runs on E2B's infrastructure via their HTTPS API; the runtime ships only an HTTP client. Set `E2B_API_KEY` and select it per agent with `with { sandbox = "e2b" }`. There is no `--sandbox e2b` flag on `symbi init` — E2B is intentionally opt-in via DSL only, since it represents a different trust model than the on-host tiers.
+
+**Use cases:**
+- Quick-start demos and evaluation without installing Docker, gVisor, or Firecracker.
+- Development environments where the operator can't run a sandbox host (CI without privileged mode, locked-down laptops, ARM developer machines).
+
+**What it is not:**
+- Not a substitute for on-host isolation. Code, prompts, and tool outputs traverse E2B's infrastructure. Don't use it for workloads with privacy, residency, or compliance requirements.
+- Not comparable to Tier 1/2/3 in a security review. The runtime maps `E2B → SecurityTier::Hosted`, which sorts **below** `Tier1` for ordering — policies that require host isolation (`tier >= Tier1`) will reject hosted execution.
+
+**Configuration:** No project-level config; set `E2B_API_KEY` in the environment and use `with { sandbox = "e2b" }` per agent.
 
 ---
 
@@ -236,6 +431,8 @@ pub enum PolicyDecision {
 
 Symbiont integrates the [Cedar policy language](https://www.cedarpolicy.com/) for formal authorization. Cedar enables fine-grained, auditable access control policies that are evaluated at the reasoning loop's policy gate.
 
+**Default-on since v1.14.x:** Cedar ships in the default feature set of `symbi-runtime` and is included in every published binary (crates.io, Docker, GitHub Release tarballs). `symbi up` and `symbi run` auto-wire `CedarPolicyGate` from `policies/*.cedar` files at startup; when at least one policy file is present the gate is constructed with `deny_by_default()` and each `.cedar` file is loaded as a named policy. When no policy files are present, the runtime falls through to the fail-closed `DefaultPolicyGate::new()` (which denies every `ToolCall` and `Delegate` action). To disable Cedar entirely — for builds that pin `OpaPolicyGateBridge` or a custom `ReasoningPolicyGate` — build with `cargo build --no-default-features --features "keychain,vector-lancedb"`.
+
 ```bash
 cargo build --features cedar
 ```
@@ -251,12 +448,50 @@ use symbi_runtime::reasoning::cedar_gate::CedarPolicyGate;
 
 // Create a Cedar policy gate with deny-by-default stance
 let cedar_gate = CedarPolicyGate::deny_by_default();
+let agent_id = symbi_runtime::types::AgentId::new();
+let (journal, audit) = symbi_runtime::reasoning::run_audit::open_run_journal(
+    trusted_project, agent_id,
+).await?;
+println!("Audit: {}", serde_json::to_string(&audit)?);
 let runner = ReasoningLoopRunner::builder()
     .provider(provider)
     .executor(executor)
     .policy_gate(Arc::new(cedar_gate))
+    .journal(journal)
     .build();
 ```
+
+### Reasoning-Loop Policy Gate Default (post-v1.13.0 audit)
+
+The reasoning loop in `symbi up` and `symbi run` is **fail-closed** by default. `DefaultPolicyGate::new()` returns `LoopDecision::Deny` for every `ToolCall` and `Delegate` action, with the reason `"No policy gate configured (DefaultPolicyGate::new is fail-closed; wire OpaPolicyGateBridge or pass --insecure-allow-all)"`. `Respond` actions remain allowed so the agent can still produce text output.
+
+This change closes the gap where the production binary previously hard-coded `DefaultPolicyGate::permissive()` and silently allowed every action — see `SECURITY_AUDIT.md` C2 for the audit trail.
+
+Operators have two paths:
+
+1. **Wire a real policy backend** (recommended): construct `CedarPolicyGate`, `OpaPolicyGateBridge`, or your own implementation of the `ReasoningPolicyGate` trait and pass it to the runner.
+2. **Opt into permissive mode for local dev**: pass `--insecure-allow-all` to `symbi up` / `symbi run`, or set `SYMBI_INSECURE_ALLOW_ALL=1`. A multi-line stderr banner is printed every time the runtime starts in this mode, and `tracing::warn!` fires on every evaluated action.
+
+The legacy `permissive()` constructor was renamed `permissive_for_dev_only()` and marked `#[doc(hidden)]` to discourage incidental use in production code paths.
+
+#### Per-surface policy scoping (since v1.19.0)
+
+Every entry point used to load the same flat pile of `policies/*.cedar`, so a `permit` written for one of them silently applied to all of them. Entry points do not share a threat model: `symbi run` and the HTTP input server dispatch real tool calls, `symbi shell` exposes its own file-editing toolset, and the `symbi up` chat coordinator executes no tools at all.
+
+Policies are now layered:
+
+- `policies/*.cedar` — **shared**, loaded by every surface's gate.
+- `policies/<surface>/*.cedar` — loaded **only** by the surface it names.
+
+The surface names are `run`, `coordinator`, `http-input`, `managed-cli`, `eval`, and `shell`. `symbi up` builds one gate per surface (`coordinator` and `http-input`) rather than one shared between them, so a grant intended for unattended webhook agents does not reach the operator chat path, and vice versa. They still share one escalation queue, so held actions reach the same approvers.
+
+Flat files remain global, so no existing deployment changes behaviour until it creates a subdirectory. Reserve the flat directory for rules that genuinely apply everywhere, and put anything tool-specific under its surface. Note that Mode B reads `policies/managed-cli/`, not `policies/run/` — spawning a managed subprocess is a different blast radius from the in-process reasoning loop, and a policy left in the wrong directory is loaded by nothing while looking identical to having written none.
+
+When a gate falls through to fail-closed, the log names both directories it searched.
+
+#### OPA backend transport hardening
+
+When using `OpaPolicyGateBridge` with `SYMBIONT_OPA_URL`, the client **refuses plaintext HTTP to a non-loopback host** and fails closed (denies) — an on-path attacker could otherwise spoof an `allow` decision. Plaintext is permitted only for loopback (a local OPA sidecar) or when `SYMBIONT_OPA_ALLOW_INSECURE=1` is set (local testing only). Set `SYMBIONT_OPA_AUTH_TOKEN` to send a bearer token with each authorization query. Use `https://` for any remote OPA endpoint.
 
 ### Inter-Agent Communication Policy
 
@@ -382,7 +617,26 @@ pub fn encrypt_message(
 
 ### Cryptographic Audit Trail
 
-Every security-relevant operation generates an immutable audit event:
+Two subsystems keep a signed, hash-chained record: the critic audit chain
+(`crates/runtime/src/reasoning/critic_audit.rs`, verified with `verify_chain` /
+`verify_chain_anchored`) and session transcripts
+(`crates/runtime/src/session/transcript.rs`). The structure below describes those
+chains.
+
+The branch also adds required protected run journals for ordinary/managed CLI,
+HTTP, scheduled ORGA and default DSL `reason()`/`tool_call()` execution. These are
+private, durably appended, Ed25519-signed and hash-chained; invocation-bound
+records include the run ID. See [run audit](run-audit.md) for the actual format,
+key custody, verification and incomplete terminal outcomes.
+
+This remains short of a system-wide audit log. The underlying `JournalWriter`
+interface still permits a buffered in-memory writer on other paths or explicit
+SDK injection; delegated internal journals are not all surfaced to the operator.
+Direct LLM/composition and other shell reasoning paths still need migration. The
+illustrative event structure below describes the critic/transcript chains, not
+the protected run journal's wire format.
+
+An event in those chains looks like:
 
 ```rust
 pub struct AuditEvent {
@@ -440,47 +694,39 @@ impl AuditChain {
 }
 ```
 
-### Compliance Features
+---
 
-**Regulatory Support:**
+## Human Approval Relay (`symbi-approval-relay`)
 
-**HIPAA (Healthcare):**
-- PHI access logging with user identification
-- Data minimization enforcement
-- Breach detection and notification
-- Audit trail retention for 6 years
+When a policy decision returns `require: approval`, the action blocks until a human reviewer either approves or denies it. `symbi-approval-relay` is the crate that carries those requests to a human and the decision back, while keeping both hops auditable.
 
-**GDPR (Privacy):**
-- Personal data processing logs
-- Consent verification tracking
-- Data subject rights enforcement
-- Data retention policy compliance
+### Dual-channel design
 
-**SOX (Financial):**
-- Internal control documentation
-- Change management tracking
-- Access control verification
-- Financial data protection
+The relay is **dual-channel** by design: every approval round-trips through two independent paths, and both must agree before the runtime unblocks the action.
 
-**Custom Compliance:**
+- **Primary channel** — an interactive surface for the reviewer (chat adapter, web UI, CLI prompt). This is where the reviewer reads the request and decides.
+- **Attestation channel** — an independent verification path (for example a signed callback, a second operator, or an out-of-band confirmation). The runtime will not unblock on a primary-channel approval alone.
 
-> **Planned feature** — The `ComplianceFramework` API shown below is part of the security roadmap and not yet available in the current release.
+This structure defeats the single-channel compromise case — an attacker who seizes the primary channel still cannot grant approvals, because the attestation channel doesn't share trust with it.
 
-```rust
-// PLANNED — not yet implemented in the current release
-pub struct ComplianceFramework {
-    pub name: String,
-    pub audit_requirements: Vec<AuditRequirement>,
-    pub retention_policy: RetentionPolicy,
-    pub access_controls: Vec<AccessControl>,
-    pub data_protection: DataProtectionRules,
-}
+### What the relay carries
 
-impl ComplianceFramework {
-    pub fn validate_compliance(&self, audit_trail: &AuditChain) -> ComplianceReport;
-    pub fn generate_compliance_report(&self, period: TimePeriod) -> Report;
-}
-```
+Every approval request in flight carries:
+- The agent identity (AgentPin-anchored) and the policy decision that triggered the request
+- The full action context — tool invocation, resource, arguments — hashed so reviewers can confirm they approved *this* action and not a swapped one
+- A deadline after which the request auto-denies
+- Correlation IDs so the audit trail ties the two channels' decisions back to a single action
+
+Approvals and denials are recorded in the same cryptographically tamper-evident audit chain as every other runtime decision. A human saying "yes" is a decision in the log, not a bypass of it.
+
+### Where it's used
+
+- Cedar policies that emit `RequireApproval { approver: "..." }` verdicts
+- Destructive or high-privilege tool calls gated by ToolClad `approval` hooks
+- Scheduled jobs configured with `one_shot = true` plus an approval policy
+- Any DSL `policy` block that names `require: <role>_approval`
+
+If no relay is configured, approval-gated actions fail closed — they're denied, not silently allowed.
 
 ---
 
@@ -501,22 +747,19 @@ External tools are verified using cryptographic signatures:
 sequenceDiagram
     participant Tool as Tool Provider
     participant SP as SchemaPin
-    participant AI as AI Reviewer
     participant Runtime as Symbiont Runtime
     participant Agent as Agent
-    
-    Tool->>SP: Submit Tool Schema
-    SP->>AI: Security Analysis
-    AI-->>SP: Analysis Results
-    SP->>SP: Human Review (if needed)
-    SP->>SP: Sign Schema
-    SP-->>Tool: Signed Schema
-    
+
+    Tool->>Tool: Sign schema with provider private key
+    Tool->>SP: Publish signed schema + public key
+
     Agent->>Runtime: Request Tool Use
-    Runtime->>SP: Verify Tool Schema
-    SP-->>Runtime: Verification Result
+    Runtime->>SP: Verify schema signature against pinned key
+    SP-->>Runtime: Verification Result (valid / invalid / unknown key)
     Runtime-->>Agent: Allow/Deny Tool Use
 ```
+
+> SchemaPin verification is purely cryptographic — signature validation and key pinning (TOFU). It performs no AI or human review of tool behavior; that is a separate, planned capability described under [AI-Driven Tool Review](#ai-driven-tool-review).
 
 ### Trust-On-First-Use (TOFU)
 
@@ -687,6 +930,55 @@ scanner.add_custom_rule(
     "References to internal API endpoints are not allowed in skills",
 );
 ```
+
+---
+
+## Invisible-Character Sanitization (`symbi-invis-strip`)
+
+`symbi-invis-strip` is a zero-dependency utility crate used across the runtime to strip characters that render as nothing but change meaning — the classic payload for prompt-injection and policy-evasion attacks.
+
+### What it removes
+
+- ASCII C0 (0x00–0x1F) and DEL (0x7F), except for `\t` `\n` `\r`
+- ASCII C1 (0x80–0x9F)
+- Zero-width characters (ZWSP, ZWNJ, ZWJ)
+- Bidirectional overrides (LRO, RLO, PDF, LRE, RLE, LRI, RLI, FSI, PDI)
+- Word joiner and the invisible-operator block
+- Byte-order marks (BOM)
+- Variation selectors (VS1–VS16 and supplementary VS17–VS256)
+- Characters in the Unicode Tag block (U+E0000–U+E007F)
+
+### Where it runs
+
+- Inbound chat and webhook payloads — before they reach the orchestrator
+- Tool-call arguments — before they reach Cedar evaluation
+- Skill and agent DSL content — before the scanner and parser
+
+### Optional markup stripping
+
+The opt-in `sanitize_field_with_markup` variant additionally removes:
+- `<!-- ... -->` HTML comments
+- Triple-backtick fenced code blocks
+
+Markup stripping is appropriate for surfaces where renderer-hidden markup has no legitimate use — for example, short policy rationale fields or display-only metadata. It is **not** applied to fields that legitimately carry markdown or code (like agent source, policy bodies, or tool outputs).
+
+---
+
+## Cedar Policy Linter
+
+`.github/scripts/lint-cedar-policies.py` is a static analysis pass that runs on every `.cedar` file in the repository. It catches a class of attack where a malicious (or compromised) authoring flow writes a policy that *looks* correct but contains characters that produce a different authorization decision than the reviewer expects.
+
+### What it catches
+
+- **Homoglyph identifiers** — Cyrillic `а` (U+0430) masquerading as Latin `a`, Greek `ο` (U+03BF) as Latin `o`, and similar lookalikes in principal/action/resource names.
+- **Invisible control characters** inside identifiers, string literals, or between tokens.
+
+### Where it runs
+
+- **Pre-commit hook** — blocks commits that introduce either class of issue.
+- **CI** — the same check is a required test job, so commits that bypass the hook (via `--no-verify`) still fail CI.
+
+Combined with `symbi-invis-strip` on the data path, the linter closes the authoring-path vector: invisible tricks can't enter the repo, and any that slip through at runtime are stripped before policy evaluation.
 
 ---
 
@@ -965,7 +1257,10 @@ automatic_key_pinning = false
 
 **Compliance Metrics:**
 - Policy compliance rate: >99.9%
-- Audit trail integrity: 100%
+- Audit trail integrity: chain verification detects any reordering, mutation, or
+  tail truncation of the critic audit chain and session transcripts (see
+  [Cryptographic Audit Trail](#cryptographic-audit-trail) for what is and is not
+  covered)
 - Security event false positive rate: <1%
 - Incident resolution time: <24 hours
 
@@ -1015,6 +1310,5 @@ automatic_key_pinning = false
 - **[Contributing](/contributing)** - Security development guidelines
 - **[Runtime Architecture](/runtime-architecture)** - Technical implementation details
 - **[API Reference](/api-reference)** - Security API documentation
-- **[Compliance Guide](/compliance)** - Regulatory compliance information
 
 The Symbiont security model provides enterprise-grade protection suitable for regulated industries and high-assurance environments. Its layered approach ensures robust protection against evolving threats while maintaining operational efficiency.

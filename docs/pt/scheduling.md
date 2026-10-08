@@ -3,6 +3,18 @@
 ## Outros idiomas
 
 
+O [guia de execução governada](/scheduled-execution) descreve o comportamento de
+runtime desta branch: o registro armazena a configuração sem executar um agente;
+invocações via API, manuais e por temporizador recebem IDs de execução distintos e
+resultados terminais reais. O histórico atinge `succeeded` após a execução e a
+limpeza, e inclui saída, erros e referências de auditoria protegidas. Agendamento
+gerenciado via CLI, modelos roteados e transporte de agentes externos permanecem
+indisponíveis no serviço padrão. O limite de comando selecionado pode usar
+[Firecracker](/firecracker-setup) para ferramentas oneshot, parsers, MCP stdio e
+sessões PTY quando os artefatos de guest correspondentes estiverem provisionados.
+Consulte o [guia da branch](/containment-branch-guide) para as diferenças visíveis
+ao operador e a cobertura restante.
+
 O sistema de agendamento do Symbiont oferece execução de tarefas baseada em cron de nível de produção para agentes de IA. O sistema suporta:
 
 - **Agendamentos cron**: Sintaxe cron tradicional para tarefas recorrentes
@@ -849,38 +861,13 @@ enable_metrics = true
 default_max_retries = 3
 shutdown_timeout_seconds = 60
 
-[scheduler.delivery]
-# Configurações de webhook
-webhook_timeout_seconds = 30
-webhook_retry_attempts = 3
-
-# Configurações do Slack
-slack_api_token = "${SLACK_API_TOKEN}"
-slack_default_channel = "#ops"
-
-# Configurações de email
-smtp_host = "smtp.example.com"
-smtp_port = 587
-smtp_username = "${SMTP_USER}"
-smtp_password = "${SMTP_PASS}"
-email_from = "symbiont@example.com"
 ```
 
-### Variáveis de Ambiente
+### Canais de entrega
 
-```bash
-# Configurações do agendador
-SYMBI_SCHEDULER_MAX_JITTER=30
-SYMBI_SCHEDULER_MAX_CONCURRENT=20
+Os canais de entrega (`stdout`, `log_file`, `webhook`, `slack`, `email`, …) são configurados **por agendamento** no bloco `delivery` daquele agendamento (veja os exemplos acima), e não por meio de uma seção global de configuração `[scheduler.delivery]`.
 
-# Configurações de entrega
-SYMBI_SLACK_TOKEN=xoxb-...
-SYMBI_WEBHOOK_AUTH_HEADER="Bearer secret-token"
-
-# Verificação AgentPin
-SYMBI_AGENTPIN_REQUIRED=true
-SYMBI_AGENTPIN_DOMAIN=agent.example.com
-```
+> **A entrega via `log_file` requer `SYMBIONT_LOG_DIR`.** O caminho de destino fica confinado a esse diretório da lista de permissão — caminhos que escapam dele via `..`, caminhos absolutos ou symlinks são rejeitados, e a entrega via log_file é fail-closed (desativada) quando `SYMBIONT_LOG_DIR` não está definido.
 
 ## Observabilidade
 
@@ -921,11 +908,13 @@ pub enum SecurityEventType {
 }
 ```
 
-Consultar log de auditoria:
+Consultar log de auditoria a partir do shell interativo:
 
-```bash
-symbi audit query --type CronJobFailed --since "2026-02-01" --limit 50
+```text
+/audit CronJobFailed
 ```
+
+Ou programaticamente via API HTTP do runtime — veja [Referência da API](/api-reference) para os endpoints `/api/v1/audit`.
 
 ## Melhores Práticas
 

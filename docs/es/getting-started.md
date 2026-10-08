@@ -1,6 +1,12 @@
 # Primeros Pasos
 
+> Si vas a ejecutar agentes bajo contencion, empieza por la [guia de operador de contencion](/containment-branch-guide) para conocer los requisitos de ejecucion, los cambios en las aprobaciones y la cobertura actual.
+
 Esta guia te guiara a traves de la configuracion de Symbi y la creacion de tu primer agente de IA.
+
+▶ **Mira el tutorial de inicio:**
+
+[![Symbiont — get started](https://img.youtube.com/vi/RPyKpqKz5ik/hqdefault.jpg)](https://www.youtube.com/watch?v=RPyKpqKz5ik)
 
 ## Tabla de contenidos
 
@@ -9,15 +15,23 @@ Esta guia te guiara a traves de la configuracion de Symbi y la creacion de tu pr
 
 ## Prerrequisitos
 
-Antes de comenzar con Symbi, asegurate de tener lo siguiente instalado:
+Lo que necesitas depende de como instales y ejecutes Symbi.
 
-### Dependencias Requeridas
+### Para ejecutar el binario preconstruido
 
-- **Docker** (para desarrollo containerizado)
-- **Rust 1.82+** (si construyes localmente)
+Los binarios preconstruidos ya estan compilados: **no** necesitas Rust, protobuf ni Git para instalarlos o ejecutarlos. Instala con Homebrew, el script de instalacion (`curl`) o una descarga manual desde GitHub Releases.
+
+- **Docker** solo se necesita en *tiempo de ejecucion* si ejecutas agentes bajo el nivel de sandbox predeterminado (`tier1`, respaldado por Docker). **No** se necesita para instalar Symbi ni para ejecutar `symbi init`, `symbi dsl` o `symbi --version`.
+
+### Para construir desde el codigo fuente
+
+Requerido solo si instalas via `cargo install` o construyes el repositorio tu mismo:
+
+- **Rust 1.82+**
+- **protobuf-compiler** (`apt install protobuf-compiler` en Ubuntu, `brew install protobuf` en macOS)
 - **Git** (para clonar el repositorio)
 
-### Dependencias Opcionales
+### Opcional
 
 - **[symbi-claude-code](https://github.com/thirdkeyai/symbi-claude-code)** (plugin de gobernanza para Claude Code)
 - **[symbi-gemini-cli](https://github.com/thirdkeyai/symbi-gemini-cli)** (extension de gobernanza para Gemini CLI)
@@ -48,18 +62,28 @@ Descargar desde [GitHub Releases](https://github.com/thirdkeyai/symbiont/release
 
 ### Opcion 2: Docker (Recomendado)
 
-La forma mas rapida de empezar es usando Docker:
+La forma mas rapida de obtener un runtime funcionando es dejar que el contenedor cree el proyecto por ti:
 
 ```bash
-# Clone the repository
+# 1. Crear symbiont.toml, agents/, policies/, docker-compose.yml y
+#    un .env con un SYMBIONT_MASTER_KEY recien generado.
+docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest \
+  init --profile assistant --no-interact --dir /workspace
+
+# 2. Iniciar el runtime. Lee .env automaticamente.
+docker compose up
+```
+
+La API del runtime queda ahora en `http://localhost:8080` y HTTP Input en `http://localhost:8081`.
+
+Si prefieres trabajar desde un clon (para compilar la imagen tu mismo o ejecutar pruebas):
+
+```bash
 git clone https://github.com/thirdkeyai/symbiont.git
 cd symbiont
 
 # Build the unified symbi container
 docker build -t symbi:latest .
-
-# Or use pre-built container
-docker pull ghcr.io/thirdkeyai/symbi:latest
 
 # Run the development environment
 docker run --rm -it -v $(pwd):/workspace symbi:latest bash
@@ -108,6 +132,31 @@ docker run --rm symbi:latest mcp --help
 
 ---
 
+## Probarlo sin clave de API
+
+Dos cosas funcionan sin conexion, antes de configurar cualquier proveedor de modelos. Ambas demuestran lo que Symbiont hace realmente — empieza aqui.
+
+**Define una herramienta y ejecutala en seco.** Los tipos de argumento, los limites de alcance y las comprobaciones de inyeccion se aplican antes de ejecutar nada:
+
+```bash
+symbi tools init greet
+symbi tools validate
+symbi tools test greet --arg target=example
+```
+
+```
+greet                                    OK
+
+  ✓ target (string): example → OK
+
+  Command:   greet example
+  Cedar:     Tool::Greet / execute_tool
+
+  [dry run — command not executed]
+```
+
+Ejecutar un *agente* requiere un proveedor de modelos — una clave en la nube o un modelo local, ambos cubiertos mas abajo.
+
 ## Inicializacion de Proyecto
 
 La forma mas rapida de iniciar un nuevo proyecto Symbiont es `symbi init`:
@@ -119,7 +168,34 @@ symbi init
 Esto lanza un asistente interactivo que te guia a traves de:
 - **Seleccion de perfil**: `minimal`, `assistant`, `dev-agent` o `multi-agent`
 - **Modo SchemaPin**: `tofu` (Trust-On-First-Use), `strict` o `disabled`
-- **Nivel de sandbox**: `tier0` (ninguno), `tier1` (Docker) o `tier2` (gVisor)
+- **Nivel de sandbox**: `landlock` (nativo de Linux), `tier0` (ninguno, solo desarrollo), `tier1` (Docker), `tier2` (gVisor / `runsc`) o `tier3` (microVM Firecracker)
+
+Con `--sandbox landlock --profile dev-agent`, el asistente tambien pregunta por el
+repositorio de codigo fuente, el ejecutable instalado de Claude Code, la URL de
+inferencia compatible con Messages, el modelo y el nombre de la variable de entorno
+con la credencial. Genera una configuracion de revision de solo lectura en un
+directorio de control separado y vacio. Quien lo invoque de forma no interactiva
+debe proporcionar `--source`, `--managed-executable`, `--inference-url`,
+`--inference-model` e `--inference-key-env`. Consulta
+[onboarding para desarrollo en Linux](/landlock-development).
+
+### Lo que produce `init`
+
+Cada ejecucion escribe:
+
+| Archivo | Proposito |
+|---------|-----------|
+| `symbiont.toml` | Configuracion del runtime y de politicas |
+| `policies/default.cedar` | Politica Cedar deny-by-default |
+| `agents/*.symbi` | Definiciones de agente especificas del perfil (los `.dsl` heredados tambien se reconocen; excepto `minimal`) |
+| `AGENTS.md` | Indice autogenerado de los agentes declarados |
+| `.symbiont/audit/` | Directorio del registro de auditoria a prueba de manipulacion |
+| `.gitignore` | Se anade con entradas especificas de Symbiont, incluyendo `.env` |
+| `.env` | `SYMBIONT_MASTER_KEY` generado desde `/dev/urandom` (permisos 0600) |
+| `.env.example` | Plantilla segura para commit que muestra las variables de entorno requeridas |
+| `docker-compose.yml` | Archivo compose con los montajes de volumen y el cableado de env; se omite con Landlock |
+
+Pase `--no-docker-compose` para omitir el archivo compose, y `--dir <PATH>` para escribir en un directorio distinto del actual (esencial dentro de un contenedor Docker — ver mas abajo).
 
 ### Modo no interactivo
 
@@ -129,18 +205,31 @@ Para CI/CD o configuraciones por script:
 symbi init --profile assistant --schemapin tofu --sandbox tier1 --no-interact
 ```
 
+### Ejecutar `init` dentro de Docker
+
+Como el WORKDIR de la imagen es `/var/lib/symbi`, use `--dir` para escribir en su volumen montado:
+
+```bash
+docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest \
+  init --profile assistant --no-interact --dir /workspace
+```
+
+Eso rellena el directorio actual del host con el arbol completo del proyecto.
+
 ### Perfiles
 
 | Perfil | Que crea |
 |--------|----------|
 | `minimal` | `symbiont.toml` + politica Cedar por defecto |
 | `assistant` | + un agente asistente gobernado |
-| `dev-agent` | + agente CliExecutor con politicas de seguridad |
+| `dev-agent` | + agente de CLI administrada; con Landlock anade herramientas configuradas de lectura, listado y busqueda, politicas acotadas y `DEVELOPMENT.md` |
 | `multi-agent` | + agentes coordinador/worker con politicas inter-agente |
 
 ### Importar desde el catalogo
 
-Importa agentes preconstruidos junto con cualquier perfil:
+Importa agentes preconstruidos junto con los perfiles generales (el inicializador
+de desarrollo de solo lectura con Landlock no admite combinar importaciones del
+catalogo):
 
 ```bash
 symbi init --profile minimal --no-interact
@@ -156,9 +245,10 @@ symbi init --catalog list
 Despues de la inicializacion, valida e inicia:
 
 ```bash
-symbi dsl -f agents/assistant.dsl   # validate your agent
+symbi dsl -f agents/assistant.symbi   # validate your agent
 symbi run assistant -i '{"query": "hello"}'  # test a single agent
-symbi up                             # start the full runtime
+symbi up                             # start the runtime locally
+docker compose up                    # ...or start it in Docker (reads .env)
 ```
 
 ### Ejecutar un agente individual
@@ -173,8 +263,52 @@ El comando resuelve nombres de agentes buscando: ruta directa, luego el director
 
 ```bash
 symbi run assistant -i 'Summarize this document'
-symbi run agents/recon.dsl -i '{"target": "10.0.1.5"}' --max-iterations 5
+symbi run agents/recon.symbi -i '{"target": "10.0.1.5"}' --max-iterations 5
 ```
+
+Los comandos de herramientas, los parsers y la ejecucion de MCP y PTY requieren el
+backend de contenedor seleccionado, una imagen cacheada con los ejecutables
+declarados y montajes de datos explicitos. Un backend no disponible no puede
+recurrir a la ejecucion en el host. Los ajustes del agente seleccionados y los
+valores predeterminados del proyecto se comprueban antes de la inferencia. Las
+ejecuciones tambien requieren el almacenamiento protegido `.symbiont/governed/` e
+imprimen su referencia publica de auditoria. Consulta
+[configuracion de comandos](/toolclad-command-boundary) y
+[auditoria de ejecuciones](/run-audit).
+
+### Usar un modelo local
+
+El proveedor no tiene por que ser un servicio en la nube. Apunta `OPENAI_BASE_URL` a cualquier servidor compatible con OpenAI — [Ollama](https://ollama.com), vLLM, LM Studio y llama.cpp exponen uno — y no interviene ninguna clave de nube:
+
+```bash
+export OPENAI_API_KEY=ollama
+export OPENAI_BASE_URL=http://localhost:11434/v1
+export CHAT_MODEL=llama3.1
+
+symbi run assistant -i 'hello'
+```
+
+Las mismas tres variables sirven para `symbi up`. Symbiont advierte cuando una URL base usa `http://` en texto plano, porque la clave viaja con la peticion. Eso es lo esperado para un modelo en tu propia maquina.
+
+### Partir desde una plantilla (`symbi new`)
+
+`symbi init` genera un proyecto generico; `symbi new` genera un proyecto en torno a una de varias plantillas orientadas a tareas. Es util cuando sabes que tipo de agente necesitas antes de saber cuales agentes necesitas.
+
+```bash
+symbi new --list                     # show available templates
+symbi new <template> <project-name>  # create a new project from a template
+```
+
+Plantillas incluidas:
+
+| Plantilla | Que obtienes |
+|-----------|--------------|
+| `webhook-min` | Agente minimo dirigido por webhooks — configuracion de HTTP Input + un DSL manejador |
+| `webscraper-agent` | Agente de scraping con politicas de acceso Cedar y una herramienta scraper de ToolClad |
+| `slm-first` | Patron de router + lista blanca SLM + respaldo por confianza |
+| `rag-lite` | Scripts de ingesta respaldados por Qdrant mas un agente de busqueda |
+
+`symbi new` y `symbi init` son complementarios: `new` te da un punto de partida especifico para una tarea, `init` (+ `--catalog`) te da uno especifico para gobernanza. Tambien puedes combinar — genera el esqueleto con `new` y luego ejecuta `symbi init --catalog ...` para incorporar agentes preconstruidos adicionales desde el catalogo.
 
 ---
 
@@ -184,7 +318,7 @@ Vamos a crear un agente simple de analisis de datos para entender los conceptos 
 
 ### 1. Crear Definicion de Agente
 
-Crear un nuevo archivo `my_agent.dsl`:
+Crear un nuevo archivo `my_agent.symbi`:
 
 ```rust
 metadata {
@@ -218,10 +352,10 @@ agent greet_user(name: String) -> String {
 
 ```bash
 # Parse and validate the agent definition
-cargo run -- dsl parse my_agent.dsl
+cargo run -- dsl parse my_agent.symbi
 
 # Run the agent in the runtime
-cd crates/runtime && cargo run --example basic_agent -- --agent ../../my_agent.dsl
+cd crates/runtime && cargo run --example basic_agent -- --agent ../../my_agent.symbi
 ```
 
 ---
@@ -336,12 +470,14 @@ export OPENROUTER_MODEL="google/gemini-2.0-flash-001"  # optional
 
 #### Modo Agente Autonomo
 
-Una sola linea para agentes nativos de la nube con inferencia LLM y acceso a herramientas Composio:
+Una sola linea para agentes nativos de la nube con inferencia LLM:
 
 ```bash
 cargo build --features standalone-agent
-# Enables: cloud-llm + composio
+# Enables: cloud-llm
 ```
+
+> **Note:** Composio MCP and SymbiBot integration were removed in this version due to security concerns — see SECURITY_AUDIT.md C3 for context.
 
 #### Primitivas de Razonamiento Avanzado
 
@@ -355,10 +491,10 @@ Consulta la [guia de orga-adaptive](/orga-adaptive) para la documentacion comple
 
 #### Motor de Politicas Cedar
 
-Autorizacion formal con el lenguaje de politicas Cedar:
+Autorizacion formal con el lenguaje de politicas Cedar. **Activado por defecto desde v1.14.x**: los binarios publicados de `symbi` (crates.io, Docker, tarballs de GitHub Release) incluyen Cedar, y `symbi up` / `symbi run` autocablean `CedarPolicyGate` desde los archivos `policies/*.cedar` al arranque; si no hay ninguno presente, el runtime recae en el `DefaultPolicyGate` fail-closed. Para construir sin Cedar (por ejemplo, cuando pretendes cablear `OpaPolicyGateBridge` o un `ReasoningPolicyGate` personalizado en su lugar), usa:
 
 ```bash
-cargo build --features cedar
+cargo build --no-default-features --features "keychain,vector-lancedb"  # drop cedar
 ```
 
 #### Base de Datos Vectorial (Integrada)
@@ -373,7 +509,9 @@ cd crates/runtime && cargo run --example rag_example
 cd crates/runtime && cargo run --example context_example
 ```
 
-> **Opcion enterprise:** Para equipos que necesiten una base de datos vectorial dedicada, Qdrant esta disponible como backend opcional con feature gate. Configura `SYMBIONT_VECTOR_BACKEND=qdrant` y `QDRANT_URL` para usarlo.
+> **Compilacion minima:** LanceDB se incluye por defecto, pero puede excluirse para binarios mas ligeros: `cargo build --no-default-features`. El runtime recurre de forma transparente a un backend vectorial no operativo.
+>
+> **Despliegues a escala:** Qdrant esta disponible como backend opcional. Compila con `--features vector-qdrant` y define `SYMBIONT_VECTOR_BACKEND=qdrant`.
 
 **Funciones de Gestion de Contexto:**
 - **Busqueda Multi-Modal**: Modos de busqueda por palabra clave, temporal, similitud e hibrido
@@ -393,15 +531,17 @@ cd crates/runtime && cargo run --example context_example
 | `http-api` | API REST con Swagger UI | No |
 | `http-input` | Servidor webhook con autenticacion JWT | No |
 | `cloud-llm` | Inferencia LLM en la nube (OpenRouter) | No |
-| `composio` | Integracion de herramientas Composio MCP | No |
-| `standalone-agent` | Combo Cloud LLM + Composio | No |
-| `cedar` | Motor de politicas Cedar | No |
+| `standalone-agent` | Meta-feature Cloud LLM | No |
+| `cedar` | Motor de politicas Cedar — autocableado desde `policies/*.cedar` al arranque | **Yes** |
 | `orga-adaptive` | Primitivas de razonamiento avanzado | No |
 | `cron` | Programacion cron persistente | No |
+| `cli-executor` | Subprocesos de CLI de IA gobernados (Claude Code, etc.) — Modo B | **Yes** |
 | `native-sandbox` | Sandboxing nativo de procesos | No |
 | `metrics` | Metricas/trazado OpenTelemetry | No |
+| `mcp-client` | Ejecucion de herramientas ToolClad basada en MCP via stdio (verificado por SchemaPin) | No |
+| `toolclad-browser` | Backend ToolClad de navegador (CDP) — solo un esqueleto de implementacion; devuelve un error explicito hasta que el backend CDP este disponible | No |
 | `interactive` | Prompts interactivos para `symbi init` (dialoguer) | Si |
-| `full` | Todas las funciones excepto enterprise | No |
+| `full` | Todas las funciones opcionales de runtime, vectoriales y de politicas | No |
 
 ```bash
 # Build with specific features
@@ -413,6 +553,89 @@ cargo build --features full
 
 ---
 
+## Plugins para Asistentes de IA
+
+Symbiont proporciona plugins de gobernanza propios para asistentes de programacion con IA populares, con tres niveles progresivos de proteccion:
+
+1. **Awareness** (por defecto) — registro consultivo de todas las llamadas a herramientas que modifican estado
+2. **Protection** — un hook de bloqueo aplica una lista local de denegacion (`.symbiont/local-policy.toml`)
+3. **Governance** — evaluacion de politicas Cedar cuando `symbi` esta en el PATH
+
+La configuracion de la lista de denegacion es agnostica respecto a la herramienta — el mismo `.symbiont/local-policy.toml` funciona con ambos plugins:
+
+```toml
+[deny]
+paths = [".env", ".ssh/", ".aws/"]
+commands = ["rm -rf", "git push --force"]
+branches = ["main", "master", "production"]
+```
+
+### Claude Code
+
+```bash
+# Install from marketplace
+/plugin marketplace add https://github.com/thirdkeyai/symbi-claude-code
+
+# Available skills: /symbi-init, /symbi-policy, /symbi-verify, /symbi-audit, /symbi-dsl
+```
+
+Consulta [symbi-claude-code](https://github.com/thirdkeyai/symbi-claude-code) para mas detalles.
+
+#### Modo B: subproceso gobernado de Claude Code
+
+Un agente con `metadata { executor = "claude_code" }` ejecuta su proceso hijo de CLI
+en el contenedor Docker/gVisor seleccionado, con almacenamiento efimero y canales
+privados de inferencia y herramientas del runtime. El agente `code_reviewer`
+incluido es el agente de referencia. Configura primero una imagen cacheada de
+CLI/Python, montajes explicitos del codigo fuente en el backend, herramientas
+ToolClad registradas con sus politicas Cedar, y `[managed_cli.inference]`. Consulta
+[contencion de la CLI administrada](/managed-cli-containment) para ver un ejemplo
+completo.
+
+```bash
+# /srv/source must map to an explicit backend mount in the control project.
+symbi run code_reviewer --target /srv/source --max-turns 12 --budget-timeout 15m
+
+# Add operator review for tools that require approval.
+symbi run code_reviewer --target /srv/source --approval-terminal
+```
+
+El proceso hijo no recibe ningun montaje directo del codigo fuente, ni acceso a la
+red externa, ni estado de sesion del host, ni credenciales del proveedor. Las
+herramientas registradas intermedian el acceso permitido a archivos y a Git. Las
+herramientas integradas y el descubrimiento automatico estan desactivados. Cada
+accion requiere autorizacion del runtime; aprobar el lanzamiento no autoriza las
+acciones posteriores. Los plugins no se cargan y `--plugin-dir` se rechaza.
+
+| Flag / ajuste | Proposito |
+|---|---|
+| `--target` | Directorio de codigo fuente asignado a un montaje explicito del backend |
+| `--max-turns` | Limite de la conversacion; 12 por defecto |
+| `--budget-timeout` | Limite de tiempo de reloj, incluida la inicializacion; `15m` por defecto |
+| `--budget-tokens` | Asignacion reservada de tokens de salida de inferencia; 100000 por defecto, no el total de tokens facturados |
+| `--approval-terminal` | Revision opt-in en la terminal de control para las aprobaciones obligatorias |
+| `[managed_cli.inference]` | Endpoint, modelo y variable de credencial explicitos del proveedor; la credencial se queda en el runtime |
+
+Los diarios de sesion firmados que se exigen residen en el almacenamiento privado
+`.symbiont/governed/`. El runtime imprime la clave publica de verificacion. Una
+aprobacion ausente, un almacenamiento de auditoria inseguro, un backend no
+disponible o una limpieza fallida no pueden reportar exito en silencio. Las
+respuestas de inferencia se almacenan en bufer, incluido SSE, por lo que la salida
+en streaming se retrasa.
+
+### Gemini CLI
+
+```bash
+# Install extension
+gemini extensions install https://github.com/thirdkeyai/symbi-gemini-cli
+```
+
+La extension de Gemini CLI proporciona una defensa en profundidad adicional mediante el bloqueo del manifiesto `excludeTools` y la aplicacion nativa de `policies/*.toml` a nivel de plataforma.
+
+Consulta [symbi-gemini-cli](https://github.com/thirdkeyai/symbi-gemini-cli) para mas detalles.
+
+---
+
 ## Configuracion
 
 ### Variables de Entorno
@@ -420,18 +643,37 @@ cargo build --features full
 Configura tu entorno para rendimiento optimo:
 
 ```bash
+# Required: 32-byte hex key used to encrypt persistent state.
+# Generate with: openssl rand -hex 32
+# `symbi init` writes one into .env automatically.
+export SYMBIONT_MASTER_KEY="..."
+
 # Basic configuration
 export SYMBI_LOG_LEVEL=info
 export SYMBI_RUNTIME_MODE=development
 
-# Vector search works out of the box with the built-in LanceDB backend.
-# To use Qdrant instead (optional, enterprise):
+# La busqueda vectorial funciona de inmediato con el backend LanceDB integrado.
+# Para usar Qdrant en su lugar (opcional, habilita la feature `vector-qdrant`):
 # export SYMBIONT_VECTOR_BACKEND=qdrant
 # export QDRANT_URL=http://localhost:6333
 
 # MCP integration (optional)
 export MCP_SERVER_URLS="http://localhost:8080"
 ```
+
+#### Variables de Entorno Relacionadas con Seguridad (auditoria posterior a v1.13.0)
+
+| Variable | Por defecto | Efecto |
+|---|---|---|
+| `SYMBI_INSECURE_ALLOW_ALL` | sin establecer | Cuando se establece a `1`, `symbi up` / `symbi run` usan la compuerta de politicas permisiva (toda llamada a herramienta y toda delegacion se permite). Equivalente al flag `--insecure-allow-all`. Se imprime un banner ruidoso en stderr. **Solo para desarrollo local.** Sin esto, el bucle de razonamiento es fail-closed y rechaza llamadas a herramientas y delegaciones hasta que se conecte un backend de politicas explicito. |
+| `SYMBI_REJECT_LEGACY_API_KEYS` | sin establecer | Cuando se establece a `1`, el validador de claves de API corta circuito el escaneo Argon2 O(n) obsoleto para las claves sin prefijo. Uselo inmediatamente despues de reemitir cada clave en formato `keyid.secret`. La ruta heredada se eliminara en la proxima release menor de todos modos. |
+| `SYMBI_UNSAFE_NATIVE_SANDBOX` | sin establecer | Requerido (ademas de `SYMBI_ENV=production`-no-establecido) para construir el runner de sandbox `native`. El feature Cargo `native-sandbox` ademas falla al compilar en builds release. El runner nativo no proporciona aislamiento y esta destinado unicamente a depuracion local. |
+| `SYMBI_TRUSTED_PROXIES` | sin establecer | Lista de permitidos CIDR para proxies reversos de confianza; `X-Forwarded-For` solo se honra desde estas direcciones. |
+
+Las siguientes variables de entorno fueron **eliminadas**:
+
+- `SYMBIONT_ALLOW_NO_JWT_AUDIENCE` — el verificador JWT ahora siempre requiere `aud`. (Eliminada en la auditoria posterior a v1.13.0; era una escotilla de escape no segura.)
+- `COMPOSIO_API_KEY`, `COMPOSIO_MCP_URL` — la integracion de Composio MCP fue eliminada por completo. Consulta `SECURITY_AUDIT.md` C3.
 
 ### Configuracion de Runtime
 
@@ -453,6 +695,51 @@ enabled = true
 backend = "lancedb"              # default; also supports "qdrant"
 collection_name = "symbi_knowledge"
 # url = "http://localhost:6333"  # only needed when backend = "qdrant"
+```
+
+### Aprobaciones con humano en el bucle
+
+Los requisitos de aprobacion del manifiesto y de los subcomandos siguen siendo
+obligatorios aunque Cedar permita la llamada. La cola compartida retiene cada
+peticion hasta que haya una decision autorizada, expire o se cancele. Un
+notificador atascado no puede bloquear otra superficie de aprobacion.
+
+- **CLI ordinaria o administrada:** anade `--approval-terminal`, opcionalmente con
+  `--approval-timeout 120` (de 1 a 3600 segundos). Revisa el JSON escapado completo
+  e introduce exactamente `approve <request-id>` en la terminal de control. Sin esa
+  bandera, las llamadas que requieren aprobacion fallan de forma cerrada.
+- **REST:** `GET /api/v1/approvals`, `POST /api/v1/approvals/{id}/approve` y
+  `.../deny` autenticados resuelven las peticiones pendientes.
+- **Shell:** Ctrl+G abre el panel Gate incluso durante un turno ocupado. Selecciona
+  con ↑/↓, pulsa Enter para revisar la peticion completa, desplazate y luego pulsa
+  `a` o `d`. `/gate` tambien abre el panel. Una fila de la lista por si sola no
+  aprueba.
+- **Chat:** un remitente de la lista de permitidos usa `/symbi gate show <id>` y
+  luego copia `/symbi gate approve <id> <review-digest>` desde la revision completa,
+  o envia `/symbi gate deny <id>`. Las aprobaciones que solo indican el ID se
+  rechazan. Los mensajes demasiado grandes necesitan otra superficie de revision
+  conectada.
+
+Las peticiones modificadas, expiradas o eliminadas requieren una revision nueva. La
+TUI reporta de forma explicita los errores de resolucion y los desenlaces
+desconocidos. La aprobacion es permiso para continuar a traves del gate; verifica la
+ejecucion real en la auditoria firmada de la ejecucion. Slack exige un signing
+secret no vacio y firmas de callback validas en todos los entornos. La antigua
+anulacion para callbacks sin firma ya no esta soportada. Consulta el
+[ciclo de vida de aprobaciones](/approval-lifecycle) para conocer los limites y los
+supuestos de confianza.
+
+Configura el tiempo de espera y los canales de aprobacion por chat en
+`symbiont.toml`:
+
+```toml
+[escalation]
+timeout_seconds = 120
+
+[[escalation.approval_channels]]
+platform   = "slack"
+channel_id = "C0APPROVERS"
+approvers  = ["U0ALICE", "U0BOB"]   # allowlisted sender ids; empty = nobody may approve via chat
 ```
 
 ---
@@ -499,7 +786,7 @@ brew install pkg-config openssl
 **Problema**: El agente falla al iniciar
 ```bash
 # Check agent definition syntax
-cargo run -- dsl parse your_agent.dsl
+cargo run -- dsl parse your_agent.symbi
 
 # Enable debug logging
 RUST_LOG=debug cd crates/runtime && cargo run --example basic_agent
@@ -546,4 +833,4 @@ Ahora que tienes Symbi ejecutandose, explora estos temas avanzados:
 5. **[Modelo de Seguridad](/security-model)** - Implementa politicas de seguridad
 6. **[Contribuir](/contributing)** - Contribuye al proyecto
 
-¿Listo para construir algo increible? Comienza con nuestros [proyectos de ejemplo](https://github.com/thirdkeyai/symbiont/tree/main/crates/runtime/examples) o sumergete en la [especificacion completa](/specification).
+¿Listo para construir algo increible? Comienza con nuestros [proyectos de ejemplo](https://github.com/thirdkeyai/symbiont/tree/main/crates/runtime/examples) o sumergete en la [especificacion completa](/dsl-specification).

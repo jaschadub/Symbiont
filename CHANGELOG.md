@@ -5,22 +5,1039 @@ All notable changes to the Symbiont project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.21.1] - 2026-10-07
+
+Fixes the cross-platform release build. 1.21.0 produced no downloadable
+binaries: only x86_64 Linux compiled, and the macOS, Windows and aarch64 Linux
+jobs each failed for a different reason, so the release carried no assets at
+all. Nothing in the runtime's behavior changes on x86_64 Linux.
+
+### Fixed
+
+- **macOS builds.** The supervisor store passed `mode_t` straight to the
+  variadic `openat`. That type is narrower than an `int` on Darwin, which C
+  variadics do not allow, so `symbi-sandbox-supervisor` would not compile for
+  either Apple target. The mode is now promoted explicitly.
+- **aarch64 Linux builds.** Non-replacing rename called glibc's `renameat2`
+  wrapper, which only exists from glibc 2.28 and is absent from the aarch64
+  cross image, leaving `undefined reference to renameat2` at link time. The
+  three call sites now issue the syscall directly through one shared helper.
+- **Windows builds.** The non-Unix `Lease` stub was missing `finish_cleanup`,
+  added to the Unix implementation in 1.21.0, so the Firecracker module failed
+  to compile for Windows even though it refuses to run there.
+- **Clippy on Rust 1.99.** `async-trait` 0.1.89 generated a doubled
+  `#[must_use]` that the 1.99 lint rejects; updated to 0.1.92. The deprecation
+  of `fetch_update` is allowed rather than fixed, because its replacement
+  `try_update` is newer than this workspace's 1.89 MSRV.
+
+## [1.21.0] - 2026-10-06
 
 ### Added
+
+- Optional OSS governed workflow improvements: versioned instruction artifacts,
+  frozen acceptance suites, offline evaluation of signed trial evidence, exact
+  operator approvals, guarded activation, rollback and independent signed exports.
+  `symbi improvement` manages the lifecycle; ordinary ORGA runs opt in with
+  `--improvement`. Existing agents and configurations keep their current behavior.
+  The explicit Rust runner API retains normal authorization and shared budgets.
+
+- A `landlock` command tier isolates one-shot commands, custom output parsers
+  and the managed CLI child with no daemon, image or helper binary. It is named
+  rather than numbered, so existing configurations are unchanged, and it refuses
+  to run where the kernel cannot enforce the declared profile. A one-shot command
+  receives a domain scoped to that call; the managed CLI child receives one for
+  its session, which is a weaker guarantee and documented as such.
+- Supervised Firecracker guests run commands, verified MCP sessions, governed
+  terminal sessions and managed CLI children. The host checks a fingerprint of
+  the guest service sources before sending a command and withholds the request
+  until that handshake passes. An independent supervisor owns VM lifetime, so a
+  VM cannot outlive it and an orphan is reclaimed against a verified process
+  identity rather than a reusable PID. Managed host isolation with jailer, host
+  limits and a watchdog is available opt-in.
+- Per-operation file grants replace ambient filesystem access. One-shot tools,
+  MCP workers and terminal sessions see only their declared inputs and a bounded
+  ceiling for new outputs, and Git source queries read through bounded repository
+  snapshots rather than the working tree.
+- Invocation identities survive retries and interruption across the HTTP input
+  server, the CLI, scheduled API invocations and coordinator messages. Dispatch
+  outcomes are recorded so an interrupted run can be inspected without replay,
+  and SDK reasoning runs require an explicit protected journal.
+
+- Native Linux development workspaces combine Landlock, seccomp, private
+  user/mount namespaces and independently supervised cgroups. Commands receive
+  declared input snapshots and new output files; publication waits for confirmed
+  descendant cleanup. Source queries, Git inspection, parser execution and
+  approved shell editing support the native route without Docker or a VM.
+- Managed CLI workers use private loopback networking and inherited tool and
+  inference connections. An explicit executable setting supports standalone
+  user-local installations without granting their containing home directory.
+  Read-only access to the primary process's maps/stat metadata supports the
+  validated standalone CLI toolchain.
+- `symbi init --sandbox landlock` provisions configuration for automatic user
+  supervision. The `dev-agent` profile adds prompts and flags for a separate
+  source repository, executable and inference settings, then generates read-only
+  tools, scoped policies and first-review instructions.
+- `symbi doctor` checks native workspaces, private loopback, inherited connections,
+  configured CLI startup and confirmed cleanup, with stage-specific remedies.
+- Worker capacity inspection links retained workers to their originating signed
+  runs and reports staging reservations and Landlock cgroup usage.
+
+### Fixed
+
+- Manual cron admission owns its intent before timer recovery can claim it;
+  refused identities retain the specific policy or identity failure and cannot
+  replay automatically after a policy change.
+- Project `.env` discovery stops at the nearest project root, with subprocess
+  initialization tests isolated from ambient developer configuration.
+- Update rustls to 0.23.45 and its affected cryptographic dependencies.
+- Publish every workspace dependency before its consumer, including both sandbox
+  crates; failed uploads cannot pass on progress messages. OSS sync validates the
+  filtered tracked tree and retains the public workflow test drivers.
+
+- Container ownership is preserved across runtime failures, so a crashed run no
+  longer abandons its worker.
+- Documentation states that every isolation tier -- landlock, Docker, gVisor and
+  Firecracker -- ships in the OSS runtime. The enterprise README and specifications
+  had listed gVisor and Firecracker as licensed features they never were.
+- Landlock grants are retained before worker creation; socket and signal scopes
+  prevent access outside the worker boundary. Capacity remains charged until
+  independent cleanup confirms that all descendants have exited.
+- Concurrent lease inspection tolerates completed records disappearing or being
+  atomically replaced without losing retained staging charges.
+- Timeout settlement closes abandoned provider requests only in the terminating
+  budget scope, preserves uncertain usage and avoids duplicate finish records.
+- Missing CPU and memory telemetry stays unavailable in the API and operations
+  console instead of appearing as measured zero usage.
+
+### Validation
+
+- Held-out routing rejects the frozen improvement candidate on all three trials;
+  governance does not claim to improve model accuracy by itself. A separate real
+  model and Landlock receipt workflow verifies exact approvals, missing-relay
+  refusal, interruption, signed reconciliation without replay and explicit recovery.
+  See [phase 2 findings](docs/governed-intake-phase2.md) and
+  [1.21.0 validation](docs/release-1.21-validation.md).
+
+### Deployment
+
+- Native development requires Linux Landlock ABI 6+, seccomp, unprivileged
+  user/mount/network namespaces, cgroup v2 delegation, a systemd user manager and
+  Python 3. Native interactive PTYs and macOS/Windows backends remain unsupported.
+- Drain active workers and restart existing supervisor services with the matching
+  runtime build when upgrading. Retain the durable supervisor state directory.
+
+## [1.20.0] - 2026-09-02
+
+Adoption release. Evaluating Symbiont no longer requires a paid API key, and
+the first commands in the getting-started guide no longer break in CI or bury
+the reader in output.
+
+### Added
+- **Local models work.** `OPENAI_BASE_URL` (and the OpenRouter/Anthropic
+  equivalents) can now point at any OpenAI-compatible server, so Ollama, vLLM,
+  LM Studio and llama.cpp all work with no cloud key. Two separate guards had
+  to give way: `reject_ssrf_url` was applied to the operator's own base URL,
+  and — less obviously — the HTTP client installed an SSRF-filtering DNS
+  resolver, so even after the URL check was dropped `127.0.0.1` worked while
+  `localhost` still failed at resolve time. The guard remains on every path
+  where a destination is attacker-influenced (ToolClad HTTP backends, SchemaPin
+  key discovery); only operator configuration is exempt, since it sits at the
+  same trust level as the API key beside it.
+- **`symbi dsl --check`** validates a `.symbi` file in one line and sets the
+  exit code, so it can gate CI. The `init` epilogue points at it. Previously
+  the advertised "Validate" step printed 164 lines of AST with no verdict.
+- **A Helm chart for the OSS runtime** at `deploy/helm/symbi`: policies mount
+  from a ConfigMap whose checksum rolls the pods on edit, probes hit
+  `/api/v1/health/live` and `/api/v1/health/ready`, and the pod runs non-root
+  with a read-only root filesystem. Charts were previously enterprise-only.
+- **Two offline examples** — `examples/policy-denial` (the Cedar gate deciding
+  allow/deny, and why the empty state is fail-closed) and
+  `examples/governed-tool` (a `.clad.toml` refusing out-of-set and malformed
+  arguments before a command exists). Both run with no API key.
+
+### Changed
+- **`symbi init` no longer panics without a terminal.** A non-TTY stdin now
+  implies `--no-interact`, so the guide's first command works in Dockerfiles,
+  CI steps and piped shells instead of aborting with a Rust backtrace.
+- **The README and getting-started guide lead with the paths that need no API
+  key.** The offline tool dry-run and policy evaluation come first; running an
+  agent, which needs a model provider, follows. Mirrored into all five
+  translations.
+- Release-binary signatures are verified against a fully anchored cosign
+  identity — the workflow file at a tag or `main` ref — rather than an
+  unanchored substring that a certificate from any workflow in the repo, or a
+  similarly-named repo, would have satisfied.
+
+### Deprecated
+- **`CustomDeliveryHandler` / `register_custom_handler`.** No implementation
+  or caller exists anywhere in the tree, so the scheduler's
+  `DeliveryChannel::Custom` lookup always misses. Deprecated rather than
+  removed because it shipped in published crates; slated for removal unless a
+  consumer appears.
+
+### Removed
+- **The `VectorDatabase` trait, merged into `VectorDb`.** Two identical traits
+  (modulo `health_check`) covered the same job, and every backend implemented
+  both — the `VectorDb` impls were pure forwarding shims onto `VectorDatabase`,
+  ~90 lines each for Qdrant and the no-op backend. Nothing consumed
+  `dyn VectorDatabase`; the factory, `ContextManager`, and the integration
+  suite all take `dyn VectorDb`. Backends now implement `VectorDb` directly.
+  Breaking for code that imported `symbi_runtime::context::VectorDatabase` —
+  switch to `VectorDb` (same methods plus `health_check`).
+- **The DSL `emit` statement and `on` event handlers.** Both parsed but
+  terminated in stubs: `emit` logged and discarded its payload, and an `on`
+  handler's body was never executed because nothing dispatches events. They
+  were absent from the DSL spec, the docs, the published tree-sitter grammar,
+  and every shipped agent — the interpreter accepted syntax the language does
+  not define, and silently doing nothing is worse than a parse error. `emit`
+  and `on` are no longer keywords, so they are usable as identifiers, matching
+  the tree-sitter grammar.
+- **The shell's `/exec` and `/verify` commands.** Both were registered,
+  completable, documented placeholders that returned "not yet connected".
+  Removed from the registry, help, and docs until there is something to wire
+  them to.
+
+### Fixed
+- Two lints Rust 1.98 introduced (`useless_format`, `drain_collect`).
+  `result_large_err` is allowed at module scope in the axum handlers and the
+  reasoning loop's typestate transitions, with the reasoning recorded: boxing
+  there fights `IntoResponse` and puts an allocation on the loop's hot path.
+- Patched `nanoid` (GHSA-2v37-7h3g-55p8), `dompurify`
+  (GHSA-55q2-fjhq-7xh7), `postcss`, `js-yaml` and `brace-expansion` in the
+  bundled UIs.
+
+- **Latent panics in three CLI truncation helpers.** `symbi run`, `symbi
+  cron`, and `symbi skills` truncated display strings with raw byte slicing
+  (`&s[..max]`), which panics when the cut lands inside a multi-byte UTF-8
+  character — and job names, skill names, and input previews are user data.
+  All now delegate to `text_util::truncate_utf8`, as does the equivalent
+  boundary walk in `communication::remote`.
+
+### Security
+- **`h2` upgraded to 0.4.19** (RUSTSEC-2026-0258, unbounded empty DATA
+  frames). A remote peer could hold an HTTP/2 connection open sending empty
+  DATA frames without bound — a denial-of-service vector on any surface the
+  runtime serves. Caught by the pre-release `cargo audit` sweep, which is why
+  it runs.
+
+## [1.19.0] - 2026-07-28
+
+### Added
+- **Mode B runs are journalled as they happen.** The policy gate authorizes a
+  managed-CLI spawn once and has no say over the subprocess afterward, which
+  left everything it did invisible. The child now runs with `--output-format
+  stream-json`, and `CliExecutor` gained an optional stdout line sink
+  (`with_stdout_line_sink`) so its events can be observed while the run is still
+  in flight. `symbi run` uses it to append each tool call, tool result, and the
+  closing summary — turn count and permission denials — to
+  `.symbiont/audit/mode-b-<session>.jsonl`. Writing live rather than at exit
+  matters: a run killed by the wall-clock timeout never returns its buffered
+  stdout at all, so a post-hoc parse would lose the trail exactly when it is
+  most wanted. Values under keys like `token`/`api_key`/`password` are redacted
+  and oversize arguments truncated, so a `Write` call does not put a whole file
+  in the audit log. `parse_output` folds the stream back into the same shape the
+  `json` format returned, so the printed result is unchanged.
+- **Surface-scoped Cedar policies.** `GateOptions` takes a `surface`, and the
+  loader now layers `policies/<surface>/*.cedar` on top of the shared
+  `policies/*.cedar` set. Flat files stay global, so nothing changes for an
+  existing deployment until it creates a subdirectory — but a grant written for
+  one entry point can now be kept out of the others' gates. `symbi up` builds
+  two gates instead of one (`coordinator` and `http-input`, sharing the same
+  escalation queue), since the chat coordinator only gates what the model says
+  back while the HTTP input server dispatches real tool calls; `symbi run`,
+  `managed_cli` and `symbi-eval` name their own surfaces. This closes a latent
+  grant: `policies/orchestrator.cedar` is written for `symbi shell`'s tools
+  (`read_file`, `edit_file`, `search`, `save_artifact`) but, being flat, was
+  loaded into the coordinator's gate too — harmless only because that surface
+  executes no tools. `symbi shell` now prefers
+  `policies/shell/orchestrator.cedar` and falls back to the flat path, and the
+  policy this repo ships has moved to the scoped location. `symbi init`
+  scaffolds no shell policy at all — the shell's tools stay fail-closed until
+  an operator writes one, rather than every new project starting with file
+  read/write grants it never asked for.
+- **Agent-to-agent delegation (in-process).** The chat coordinator now offers a
+  `delegate` tool listing the agents loaded from `./agents`; calling it runs that
+  agent as a bounded sub-loop and returns its reply to the model as a correlated
+  tool result. Recursion is bounded by `max_delegation_depth` (default 3) with
+  cycle detection, and every failure — unknown target, cycle, depth exceeded,
+  policy denial, or a sub-agent that does not complete — surfaces as an honest
+  error rather than a silent or empty success. A delegated run uses an id derived
+  from the target's name, so its policy decisions and journal entries are
+  attributable and can be named in a Cedar policy, and it is offered the
+  coordinator's read-only monitoring tools (not `delegate` — it has no target
+  registry of its own). Per-agent toolsets, ToolClad/MCP tools on the chat
+  surface, and operator-visible accounting of sub-loop token spend are follow-ups.
+
+### Security
+- **Resolving a held action now requires an admin key.** `POST
+  /escalations/{id}/approve` and `/deny` read the caller's API key only to
+  attribute the decision, never to authorize it, so any key scoped to any
+  endpoint could release actions the gate had deliberately held for human
+  review — including the escalation an agent's own scoped key had just
+  triggered. Both routes now go through `require_admin` first. The legacy
+  single-token `SYMBIONT_API_TOKEN` path is unchanged and still admin by
+  design.
+- **HTTP input no longer serves requests when no authentication is
+  configured.** With neither a static token nor JWT verification set up, the
+  auth middleware fell through and accepted the request, so a deployment that
+  simply forgot to configure auth exposed webhook-triggered agent runs to
+  anyone who could reach the port. It now logs the misconfiguration and returns
+  401 — failing closed rather than open.
+- **Cedar policy files in JSON form are loaded instead of denying everything.**
+  `symbi up` read every `policies/*.cedar` as raw Cedar source. The file this
+  repo ships is a JSON array of policy entries, so parsing failed, the gate
+  ended up with an empty policy set, and *every* action was denied — including
+  `respond`, which is why an affected chat surface answered nothing at all
+  rather than reporting a policy error. The loader now detects both forms.
+
+### Fixed
+- **Mode B no longer forces `dontAsk` on every agent.** The managed CLI child
+  was spawned with `permission_mode: "dontAsk"` hardcoded, so every Mode B
+  session ran without prompting regardless of what the agent declared. The
+  spawn is policy-gated once, but nothing gates the child afterward, which made
+  the hardcoded value a blanket grant no agent had asked for. It is now read
+  from the agent's `metadata` block; unset omits `--permission-mode` entirely
+  and the child keeps its own default, which still prompts for anything outside
+  `allowed_tools`. An agent that must run unattended declares
+  `permission_mode = "dontAsk"` and owns the trade-off.
+- **CWD-swapping tests no longer race.** `secrets_store`'s tests serialize on
+  `serial_test`'s binary-wide lock while `orchestrator_executor::with_cwd` used
+  a private mutex. The two locks knew nothing about each other, so both mutated
+  process-global CWD at once and whichever finished second tried to restore a
+  directory the other had already deleted — a reliable failure under
+  `cargo test --workspace` that never reproduced in isolation. It had also been
+  writing a stray `crates/symbi-shell/.symbi/secrets.enc` into the tree.
+- **CI clippy now runs `--all-targets`,** so a warning inside a `#[cfg(test)]`
+  module can no longer merge green.
+- **`http_input` is now a governed loop, not a free-rein one.** The webhook
+  handler's on-demand LLM path previously ran a hand-rolled tool-calling loop
+  with none of the runtime's governance: no policy gate, no journal, no circuit
+  breakers, no token/iteration budget — yet it advertised the full ToolClad
+  toolset (including `nmap_scan`, whose `extra_flags` the model supplies, and
+  `curl_fetch`) and ran approved calls through the raw `ToolCladExecutor::execute_tool`,
+  bypassing the circuit-breaker-aware dispatch the executor already implements.
+  It is started on every `symbi up` and reached over HTTP with no
+  administrator in the loop. The hand-rolled loop is deleted; the handler now
+  drives `ReasoningLoopRunner::run`, so every model-proposed tool call passes
+  through a `ReasoningPolicyGate` before it can execute, dispatch goes through
+  the same `ActionExecutor`/circuit-breaker path other entry points use, and
+  the run is recorded to a journal.
+  - `start_http_input` gains a `policy_gate: Option<Arc<dyn ReasoningPolicyGate>>`
+    parameter; `symbi up` passes the same Cedar+escalation gate it already
+    builds for Coordinator Chat (hoisted out so both share it instead of each
+    risking its own wiring). `None` resolves to **fail-closed**
+    (`DefaultPolicyGate::new()`), never permissive — an embedder that forgets
+    to pass a gate gets denial for every tool call, not free rein.
+  - **Breaking `HttpInputServer` API change:** `with_toolclad_executor(Arc<ToolCladExecutor>)`
+    is replaced by `with_executor(Arc<dyn ActionExecutor>)` (defaults to
+    `build_tool_executor(Path::new("tools"))` when unset — `ToolCladExecutor`
+    when `tools/*.clad.toml` manifests are present, otherwise the honest
+    `UnavailableToolExecutor`). New `with_inference_provider(Arc<dyn InferenceProvider>)`
+    and `with_policy_gate(Arc<dyn ReasoningPolicyGate>)` builders.
+  - **Bedrock: tool results and tool-call echoes reaching the model.**
+    `http_input::bedrock::build_converse_request` read a message's `content`
+    field with `.as_str()`, which is `None` once a turn carries tool
+    calls/results (`content` becomes an array of blocks there) — every tool
+    result, and the assistant's own prior tool_use, silently flattened to an
+    empty text block on the Bedrock path. The model never saw its own tool
+    output and kept re-issuing the same call. The old hand-rolled loop's
+    in-iteration duplicate-call dedup partly masked this by refusing to
+    re-execute an identical (tool, input) pair within one turn; removing the
+    loop removes that mask. Fixed by converting each unified content block
+    (`text` / `tool_use` / `tool_result`) into its Bedrock Converse
+    equivalent instead of flattening to a bare string; covered by a new
+    regression test (`tool_result_content_reaches_the_model_as_non_empty_text`)
+    that builds a real tool-result turn via `Conversation::to_anthropic_messages`
+    and asserts the built request carries the actual result text.
+  - **Response shape (`/webhook` JSON body):**
+    - `tool_runs[].tool` is now the label the governed conversation actually
+      recorded (`ConversationMessage.tool_name`, i.e. the executor's
+      `Observation::source`), not always the bare model-supplied tool name.
+      For calls dispatched through `ToolCladExecutor` this carries its own
+      `toolclad:<name>` naming convention; denied or schema-rejected calls
+      never reach the executor and keep the bare name. This is stated rather
+      than papered over: guessing at stripping a prefix that may not even be
+      ToolClad's (agent delegation uses `delegate:<target>`) would risk
+      fabricating a value that was never actually recorded.
+    - `tool_runs` can now include denied and schema-rejected calls (with an
+      `output_preview` of `"[Policy denied] ..."` or
+      `"[Schema validation failed] ..."`) — previously only executed,
+      errored, timed-out, or duplicate-skipped calls appeared, since there
+      was no gate to deny anything.
+    - `input` and `output_preview` are reconstructed from the same governed
+      conversation and are faithful to what the model actually sent/saw: input
+      is the assistant's original tool-call arguments (correlated by
+      `tool_call_id`), and `output_preview` is a 500-byte UTF-8-safe
+      truncation of the tool-result content, matching the previous semantics.
+    - New fields: `termination_reason` (the loop's `TerminationReason`,
+      e.g. `"Completed"`, `{"PolicyDenial":{"reason":"..."}}`) and
+      `iterations` (loop iteration count).
+    - `provider` is now lowercase (`"anthropic"`, `"openai"`, `"bedrock"`, …)
+      — the `InferenceProvider::provider_name()` convention — instead of the
+      previous `LlmProvider`'s `Display` capitalization (`"Anthropic"`).
+  - **`cloud-llm` feature now required for the LLM/tool-calling path.** The
+    provider is a `CloudInferenceProvider` (gated on the `cloud-llm` feature,
+    already enabled by every real consumer — the `symbi` binary, `symbi-shell`,
+    `repl-cli`); building `symbi-runtime` with `http-input` alone (as
+    `cargo test -p symbi-runtime --features http-input` does) still compiles
+    and the webhook/auth/routing layer is fully tested, but that build has no
+    `InferenceProvider` to construct, so the LLM path reports "no inference
+    provider configured" — the same outcome as "no API key" today.
+  - **Custom ToolClad argument types:** `start_http_input` (the production
+    entrypoint `symbi up` uses) still loads `toolclad.toml` custom argument
+    types, unchanged. `HttpInputServer::start()`'s own generic default
+    (`build_tool_executor`, used when no executor was set via `with_executor`
+    — today only exercised by direct `HttpInputServer` construction in tests)
+    has no project-root context to find that file and does not load them; no
+    shipped manifest in this repo uses a custom type, so this has no effect
+    on the current tool set.
+- **Consolidation continued: DSL `tool_call`, `symbi-eval`, and chat-adapter
+  responses now go through a policy gate.** Three more paths identified in
+  the same census acted on model output with no governance:
+  - **DSL `tool_call` builtin.** `reasoning_builtins::builtin_tool_call` took
+    `_ctx: &ReasoningBuiltinContext` — the leading underscore was the bug —
+    so `ctx.reasoning_policy_gate` was never read and every DSL `tool_call()`
+    dispatched straight to the executor. It now evaluates a
+    `ProposedAction::ToolCall` through the gate before dispatch, same as its
+    neighbour `builtin_reason`: a caller-installed gate if present, else the
+    fail-closed `DefaultPolicyGate::new()` — never permissive by omission. A
+    denial (or a gate `Modify` that replaces the call with a non-tool-call
+    action) returns `{"status": "denied", "reason": "..."}` rather than a
+    Rust-level error, matching this builtin's existing
+    `"not_executed"`/`"error"` result shapes. `repl_core::RuntimeBridge`
+    gained `set_reasoning_policy_gate`, and `symbi-shell` now installs its
+    Cedar+escalation gate there too, so DSL scripts run in the shell share
+    the same governance as the orchestrator and fleet runner instead of
+    silently falling back to the default. (Other `RuntimeBridge`
+    constructors — `repl-cli`, tests, the DSL evaluator fuzz target — are
+    unchanged and stay at the fail-closed default.)
+  - **`symbi-eval`.** Replaced its hardcoded
+    `DefaultPolicyGate::permissive_for_dev_only()` — the only non-test
+    permissive gate left in the tree, guarding an executor that shells out
+    via `bash -c` for non-mock tasks — with the same `governed_gate` ladder
+    every other entry point uses: fail-closed by default, Cedar when
+    `policies/*.cedar` is present, permissive only via
+    `SYMBI_INSECURE_ALLOW_ALL=1` (with the same warning banner `symbi
+    run`/`symbi up` print). **Behavior change for the `symbiont-eval`
+    harness:** a non-mock eval task run against a checkout with no
+    `policies/*.cedar` will now have every tool call denied unless
+    `SYMBI_INSECURE_ALLOW_ALL=1` is set — previously every such task ran
+    unrestricted.
+  - **Chat adapters (Slack/Teams/Mattermost).** `LlmAgentInvoker::invoke`
+    (`symbi up`) completed against the LLM and handed the text straight to
+    `ChannelAdapterManager`, which publishes it under the bot identity with
+    no gate in between (`channel-adapter` is a community-edition crate with
+    no policy engine of its own). `invoke()` now evaluates the completion as
+    a `ProposedAction::Respond` through the same Cedar+escalation gate
+    `symbi up` already builds for the coordinator and HTTP input, via a new
+    `gate_chat_response` helper, before returning it — a denial becomes an
+    `Err` that `ChannelAdapterManager` logs as an agent error and never
+    forwards to `send_response`. A full `ReasoningLoopRunner` port wasn't
+    used here since `AgentInvoker::invoke` returns one completion, not a
+    multi-turn loop with its own conversation/budget; a single gate-checked
+    `Respond` was used instead. Note: none of the shipped gates
+    (`DefaultPolicyGate`, `CedarPolicyGate`, `EscalationGate`) currently deny
+    a bare `Respond` action, so this is architectural readiness for
+    operator-authored policies more than an immediate behavior change today.
+
+  Left ungated in this pass, tracked rather than overlooked:
+  `builtin_tool_call` still builds a fresh `CircuitBreakerRegistry::default()`
+  per call, so breaker state has no memory across DSL `tool_call()`
+  invocations.
+- **Pattern builtins (`director`, `debate`, `map_reduce`) are now bounded.**
+  These don't perform a host action — no tool executes, so there is nothing
+  for a policy gate to evaluate — but each turns one DSL call into an
+  unbounded number of downstream inference calls: `director`'s `assignments`
+  list is model-authored (the plan JSON) with one inference call issued per
+  assignment, `debate`'s `rounds` is caller-supplied with no upper bound, and
+  `map_reduce`'s map phase fanned every `inputs` item out via `try_join_all`
+  simultaneously with no concurrency limit. `crates/repl-core/src/dsl/pattern_builtins.rs`
+  now enforces named caps instead:
+  - `MAX_DIRECTOR_ASSIGNMENTS` (20) and `MAX_DIRECTOR_FIELD_LEN` (4,000 bytes):
+    a `director` plan proposing more assignments, or a `worker`/`subtask`
+    field longer than either bound, is rejected with an honest error before
+    any per-worker inference runs — the plan is never silently truncated,
+    it fails outright.
+  - `MAX_DEBATE_ROUNDS` (20): `debate` rejects a `rounds` value above the cap
+    before the first writer/critic call, so no partial debate runs on a
+    rejected round count.
+  - `MAX_MAP_REDUCE_CONCURRENCY` (8): unlike the two caps above, this one
+    does **not** error. The map phase now runs in chunks of at most this
+    many concurrent inference calls (chunked joins) instead of firing every
+    input at once; every input is still processed and no result is dropped,
+    it just runs in bounded-size batches. This is a scheduling clamp, not a
+    data cap, so there is nothing to reject.
+- **Mode B now requires an explicit tool allowlist.** The Mode B spawn
+  (`src/commands/managed_cli.rs`) was already gated — a synthetic
+  `claude_code` `ProposedAction` goes through the policy gate before the
+  subprocess starts — but nothing gates the child afterward: it runs with
+  `permission_mode: "dontAsk"` for the life of the session, and when the
+  agent's DSL metadata carries no `allowed_tools`, `--allowedTools` was
+  omitted entirely (`ClaudeCodeAdapter`), so the child fell back to its own
+  default tool access. One gate decision was authorizing a whole,
+  unrestricted session rather than a bounded one. Per-action gating would
+  require the child to call back into Symbiont's gate for every tool use —
+  a trust-boundary redesign that stays explicitly out of scope. Instead,
+  `run_claude_code` now refuses to spawn when `allowed_tools` is empty, with
+  an error naming the agent, pointing at the `metadata { ... }` block of its
+  `.symbi` file, and stating plainly that Symbiont's gate authorizes the
+  spawn once and cannot restrict the child afterward —
+  `allowed_tools` becomes the child's own `--allowedTools` allowlist, the
+  only in-session restriction that exists post-spawn. **Behavior break:**
+  any existing agent with `executor = "claude_code"` and no `allowed_tools`
+  in its metadata, which previously ran with the child's unrestricted
+  defaults, now refuses to spawn until `allowed_tools` is added. The shipped
+  reference agent (`agents/code_reviewer.symbi`) already declares one and is
+  unaffected. No bypass flag was added for this check.
+- **UTF-8 panic on model-controlled summary text (`reasoning::knowledge_bridge`).**
+  `persist_learnings` joined assistant messages into a working-memory summary
+  and truncated over-long results with `&combined[..2000]`, a raw byte-index
+  slice. Because the content is assistant (model) output, a multi-byte
+  character straddling byte 2000 panics the whole persistence path — reachable
+  from the now-governed chat/HTTP RAG flow, i.e. remotely triggerable. The
+  truncation now goes through a new `text_util::truncate_utf8` helper that
+  backs up to the nearest character boundary; `http_input::server` had its own
+  copy of the same logic (`truncate_utf8`, used for system-prompt and
+  tool-result previews) which is now deduplicated to this one shared
+  implementation instead of two subtly-independent ones. Covered by a
+  regression test that constructs a string whose 2000th byte falls inside a
+  2-byte `'é'` and asserts truncation completes without panicking.
+- **ToolClad shell backend now enforces the manifest's `timeout_seconds`.**
+  `ToolCladExecutor::execute_tool` computed the manifest's timeout into a
+  `_timeout` binding and never used it, then called the blocking
+  `std::process::Command::output()`, which waits for the child to exit no
+  matter how long that takes — a hung shell tool (bad args, a command
+  reading from stdin that never arrives, or one that simply never exits)
+  hung its caller indefinitely. An outer `tokio::time::timeout` at some call
+  sites only abandons the *future*; the child keeps running regardless. The
+  shell backend now spawns the child with piped stdout/stderr, drains both
+  pipes on background threads (polling `try_wait()` while leaving the pipes
+  unread would let a child that fills its OS pipe buffer block forever,
+  defeating the timeout independent of how the wait loop works), and waits
+  with a deadline; on expiry it kills the child, reaps it, and returns an
+  error naming the tool and the configured limit. Uses a plain `kill()`
+  rather than the SIGTERM→grace→SIGKILL escalation `cli_executor` uses for
+  long-running interactive CLI sessions — ToolClad shell tools are short,
+  template-built one-shot commands (`curl`, `nmap`, …) with no in-flight
+  state worth flushing, and by construction anything reaching this path has
+  already failed to exit on its own, so the extra process-group handling and
+  nested grace-period wait would add real complexity for no proportionate
+  benefit. Success/error shapes, captured stdout/stderr, and duration
+  measurement are unchanged for the (still-common) case that finishes in
+  time. No new crate dependency was needed. Covered by a regression test
+  (`sleep 5` against a 1s `timeout_seconds`, asserting the call returns a
+  named timeout error in well under the full 5s) and a normal-success test
+  asserting stdout capture is unaffected.
+- **Scheduler policy gate wired to cron runs (ahead of real task bodies, not
+  a claim that cron is fully governed today).** `scheduler::policy_gate::PolicyGate`
+  was fully implemented, exported, and unit-tested, but had zero call sites;
+  `CronJobDefinition.policy_ids` was populated when DSL `schedule` blocks
+  declared a `policy` and then never read anywhere. Cron is not an ungoverned
+  loop *today* only because its task body is a placeholder that shells out to
+  `echo … sleep 1` (`scheduler/task_manager.rs`); this wires the check in now,
+  at the one seam every cron-triggered run already passes through, so that
+  placeholder can be replaced with real agent execution later without the
+  gate being forgotten.
+  - `CronScheduler` gains an optional `policy_gate` (installed via
+    `with_policy_gate(Arc<PolicyGate>)`, mirroring the existing
+    `with_agentpin_verifier` builder — an explicit opt-in, not a fail-closed
+    default; `None` runs every job same as before). It is evaluated in both
+    `trigger_now` and the tick loop, immediately before the agent scheduler
+    is invoked — the same choke point both paths already share to run
+    identity verification — so neither the manual nor the automatic
+    cron-execution path can reach the agent scheduler around it. A `Deny`
+    refuses the run; `RequiresApproval` also refuses it (logged as such)
+    rather than auto-allowing, since cron has no approval-queue wiring to
+    route it to and silently allowing would defeat the point of installing a
+    gate. Both are recorded as a `Failed` run (mirroring how identity
+    failures are recorded) and counted in a new `CronMetrics::runs_skipped_policy`.
+  - `ScheduleContext` is populated only from data already tracked:
+    `consecutive_failures`/`total_runs` come straight from the job record;
+    `system_load` is left at its default (`0.0`) because no system-level load
+    metric is wired into the cron scheduler — stated here rather than
+    fabricating a reading, so a `SystemLoadExceeds` rule cannot fire from
+    cron yet.
+  - Not wired into `symbi up` by default in this change, matching how
+    `with_agentpin_verifier` itself is available but not called there today —
+    an embedder opts in explicitly rather than the CLI silently gating (or
+    silently not gating) cron jobs.
+  - **Adjacent finding, not fixed here (out of scope):** the tick loop's
+    pre-existing AgentPin identity-check-failure branch contains
+    `*active_c.write() = active_c.read().saturating_sub(1);` — acquiring a
+    write guard and a read guard on the same non-reentrant `parking_lot::RwLock`
+    within one statement, which self-deadlocks. It has no test coverage via
+    the tick loop (only via `trigger_now`, which doesn't hit this line), so
+    it has never been observed to hang in CI. The equivalent line added for
+    the policy-gate refusal path here was written as two separate guard
+    acquisitions specifically to avoid this trap.
+
+## [1.18.0] - 2026-07-22
+
+### Added
+- **MCP-backed tool execution (`mcp-client` feature).** ToolClad `.clad.toml`
+  manifests can route a tool to an upstream Model Context Protocol server over
+  stdio via an `[mcp]` block (`server`/`tool`/`field_map`), with servers declared
+  in `mcp-config.toml` (per-project, then `~/.symbiont/`). This replaces the
+  previous placeholder in `symbi run` and the DSL `reason()`/`tool_call()`
+  builtins with real execution; when no `tools/` manifests are present those
+  paths now return an honest "no tool backend" error instead of a fabricated
+  success. Invocation is SchemaPin-verified fail-closed by default (TOFU key
+  pinning; a post-pin key swap at the provider key URL is rejected as
+  `KeyMismatch`), with `ToolCladExecutor::with_mcp_verification(false)` as a
+  local-dev opt-out. The default build does not pull the MCP client transport.
+  See `docs/mcp-tools.md`.
+- **Live RAG retrieval in interactive chat.** The WebSocket coordinator now wires
+  a real `KnowledgeBridge` (over `StandardContextManager` + LanceDB) into the
+  reasoning loop, so knowledge retrieval and the `recall_knowledge` /
+  `store_knowledge` tools run for live agents. RAG turns on when built with the
+  `vector-lancedb` feature and an embedding provider is configured
+  (`EMBEDDING_*` / `OPENAI_API_KEY`); otherwise it stays off with a clear log.
+  The previously-silent mock-embedding fallback now warns loudly.
+  `SYMBIONT_REQUIRE_REAL_EMBEDDINGS=1` makes the general runtime's context
+  manager refuse to start without a configured provider; chat RAG does not
+  consult it — with no provider the bridge is simply not built and chat runs
+  without retrieval.
+- **Reasoning-loop robustness (issue #20).** The ORGA loop now fails over on
+  model refusal and no-progress turns instead of stalling; Anthropic requests
+  support prompt caching and extra-parameter passthrough; the output-token cap
+  is configurable; and 1M-context models report the correct context-window size.
+
+### Fixed
+- **Browser tools no longer fabricate success.** `mode = "browser"` ToolClad
+  tools were wired live but had no CDP backend, so every command returned a
+  fake `"status":"success"` envelope. They now run argument validation and the
+  scope deny-by-default guard, then return an honest error (gated behind the new
+  `toolclad-browser` feature) until a real Chrome DevTools Protocol backend is
+  added. No build enables browser execution by default.
+- **MCP tool arguments keep their declared JSON types.** A manifest arg typed
+  `integer`/`number`/`boolean`/`array`/`object` is sent to the upstream MCP
+  server as the matching JSON type instead of an always-quoted string.
+- **MCP tool calls are time-bounded.** A per-call timeout (the tool's
+  `timeout_seconds`, capped by the loop's `tool_timeout`) prevents a hung or slow
+  MCP server from hanging the caller, including the DSL `tool_call()` path.
+- **Anthropic refusals are surfaced.** A model refusal now maps to
+  `FinishReason::Refusal` (with a warning on no-progress turns) instead of
+  silently no-op'ing tool-driven agents.
+- **Backend-less runners are honest.** `symbi run` and the DSL reasoning builtins
+  return a clear "no tool backend" error rather than a fabricated success when no
+  tools are configured.
+
+### Security
+- **`opentelemetry_sdk` 0.31 → 0.32** — clears GHSA-w9wp-h8wv-79jx (W3C Baggage
+  unbounded allocation).
+- **`serde_with` → 3.21.0** — clears GHSA-7gcf-g7xr-8hxj (KeyValueMap
+  serialization panic on empty sequence/map entries).
+- **`dompurify` → 3.4.12** (`symbi-a2ui`) — clears GHSA-c2j3-45gr-mqc4
+  (`CUSTOM_ELEMENT_HANDLING` sanitizer bypass).
+- **`crossbeam-epoch` → 0.9.20** — clears RUSTSEC-2026-0204 (invalid pointer
+  dereference in the `fmt::Pointer` impl for `Atomic`/`Shared`); `spin` bumped to
+  0.9.9 to drop the yanked 0.9.8.
+
+### Changed
+- **`ethnum` → 1.5.3** — 1.5.2 no longer compiles on current stable Rust.
+
+## [1.17.0] - 2026-07-01
+
+### Security
+- **Residual trust-boundary hardening.** Closes three audit residuals with
+  opt-in, default-off primitives (existing behavior unchanged): a `closed_world`
+  flag on `KeyStoreConfig` (and `LocalKeyStore::pin_key_strict`) that rejects
+  trust-on-first-use of un-provisioned identifiers (A-10 first-use poisoning);
+  `route_grounded_untrusted` / `ticket_severity_untrusted`, which cap
+  attacker-controlled ticket text at `High` so it cannot forge a `Critical` and
+  reach exec escalation (A-02b); and `verify_chain_anchored`, which verifies a
+  critic-audit chain against an external length + head-hash anchor to detect
+  tail-truncation (D-05).
+- **Dependency advisory.** Updated `anyhow` to 1.0.103 to clear RUSTSEC-2026-0190
+  (unsoundness in `Error::downcast_mut()`).
+
+### Added
+- **AWS Bedrock provider (off-by-default `bedrock` feature).** `LlmClient` /
+  `CloudInferenceProvider` can target Bedrock-hosted models via the Converse API,
+  SigV4-signed with the standard AWS credential chain. Select with
+  `BEDROCK_MODEL_ID` + `AWS_REGION`. Non-streaming; tool-use supported. Enabling
+  the feature pulls `aws-config`/`aws-sigv4`/`aws-credential-types`; default
+  builds are unaffected.
+- **`.symbi` agents load into the symbi-shell fleet.** DSL agents in `./agents`
+  are parsed and registered alongside TOML manifests — addressable with `@name`
+  and run through the same governed loop. Declared capabilities map to tools
+  (read/write/execute → read_file+search/edit_file/shell; unknown capabilities
+  grant nothing; `delegate` stays orchestrator-only). Agents declaring a sandbox
+  tier the shell cannot provide (`Tier2`+ or `sandbox: strict`/`moderate`) are
+  refused with a pointer to `symbi up`/`symbi run`, never run unsandboxed.
+- **Fleet agents can execute their manifest tools.** Agents loaded from
+  `./agents` now run through the same governed reasoning loop as the
+  orchestrator (Cedar gate + executor + human approval). A tool is callable
+  only if it is in the agent's manifest `tools` AND `policies/orchestrator.cedar`
+  permits it. `delegate` stays orchestrator-only; `shell` still requires
+  `--allow-shell`. Agents with no tools remain conversational (and keep the
+  no-fabrication guard). A one-time hint appears when tools are denied solely
+  because `policies/orchestrator.cedar` is missing.
+
+### Changed
+- **MSRV raised to Rust 1.89.** The dependency tree now requires it
+  (`datafusion` 51 needs 1.88, `smol_str` 0.3.5 needs 1.89). The new MSRV CI job
+  surfaced that the previously-declared 1.86 no longer builds; `rust-version`,
+  CI, and the docs are updated to 1.89.
+- **Developer-onboarding docs and contributor tooling.** Fixed the "Your First
+  Agent" tutorial (`symbi dsl -f` / `symbi run` instead of the nonexistent `dsl
+  parse` subcommand and the arg-ignoring `basic_agent` example), documented
+  `cargo install symbi` and the required LLM API key, added a root
+  `CONTRIBUTING.md` plus GitHub issue/PR templates, and registered all runtime
+  examples explicitly (`context_persistence_test` renamed to
+  `context_persistence`). CI now lints feature-gated code at `--all-features`
+  with `-D warnings`, tests the major features, and verifies the 1.86 MSRV.
+- **Documentation accuracy pass.** Corrected the feature-flag reference table
+  (`cron` is default-on; `cloud-llm` covers OpenRouter/OpenAI/Anthropic; added
+  `session`/`toolclad-session`/`minimal` rows), replaced the README DSL example
+  with valid real-grammar syntax, fixed the `agents/` example count and its
+  stale `dsl parse` / `basic_agent` commands, pointed the README build badge at
+  the test workflow, refreshed the `docs/contributing.md` crate layout, and
+  standardized the install-script URL. The `SYMBIONT_MASTER_KEY`-not-set warning
+  now shows how to generate a key, and `symbi agents-md` no longer refers to the
+  legacy `.dsl` extension.
+
+### Fixed
+- **`.symbi` agents now load with the real DSL grammar.** symbi-shell parses
+  `.symbi` files with the tree-sitter `symbi-dsl` parser (the same one `symbi
+  run` uses) instead of a minimal subset parser, so the full-grammar agents in
+  `agents/` actually load. The fail-closed sandbox gate now refuses any agent
+  that declares a `with { sandbox = ... }` tier (the in-process shell provides no
+  container isolation) — run those via `symbi up`/`symbi run`.
+- **symbi-shell fleet agents no longer fabricate tool execution.** Fleet agents
+  are conversational only (no executor wired yet), so an agent prompted like a
+  scanner would *describe* running a command and then invent its output — e.g.
+  fabricated vulnerability findings. Every fleet agent's system prompt now carries
+  an explicit constraint: it cannot execute tools/commands/network, and must never
+  claim to have run anything or invent results.
+
+## [1.16.0] - 2026-06-25
+
+### Added
+- **`symbi-shell` is now a published crate.** The interactive agent
+  orchestration shell ships to crates.io for the first time in this release.
+- **symbi-shell agent fleet + governed delegation.** The shell auto-loads agents
+  from `./agents` (TOML manifests); the orchestrator delegates tasks to them
+  through the governed communication path (policy-checked + audited). Manage with
+  `/agents list|load|reload`. `.symbi` agents are detected but deferred (loading
+  them with their policy/sandbox enforced is on the roadmap).
+- **symbi-shell governed orchestrator tools.** The orchestrator's reasoning loop
+  now runs under a Cedar policy gate loaded from `policies/orchestrator.cedar`
+  (deny-by-default; missing/invalid policy falls back fail-closed, never
+  allow-all) — this is what lets the orchestrator's tools actually run, governed.
+  New read-only tools `read_file` and `search` (repo-rooted, path-sanitized).
+- **symbi-shell HITL mutating tools.** The orchestrator can `edit_file`
+  (repo-confined writes) and, behind a default-off `--allow-shell` opt-in, run
+  `shell` commands — each requiring **human approval** via the EscalationGate,
+  surfaced in the local Gate panel (`Ctrl+G`), fail-closed on timeout. `shell` is
+  triple-gated: unavailable unless `--allow-shell` (not advertised, executor
+  refuses, and Cedar permits it only then). (Per-agent tool grants remain deferred
+  until fleet agents can call tools.)
+- **symbi-shell direct agent addressing.** Talk to one fleet agent directly with
+  `@<name> <message>` or `/agent use <name>` (focus mode) — a governed, per-agent
+  threaded conversation; the footer shows the active addressee. `/agent clear`
+  returns to the orchestrator.
+- **Inter-agent session-type conformance (experimental).** New `symbi-session` crate: multiparty session-type projection (global protocol → per-role FSM) + a runtime `SessionMonitor` wired into `CommunicationPolicyGate`, so a *sequence* of inter-agent messages is checked against an agreed choreography (ordering/branching), not just per-message authorization. Under an active session the DSL primitives auto-derive the protocol label from the FSM (the agent names only the recipient), illegal transitions are denied with precise diagnostics fed back to the loop, and stalled sessions fail closed to an `Aborted` state. Every transition (allowed/denied) is recorded to a tamper-evident Ed25519 hash-chained **transcript** (offline-verifiable via `RuntimeBridge::session_transcript()`). No DSL syntax yet, and cross-instance propagation is not wired; sessions are opened via `RuntimeBridge::open_session`. Gated behind the **`session` cargo feature, off by default** — default builds don't compile the crate or its wiring; enable with `--features session`. See [Session Types](docs/session-types.md).
+- **Human-in-the-loop approvals.** A runtime held-action escalation queue holds agent actions that require human approval (block-with-timeout, fail-closed) and lets operators approve/deny them in real time via a new REST API (`/api/v1/approvals`), the new **Gate panel** in `symbi-shell` (`/gate`, `Ctrl+G`), or chat (`/symbi gate approve|deny <id>` over Slack/Teams/Mattermost, allowlist-authorized). Config: `[escalation]` + `SYMBIONT_ESCALATION_TIMEOUT` / `SYMBIONT_REQUIRE_APPROVAL_TOOLS`.
+
+### Changed
+- **`symbi` now auto-loads a project-local `.env`.** On startup the CLI reads `.env` from the working directory (additively — real environment variables still take precedence and are never overridden), printing `Loaded environment from <path>` to stderr. This closes the `init` → `up` loop: the `SYMBIONT_MASTER_KEY` that `symbi init` generates in `.env` is now picked up automatically by a local `symbi up`/`run`, instead of requiring a manual `source .env`.
+- **`symbi init` output polish.** The "Next steps" block now prints last (after `.env` and `docker-compose.yml` are written) instead of mid-output, and presents clearer guidance: `Validate` / `Run` (with `docker compose up` recommended for the default Docker tier, and `symbi up` noted to load `.env`) / `Update`.
+- **agentpin bumped to 0.3.0.** Picks up the new credential-verification
+  surface; capability taxonomy validation is available but left off by default
+  to preserve existing behavior.
+- **MSRV raised to Rust 1.86** (required by agentpin 0.3.0's icu_* dependencies).
+
+### Security
+- Bumped transitive `quinn-proto` to 0.11.15 to address RUSTSEC-2026-0185
+  (remote memory exhaustion via unbounded out-of-order stream reassembly).
+
+### Removed
+- Dead code and unused dependencies: the unused `completer.rs`, the
+  `AstVisitor`/`AstVisitorMut` traits, `session_exists()`, and the
+  `tree-sitter-{rust,python,javascript,typescript}`, `walkdir`, `tokio-test`,
+  and `criterion` dependencies from `symbi-dsl`.
+
+## [1.15.2] - 2026-06-09
+
+**Patch: Cedar policy enforcement is on by default in the `symbi` binary.**
+
+### Fixed
+- **Cedar enabled by default in the `symbi` binary.** The `cedar` feature was in `symbi-runtime`'s defaults but not the binary's, and the binary's `try_wire_cedar_policy_gate` / `symbi policy` are `#[cfg(feature = "cedar")]`. So a default `cargo build` of `symbi` compiled out the Cedar wiring — `symbi up`/`run` fell back to the fail-closed gate and `symbi policy evaluate` was a no-op. Added `cedar` to the binary's `default` features so Cedar policy enforcement is active out of the box.
+
+### Crate versions
+| Crate | Version |
+|-------|---------|
+| `symbi` | 1.15.2 |
+| `symbi-runtime` | 1.15.2 |
+| `symbi-dsl` | 1.15.2 |
+| `repl-core` | 1.15.2 |
+| `repl-cli` | 1.15.2 |
+| `repl-proto` | 1.15.2 |
+| `repl-lsp` | 1.15.2 |
+| `symbi-shell` | 1.15.2 |
+
+## [1.15.1] - 2026-06-09
+
+**Patch: `symbi init` agent templates now parse cleanly.** The generated agents tripped `symbi dsl` warnings; no runtime/API changes.
+
+### Fixed
+- **Missing statement terminators.** All four `symbi init` templates (`assistant`, `dev`, `coordinator`, `worker`) omitted the `;` the grammar requires, producing MISSING-token parse errors (`Parse errors in …`) on the generated agents. Semicolons added.
+- **`dev` template invalid DSL.** It used an `executor { }` block (not a valid agent item), the `and` keyword (grammar uses `&&`), and `audit: … with signature` (policy rules accept only an optional `if`). The executor config now uses the Mode B metadata convention (`executor = "claude_code"`, `model`, `allowed_tools`), and the policy syntax is corrected — so `dev-agent` is a functional managed agent.
+- **Sandbox tier aliases.** `WithBlock::parse_sandbox_tier` now accepts `tier1`/`tier2`/`tier3` (→ `docker`/`gvisor`/`firecracker`), matching the docs and example agents; this clears the `Invalid sandbox tier` extraction warning on `data_validator.symbi` and others.
+
+### Added
+- Regression test asserting every `init` template parses without errors and exposes an extractable sandbox tier.
+
+### Crate versions
+| Crate | Version |
+|-------|---------|
+| `symbi` | 1.15.1 |
+| `symbi-runtime` | 1.15.1 |
+| `symbi-dsl` | 1.15.1 |
+| `repl-core` | 1.15.1 |
+| `repl-cli` | 1.15.1 |
+| `repl-proto` | 1.15.1 |
+| `repl-lsp` | 1.15.1 |
+| `symbi-shell` | 1.15.1 |
+
+## [1.15.0] - 2026-06-09
+
+**Feature + security-hardening release.** Adds the Mode B governed-Claude-Code path and typed+grounded inter-agent decisions, and folds in the full remediation of the `symbi-codered` `473178fd` engagement. Several security fixes change default behavior — see **Changed** for upgrade notes.
+
+### Added
+- **Mode B — governed Claude Code subprocess.** An agent whose metadata declares `executor = "claude_code"` now runs by spawning a governed Claude Code subprocess via the runtime's `CliExecutor` instead of the ORGA reasoning loop. `symbi run code_reviewer --target <dir>` evaluates the spawn through the policy Gate, injects the `SYMBIONT_*` env handshake (`SYMBIONT_MANAGED`, `SYMBIONT_SESSION_ID`, `SYMBIONT_BUDGET_TOKENS`/`_TIMEOUT`, `CLAUDE_PROJECT_DIR`) so the `symbi-claude-code` plugin defers its hooks to the outer Gate, loads the plugin via `--plugin-dir`, and wires the stdio `symbi mcp` back-channel via `--mcp-config --strict-mcp-config`. New `symbi run` flags: `--target`, `--max-turns` (primary cooperative bound), `--budget-timeout` (wall-clock backstop), `--budget-tokens`, `--plugin-dir`. New `agents/code_reviewer.symbi` reference agent. The `cli-executor` feature is now **enabled by default** in the `symbi` binary.
+- **Typed + grounded inter-agent decisions.** `LoopState.trusted_context` carries runtime-populated, non-model context into Cedar policy evaluation; `ArgDef.feeds_decision` flags free-text args that feed privileged decisions (now lint-checked); Cedar requests are grounded in trusted context. Includes a typed+grounded triage manifest + Cedar policy reference and a decision-reference module.
+- **Opt-in `tool_choice`** on `InferenceOptions` / `LoopConfig`.
+
+### Changed
+- **Scheduler `LogFile` delivery is now confined to an allowlisted base directory** (`SYMBIONT_LOG_DIR`). Paths escaping it via `..`, absolute paths, or symlinks are refused, and log-file delivery is **fail-closed (disabled) when `SYMBIONT_LOG_DIR` is unset**. *Upgrade note:* set `SYMBIONT_LOG_DIR` to keep using `LogFile` delivery channels.
+- **Browser executor `navigate` now denies by default** when a `[browser]` manifest declares no `scope` (previously fail-open). *Upgrade note:* add an explicit `[browser.scope]` to navigate-capable manifests.
+- **OPA policy engine refuses plaintext HTTP to non-loopback hosts** (fail-closed) unless `SYMBIONT_OPA_ALLOW_INSECURE=1`; sends `SYMBIONT_OPA_AUTH_TOKEN` as bearer auth when set.
+- **E2B sandbox requires `https` to an `e2b.dev` host** (or a host in `SYMBIONT_E2B_ALLOWED_HOSTS`) before shipping code + the API key.
+- **API key store refuses group/other-readable key files** on unix (mirrors `crypto.rs`).
+- **`CliExecutor` process termination is now graceful** (SIGTERM → grace period → SIGKILL) so a killed child can flush output and clean up.
+- **Cedar policy linter relocated** to `.github/scripts/lint-cedar-policies.py` so it survives the OSS sync (was `scripts/`, which is excluded).
+- Conversation truncation preserves `tool_use`/`tool_result` pairing; context-truncation logging lowered from `warn` to `debug`.
+
+### Security
+- **Full remediation of `symbi-codered` engagement `473178fd`** (10 fixed/hardened, 11 verified false positives, 1 accepted risk): scheduler log-file path traversal (CWE-22, PoC-reproduced), browser fail-open scope (SSRF), OPA decision spoofing over plaintext HTTP, E2B arbitrary-endpoint SSRF / key exfiltration, API-key file permissions, SchemaPin fetched-key PEM validation, CI workflow least-privilege (`permissions: contents: read`), Dockerfile `HEALTHCHECK`, and OpenAPI `maxItems` bounds. `// SAFETY:` comments added to audited libc/FFI `unsafe` blocks.
+
+### Fixed
+- Mode B: dropped `--bare` from the spawned `claude` invocation — it skipped reading `~/.claude` (credentials included) and broke subscription-login auth.
+- Derive `Default` for `ToolChoice` (clippy) instead of a manual impl.
+
+### Crate versions
+| Crate | Version |
+|-------|---------|
+| `symbi` | 1.15.0 |
+| `symbi-runtime` | 1.15.0 |
+| `symbi-dsl` | 1.15.0 |
+| `repl-core` | 1.15.0 |
+| `repl-cli` | 1.15.0 |
+| `repl-proto` | 1.15.0 |
+| `repl-lsp` | 1.15.0 |
+| `symbi-shell` | 1.15.0 |
+
+## [1.14.3] - 2026-05-25
+
+**Dependency hygiene patch.** Consolidates the workspace onto a single tree-sitter major and clears a transitive OpenSSL CVE. No public API or CLI surface changes; no security-posture regressions.
+
+### Changed
+- **tree-sitter 0.20 → 0.26** (workspace-wide). `crates/dsl` was bumped to align with downstream consumers (notably `symbi-codered`'s cartographer) that pin 0.26, and `crates/symbi-shell` was bumped to match so the workspace no longer ships two tree-sitter majors. Inverse `cargo tree` now shows a single `tree-sitter v0.26.9`. Language crates moved alongside: `tree-sitter-rust 0.20 → 0.24`, `tree-sitter-python 0.20 → 0.25`, `tree-sitter-javascript 0.20 → 0.25`, `tree-sitter-typescript 0.20 → 0.23`. Code edits were the mechanical 0.26 API migration (`Parser::set_language(&Language)`, `Node::child(u32)`); `crates/dsl/src/lib.rs`, `crates/dsl/src/format.rs`, and `crates/dsl/tests/parser_tests.rs` were updated to match.
+
+### Security
+- **openssl 0.10.79 → 0.10.80** (CVE-2026-45784 / GHSA-phqj-4mhp-q6mq). Patches an out-of-bounds write in `CipherCtxRef::cipher_update_inplace` for AES-KW-PAD ciphers. Exposure is transitive only (via `reqwest → hyper-tls → native-tls`); no source under `crates/` or `tools/` invokes the vulnerable code path, so this is hygiene rather than active-exploit remediation. Applied to both the root `Cargo.lock` and `tools/fuzz/Cargo.lock`; closes Dependabot alerts #75 and #76.
+
+### Fixed
+- **`security_tests.rs` build break.** Commit `198aed0` (security hardening) removed the file-level `static ENV_MUTEX: Mutex<()>` while leaving the seven `ENV_MUTEX.lock()` callsites inside `mod native_sandbox_tests`. The mutex is now defined inside that module, restoring `cargo test -p symbi-runtime --test security_tests` to a buildable state. `just check`'s `cargo test --all-features` had been masking this because it runs only the root `symbi` package's tests, not the workspace.
+
+### Known issues
+- Five `sandbox::native::tests::*` lib tests in `symbi-runtime` (`test_native_runner_creation`, `test_native_bash_execution`, `test_native_execution_with_env_vars`, `test_native_execution_timeout`, `test_output_truncation`) fail in local dev environments with `"Working directory '/tmp/symbiont-native' is within blocked host path '/'"`. This is pre-existing on `main` (predates v1.14.3) and stems from the `NativeRunner` working-dir validator considering `/` a blocked host path; the tests need an explicit allowlist that production code paths configure but the test setup does not. Tracked for a follow-up; unrelated to anything in this release.
+
+### Crate versions
+| Crate | Version |
+|-------|---------|
+| `symbi` | 1.14.3 |
+| `symbi-runtime` | 1.14.3 |
+| `symbi-dsl` | 1.14.3 |
+| `repl-core` | 1.14.3 |
+| `repl-cli` | 1.14.3 |
+| `repl-proto` | 1.14.3 |
+| `repl-lsp` | 1.14.3 |
+| `symbi-shell` | 1.14.3 |
+
+## [1.14.2] - 2026-05-21
+
+**Closes the v1.14.0 "fail-closed without a policy backend compiled in" trap.** Published `symbi` binaries (crates.io, Docker, GitHub Release tarballs) now ship with Cedar in the default feature set and `symbi up` / `symbi run` auto-wire `CedarPolicyGate` from `policies/*.cedar` files at startup. The fail-closed `DefaultPolicyGate::new()` default introduced in v1.14.0 stays in place as the fallback when no policy files are present; nothing about the security posture regresses.
+
+### Added
+- **Cedar in default features.** `symbi-runtime`'s `default` feature set now includes `cedar`, and the binary crate's `symbi-runtime` feature pin lists `cedar` explicitly. Operators who pin `OpaPolicyGateBridge` or a custom `ReasoningPolicyGate` can still opt out with `cargo build --no-default-features --features "keychain,vector-lancedb"`. (Fixes the v1.14.0 UX where `cargo install symbi` shipped without the only in-tree policy backend, leaving every tool call denied by the fail-closed default.)
+- **`try_wire_cedar_policy_gate()` helper** in `src/commands/up.rs` (`pub(super)`, reused by `src/commands/run.rs`). On startup, when the `cedar` feature is compiled in AND `policies/` contains at least one `*.cedar` file, the helper constructs a `CedarPolicyGate::deny_by_default()` and loads each file as a named policy. If the directory is missing, empty, or every file fails to read, the helper returns `None` and the existing fail-closed `DefaultPolicyGate::new()` fallback is used. `--insecure-allow-all` / `SYMBI_INSECURE_ALLOW_ALL=1` still takes precedence over both. Per-file Cedar syntax validation is deferred to evaluation time; malformed policies produce explicit `LoopDecision::Deny` reasons (consistent with the deny-by-default fallback).
+- **`CedarPolicyGate` and `CedarPolicy` re-exported** from `symbi_runtime::reasoning` (feature-gated) so downstream embedders can wire the gate without reaching into the `cedar_gate` submodule.
+
+### Changed
+- **Docs**: `docs/getting-started.md` feature flag table flips the `cedar` default to **Yes** with the auto-wire description; the "Cedar Policy Engine" subsection now documents the auto-wire contract and the `--no-default-features` opt-out instead of the old `--features cedar` build example. `docs/security-model.md` gains a "Default-on since v1.14.x" paragraph describing the auto-wire base (`deny_by_default`), the `policies/*.cedar` discovery rule, and the fail-closed fallback. All 5 translations (de, es, ja, pt, zh-cn) of both docs updated to match.
+
+### Crate versions
+| Crate | Version |
+|-------|---------|
+| `symbi` | 1.14.2 |
+| `symbi-runtime` | 1.14.2 |
+| `symbi-dsl` | 1.14.2 |
+| `repl-core` | 1.14.2 |
+| `repl-cli` | 1.14.2 |
+| `repl-proto` | 1.14.2 |
+| `repl-lsp` | 1.14.2 |
+| `symbi-shell` | 1.14.2 |
+| `symbi-invis-strip` | 0.3.0 (unchanged) |
+| `symbi-approval-relay` | 0.1.1 (unchanged) |
+| `symbi-channel-adapter` | 0.1.3 (unchanged) |
+
+## [1.14.1] - 2026-05-18
+
+**Hotfix for v1.14.0 release workflow + integration tests.** v1.14.0's binaries and `cargo publish` to crates.io did not ship: the GitHub Actions workflow YAML captured at the v1.14.0 tag commit had two issues that prevented the tag-triggered jobs from running. v1.14.1 is identical in source-level security posture to v1.14.0 — see the v1.14.0 entry below for the full audit response.
+
+### Fixed
+- **`dtolnay/rust-toolchain` action invocation**: the SHA-pinned form (added in v1.14.0 H6) requires an explicit `with: toolchain: <version>` input — the older ref-as-toolchain inference (`@stable`) only works when the action is consumed by ref name, not by SHA. Three workflow sites in `.github/workflows/{test,publish,release-binaries}.yml` now pass `toolchain: stable`. (The `fuzz` job's second invocation was already correct, pinning `nightly-2026-02-21`.)
+- **`tools/fuzz` CI list**: dropped `sse_jsonrpc_parsing` from the hardcoded fuzz-target list in `.github/workflows/test.yml`. The corresponding source was removed in v1.14.0 as part of the Composio MCP removal but the workflow YAML was not updated, causing the fuzz job to fail on `cargo fuzz run sse_jsonrpc_parsing`.
+- **`crates/runtime/tests/http_input_integration_tests.rs`**: the test fixture seeded `cors_origins: ["*"]`, but v1.14.0's M1 fix refuses the wildcard at server startup. The integration tests therefore failed with `Connection refused` for the whole file (9/9 tests). Test fixture now uses the explicit loopback origin (`http://127.0.0.1:<port>`); the `test_cors_headers_when_enabled` preflight is rewritten to send the matching `Origin` header so it actually exercises the allowlist path. Local `cargo test -p symbi-runtime --test http_input_integration_tests --features http-input` is green (9/9 pass).
+
+### Crate versions
+| Crate | Version |
+|-------|---------|
+| `symbi` | 1.14.1 |
+| `symbi-runtime` | 1.14.1 |
+| `symbi-dsl` | 1.14.1 |
+| `repl-core` | 1.14.1 |
+| `repl-cli` | 1.14.1 |
+| `repl-proto` | 1.14.1 |
+| `repl-lsp` | 1.14.1 |
+| `symbi-shell` | 1.14.1 |
+| `symbi-invis-strip` | 0.3.0 (unchanged) |
+| `symbi-approval-relay` | 0.1.1 (unchanged) |
+| `symbi-channel-adapter` | 0.1.3 (unchanged) |
+
+## [1.14.0] - 2026-05-18
+
+**Security audit response release.** Implements every finding in `SECURITY_AUDIT.md` (5 CRITICAL, 7 HIGH, 10 MEDIUM, 9 LOW). Out-of-band operator items live in `SECURITY-OPS.md`.
+
+### Removed (BREAKING)
+- **Composio MCP integration + SymbiBot autonomous-posting feature** removed entirely (SECURITY_AUDIT.md C3). Affected surface: the `composio` Cargo feature flag, `ComposioToolExecutor`, the `crates/runtime/src/integrations/composio` module, the `symbiont_mcp add` / `symbiont_mcp list` CLI subcommands, the `crates/runtime/examples/composio_smoke_test.rs` example, and the `tools/fuzz/fuzz_targets/sse_jsonrpc_parsing.rs` fuzz target. Env vars `COMPOSIO_API_KEY` and `COMPOSIO_MCP_URL` are no longer read. Bring your own `ActionExecutor` for external tool dispatch — Composio dispatched LLM-supplied tool names without a static allowlist or TLS pinning.
+- **`SYMBIONT_ALLOW_NO_JWT_AUDIENCE` env-var escape hatch** removed (SECURITY_AUDIT.md M2). Every JWT verifier now requires an explicit `aud` configuration unconditionally.
+
+### Changed (BREAKING)
+- **`symbi up` / `symbi run` default policy gate is now fail-closed** (SECURITY_AUDIT.md C2 / M3). `DefaultPolicyGate::new()` returns `LoopDecision::Deny` for every `ToolCall` and `Delegate` action with an explicit reason; `Respond` actions remain allowed. The previous binary hard-coded `DefaultPolicyGate::permissive()`, which silently allowed every tool call and delegation. Wire `CedarPolicyGate` / `OpaPolicyGateBridge` / your own `ReasoningPolicyGate` impl, or opt into the dev-only permissive mode via `--insecure-allow-all` (or `SYMBI_INSECURE_ALLOW_ALL=1`) with a loud stderr banner.
+- **`DefaultPolicyGate::permissive()` renamed to `DefaultPolicyGate::permissive_for_dev_only()`** and marked `#[doc(hidden)]`. It now emits a `tracing::warn!` on every evaluated action so insecure permissive mode is visible in production logs.
+- **`bundled docker-compose.test.yml` now requires `SYMBIONT_API_TOKEN`** (no `testtoken123` default) and binds published ports to `127.0.0.1` rather than `0.0.0.0` (SECURITY_AUDIT.md C5). `VM_HOST` is also required; `.env.example` is included.
+- **JWT verifier algorithm allowlist** (SECURITY_AUDIT.md C4). ES256 and EdDSA only for the asymmetric `Authorization: Bearer` path; HS256 only for the HMAC webhook-signature path. `RS256`/`RS384`/`RS512`/`PS256`/`PS384`/`PS512` and `none` are rejected at both the header-inspection guard and the `Validation::algorithms` allowlist. Neutralizes RUSTSEC-2023-0071 (`rsa` Marvin Attack reachable through `jsonwebtoken`) on every path operators control. The Microsoft Teams adapter (`crates/channel-adapter/src/adapters/teams/auth.rs`) still uses RS256 because the Bot Framework protocol requires it; that surface is bounded to MS-signed tokens.
+- **`symbi-invis-strip` 0.3.0**: forbidden range expanded with U+00AD (soft hyphen), U+0300..=U+036F (combining diacritical marks), and U+2070..=U+209F (superscript/subscript forms); `detect_injection_patterns` now NFKC-normalises input (closes fullwidth and math-alphanumeric homoglyph bypasses), adds a compact-projection scan (catches post-strip word concatenation), and flags Latin+Cyrillic mixing with a synthetic `mixed-script` marker. New `unicode-normalization` dependency. 7 new `bypass_proofs` regression tests cover each bypass class. (SECURITY_AUDIT.md H5)
+
+### Added
+- **`SYMBI_REJECT_LEGACY_API_KEYS=1` env var**: short-circuits the deprecated O(n) Argon2 scan for unprefixed API keys (returns `None` with a warn log). Operators should re-issue every key in `keyid.secret` format. The legacy path will be removed in the next minor release. (SECURITY_AUDIT.md M6)
+- **`SYMBI_UNSAFE_NATIVE_SANDBOX=1` env var**: required (in addition to `SYMBI_ENV` not being `production`) to construct the `native` sandbox runner at runtime. The `native-sandbox` Cargo feature now also fails to compile in release builds via a top-of-module `compile_error!`. (SECURITY_AUDIT.md H4)
+- **Tool-call argument validation against the declared JSON Schema** (SECURITY_AUDIT.md M4). Arguments produced by the LLM are validated before the policy gate runs; non-object arguments and schema-violating arguments are rejected as `LoopDecision::Deny`.
+- **`Secret` has a hand-written `Serialize` impl that emits `"value": "[REDACTED]"`** (SECURITY_AUDIT.md M7). Derived `Deserialize` retained. Regression test asserts the JSON output never leaks the plaintext.
+- **`symbi-approval-relay` 0.1.1**: Slack timestamp delta widened to `i128` + `saturating_sub` to mirror the channel-adapter pattern. (SECURITY_AUDIT.md L4)
+
+### Fixed
+- **Scheduler shell-injection sink** (SECURITY_AUDIT.md C1). `scheduler/task_manager.rs` no longer interpolates `task.config.dsl_source` into `sh -c`. The DSL is written to disk and passed via `$1` argv with a quoted-literal script.
+- **Toolclad `session.startup_command` shell-injection** (SECURITY_AUDIT.md H1). Parsed via `shlex::split` and executed as argv; empty / metacharacter-bearing tokens rejected.
+- **Firecracker host `/tmp` working directory** (SECURITY_AUDIT.md H3). Production path now uses per-uid `/run/symbi/agent_<id>` (0700) with `<temp>/symbi-<uid>/agent_<id>` fallback. Avoids cross-user `/tmp` races.
+- **Docker sandbox `-e KEY=VALUE` env smuggling** (SECURITY_AUDIT.md M5). Environment is now written to a 0600 tempfile and passed via `--env-file`. Env keys containing `=`, newlines, or NULs are rejected.
+- **HTTP-input CORS wildcard `"*"` accepted at startup** (SECURITY_AUDIT.md M1). Server now returns a `RuntimeError::Configuration` and refuses to start when the wildcard is configured.
+- **HTTP-input error response logging** (SECURITY_AUDIT.md L1). Replaced `tracing::debug!` of the full `Display` string with `tracing::info!` of a stable enum-tag (`Configuration`, `Security`, etc.) plus the public message. No more internal path leaks.
+- **Empty `ApiKeyStore` silent legacy fallback** (SECURITY_AUDIT.md L3). When a key store is configured but contains no records, a one-shot `tracing::error!` fires before falling back to the legacy env-var auth.
+- **`approval-relay` Slack timestamp `i64::abs` overflow** (SECURITY_AUDIT.md L4). Widened to `i128 + saturating_sub`.
+- **`Dockerfile` base images pinned by `@sha256:` digest** (SECURITY_AUDIT.md L6). `rust:1.88-slim-bookworm@sha256:38bc5a86…`, `debian:bookworm-slim@sha256:67b30a61…`.
+- **`Dockerfile` HEALTHCHECK probes the HTTP server** (SECURITY_AUDIT.md L7). `curl -fsS http://127.0.0.1:8080/api/v1/health` with the original `/proc/net/tcp` socket-listen check as a fallback for HTTP-Input-only deploys.
+- **All third-party GitHub Actions SHA-pinned** (SECURITY_AUDIT.md H6). Every `uses:` line carries a 40-char commit SHA with a trailing version comment. `cargo install cargo-fuzz` pinned to `0.13.1 --locked`. PR-only jobs now run with `permissions: contents: read` only (SECURITY_AUDIT.md M9).
+- **`deny.toml`**: stale ignores `RUSTSEC-2026-0097` and `RUSTSEC-2026-0002` removed; `RUSTSEC-2023-0071` (`rsa` Marvin Attack) documented as a runtime-mitigated ignore pointing at the JWT verifier allowlist (SECURITY_AUDIT.md M8).
+- **`config.rs` weak-token guard extended** (SECURITY_AUDIT.md C5 belt-and-braces). Rejects `testtoken123` literally and any token starting with `test` (case-insensitive) shorter than 20 chars. Prevents re-introduction of the historical compose default.
+
+### Migration notes
+- **No replacement for Composio.** Implement your own `ActionExecutor` for external tool dispatch. If you were using `ComposioToolExecutor` directly, see the v1.7.0 phase guidance in `ROADMAP.md` for the `ActionExecutor` trait surface.
+- **If `symbi up` / `symbi run` denies every tool call after upgrade**, that is expected: wire a real policy backend (`CedarPolicyGate`, `OpaPolicyGateBridge`, or a custom `ReasoningPolicyGate`), or opt into permissive mode for local development via `--insecure-allow-all` / `SYMBI_INSECURE_ALLOW_ALL=1`.
+- **Operators who issued API keys before the `keyid.secret` format** should re-issue all keys in the new format and set `SYMBI_REJECT_LEGACY_API_KEYS=1`. The legacy O(n) scan path will be removed in the next minor release.
+- **JWT verifier**: tokens without `aud` are rejected unconditionally; remove `SYMBIONT_ALLOW_NO_JWT_AUDIENCE` from any environment file. RSA-signed JWTs are refused on every path under operator control.
+- **`docker-compose.test.yml`** now requires explicit `SYMBIONT_API_TOKEN` and `VM_HOST` env vars and binds to `127.0.0.1`. See `.env.example`.
+- **`native-sandbox` Cargo feature** fails to compile in release builds. The feature is intended only for local debugging — use the `docker`, `gvisor`, `firecracker`, or `e2b` runners in CI / staging / production.
+
+### Crate versions
+| Crate | Version |
+|-------|---------|
+| `symbi` | 1.14.0 |
+| `symbi-runtime` | 1.14.0 |
+| `symbi-dsl` | 1.14.0 |
+| `repl-core` | 1.14.0 |
+| `repl-cli` | 1.14.0 |
+| `repl-proto` | 1.14.0 |
+| `repl-lsp` | 1.14.0 |
+| `symbi-shell` | 1.14.0 |
+| `symbi-invis-strip` | 0.3.0 |
+| `symbi-approval-relay` | 0.1.1 |
+| `symbi-channel-adapter` | 0.1.3 (unchanged) |
+
+## [1.13.0] - 2026-05-07
+
+### Added
+- **`symbi fmt`** — canonical formatter for `.symbi` source files. Reuses the tree-sitter parse tree from `symbi-dsl` to emit a stable canonical layout (4-space indent, single blank line between top-level items, trailing commas in metadata blocks, normalised spacing around `:`, `=`, `->`, `,`). Modes: rewrite-in-place by default; `--check` exits with code 2 if changes are needed (CI gate); `--stdin` reads from stdin and writes formatted output to stdout for editor integration. The formatter only emits output when the source parses without syntax errors and otherwise leaves the file untouched. v1 covers `metadata`, `agent`, `capabilities`, and `with` blocks; other top-level constructs (policies, schedules, channels, memories, webhooks, free-standing functions) round-trip via trimmed verbatim source.
+- **Tree-sitter grammar v2 for the Symbiont DSL** — covers the full surface used by every example agent in `agents/*.symbi` plus documented Symbiont features: `=` and `:` separators in metadata/capabilities/channel properties; array and record values; full expression precedence ladder (`||`, `&&`, `==`/`!=`/`in`, `<`/`>`/`<=`/`>=`, `+`/`-`/`*`/`/`/`%`, unary `!`/`not`/`-`, postfix `.`/`(...)`/`[...]`); type literals (`Foo { k: v }`) and bare records with both identifier and string keys; lambdas (`x => expr`); vault URLs (`vault://...`); statements (`for in`, `match`, `try`/`catch`, assignment, compound assignment, `let`/`return`); block tail expressions; multi-arg generics (`Map<K, V>`, `Result<T, E>`); `if let Pattern(...) = expr { ... }` destructuring; named arguments accept `=` or `:`; underscore separators in numeric literals (`100_000_000`).
+- **Tolerant formatter fallback** — `format_source` now returns the input unchanged on any parse error rather than failing, so `symbi fmt` degrades gracefully on novel grammar surfaces while a follow-up grammar bump catches up.
+- **LLM API keys via `SecretStore`**: `CloudInferenceProvider` and `LlmClient` now accept an optional `Arc<dyn SecretStore + Send + Sync>` (HashiCorp Vault, OpenBao, or the file-encrypted backend) for resolving provider API keys. Operators point at secret-store keys with new env vars (`OPENROUTER_API_KEY_REF`, `OPENAI_API_KEY_REF`, `ANTHROPIC_API_KEY_REF`); when the corresponding `*_REF` is set the value is fetched from the store, otherwise the existing `*_API_KEY` env var is used. On store miss/failure the loader falls back to the env var so dev and CI workflows are unaffected. New helper `secrets::resolve_secret_or_env(env_var, secret_key, store)` exposes the same logic for other call sites. New constructors `LlmClient::from_env_or_secrets(store)` and `CloudInferenceProvider::from_env_or_secrets(store)` (async); `from_env()` is unchanged. Side benefit: the cloud provider no longer re-reads `*_API_KEY` / `*_BASE_URL` from the env on every inference call.
+- **ToolClad `agent_summary` arg type** — typestate fence for orchestrator-injection that prevents adversarial agent output from being repackaged into trusted orchestration arguments.
+- **`symbi-invis-strip` 0.2.0 — INJECTION_MARKERS expanded** from tier1-v3 bypass forensics. Runtime tracks the new `symbi-invis-strip` version.
+
+### Fixed
+- **Slack signature timestamp overflow** (`crates/channel-adapter/src/adapters/slack/signature.rs`): the freshness check computed `(now - ts).abs()` on `i64`. When the fuzzer fed an adversarial timestamp at the i64 extremes (e.g. `i64::MAX`) the subtraction overflowed — debug builds panicked with `attempt to subtract with overflow`, **release builds wrapped silently and could let stale or future requests slip through the freshness check**. The delta is now computed in `i128` so adversarial timestamps near the i64 boundaries cannot escape the rejection. Surfaced by the `slack_signature_verification` fuzz target; the matching property check inside the harness was widened to keep the assertion truthful at the boundary. New regression test `extreme_timestamps_do_not_panic` covers `i64::MIN`, `i64::MAX`, and adjacent values.
+- **`jsonwebtoken` v10 crypto backend**: pinned `rust_crypto` feature on `jsonwebtoken` in `crates/runtime` and `crates/channel-adapter`. The v10 release dropped a default backend and required exactly one of `rust_crypto` or `aws_lc_rs` to be enabled; without it, JWT verifier tests panicked at runtime. `rust_crypto` was selected because the workspace already depends on RustCrypto crates (`hmac`, `sha2`, `ecdsa`, `p256`) and avoids pulling in `aws-lc-sys`.
+- **rustfmt drift** in `crates/runtime/src/toolclad/validator.rs` and `crates/symbi-invis-strip/src/lib.rs` (test bodies wrapping long inline strings).
+
+### Editor / tooling ecosystem (separate repos, released this cycle)
+- **[`tree-sitter-symbiont`](https://github.com/ThirdKeyAI/tree-sitter-symbiont) v0.1.0** — standalone tree-sitter grammar repo published to npm (`tree-sitter-symbiont`) and crates.io (`tree-sitter-symbiont`). Carries the v2 grammar, highlights query, Node and Rust bindings, and corpus tests.
+- **[`vscode-symbiont`](https://github.com/ThirdKeyAI/vscode-symbiont) v0.1.0** — VS Code extension with a TextMate grammar covering the full keyword surface. `.vsix` published as a GitHub release asset; marketplace publish is a separate step.
+- **[`symbiont-sdk-js`](https://github.com/ThirdKeyAI/symbiont-sdk-js) v1.13.0** — `symbi agent create` CLI now accepts `.symbi` files alongside `.json` and the legacy `.dsl`.
+
+### Notes
+- The `symbiont-sdk-python` SDK (currently v1.11.0) does not require a release in this cycle: the runtime HTTP API surface has not changed since v1.11.0 and the Python SDK does not read agent files from disk in a way that the canonical-extension change affects.
+
+## [1.12.0] - 2026-04-29
+
+### Added
+- **Sandbox tier selection — all OSS** (PR #54): Operators now pick the host-isolation tier per agent via the DSL `with { sandbox = "tier1" | "gvisor" | "firecracker" }` block, or set a project default via `[sandbox] tier = "..."` in `symbiont.toml`. All three tiers — Docker, gVisor, and Firecracker — ship in the OSS runtime; gVisor and Firecracker are no longer Enterprise-gated. New runtime modules: `crates/runtime/src/sandbox/gvisor.rs` (delegates to Docker with the `runsc` runtime) and `crates/runtime/src/sandbox/firecracker.rs` (per-execution Firecracker microVM with operator-supplied kernel + rootfs).
+- **`.symbi` canonical agent file extension** (PR #53): Agent files use `.symbi` going forward. `.dsl` continues to be recognized indefinitely for backward compatibility — no migration required. New helpers `dsl::is_symbi_file` and `dsl::strip_symbi_extension`. Scaffolding (`symbi init`, `symbi new`) now emits `.symbi`. The 14 example agents in `agents/` were renamed.
+- **Tier 3 `symbi init` flags** (PR #55): `symbi init --sandbox tier3 --firecracker-kernel <PATH> --firecracker-rootfs <PATH>` validates both files exist before scaffolding `[sandbox.firecracker]` into `symbiont.toml`. New guide `docs/firecracker-setup.md` covers prerequisites, a quickstart recipe (prebuilt vmlinux + minimal Alpine rootfs), the in-VM init contract, transport patterns for `/work` (vsock vs. second block device), a hardening checklist, and troubleshooting.
+- **`SecurityTier::Hosted` variant** (PR #56): E2B is no longer modeled as a peer of Tier 1/2/3 — it is a separate hosted-cloud backend with no on-host isolation. `E2B → SecurityTier::Hosted` sorts **below** `Tier1` for ordering, so policies requiring host isolation (`tier >= Tier1`) now correctly reject hosted execution. E2B remains opt-in only via DSL (`with { sandbox = "e2b" }`); it is intentionally not exposed as an `[sandbox] tier` value or a `--sandbox` flag.
+
+### Changed
+- **`symbi doctor`** now reports reachability of `runsc` and `firecracker` binaries in addition to `docker`.
+- **Documentation** updated across English + 5 translations (zh-cn, es, pt, ja, de): `docs/security-model.md` rewritten with the three-tier ladder + hosted-execution sidebar, `docs/getting-started.md` documents `.symbi` and `tier3`, `docs/api-reference.md` notes `agents-md` reads `.symbi` first then `.dsl`, `docs/docker.md` and `docs/native-execution-guide.md` updated for the new file extension, `docs/http-input.md` clarifies on-demand LLM invocation reads both extensions.
+
+### Migration notes
+- No breaking changes. Existing `.dsl` files continue to work without modification.
+- Operators using E2B should review any policies that relied on `E2B → SecurityTier::Tier1` parity — those policies will now correctly fail on hosted execution unless re-scoped.
+
+## [1.11.0] - 2026-04-24
+
+### Added
+- **`symbi init` Docker ergonomics**: `init` now accepts `--dir <PATH>` for targeting a mounted volume from inside a container (`docker run -v $(pwd):/workspace ... init --dir /workspace`), generates a ready-to-run `docker-compose.yml` with correct volume mounts and env wiring, and writes a `.env` with a freshly generated `SYMBIONT_MASTER_KEY` (0600 perms) plus a safe-to-commit `.env.example`. Opt out with `--no-docker-compose`. `symbi up` in an empty directory now points the user at `symbi init` instead of silently starting with no agents. `init` is promoted to the first subcommand in `symbi --help`. See `docs/docker.md` for the new 2-command Docker quickstart.
 - **`symbi shell` — interactive TUI**: New first-class subcommand providing a ratatui-based terminal UI for building, orchestrating, and operating agents. Inline viewport with live-streaming tool-call cards, async throbber during LLM calls, markdown + diff renderers, toggleable project-structure sidebar, agent-card widget, diff view, and ORGA-phase-colored trace timeline. Command registry with `/help`, `/clear`, `/quit`, `/dsl` toggle, `/model`, `/cost`, `/status`, input history, and session UUIDs. Agent lifecycle: `/agents`, `/debug`, `/stop`, `/pause`, `/destroy`. AI-assisted authoring: `/spawn`, `/policy`, `/tool`, `/behavior` (artifacts are persisted to disk). Orchestration: async orchestrator wired for conversational mode, `/audit` command wired to the ORGA journal, automatic context compaction with `/compact` and `/context`. Ops: `/deploy`, `/ask`, `/send`, `/memory`, `/run`, `/chain`, `/debate`, `/tools`, `/skills`, `/doctor`, `/logs`, `/new`. Remote attach: `/attach`, `/detach`, `/cron` over HTTP; `/channels` via remote attach; `/secrets` via local encrypted store. Session persistence: `/snapshot`, `/resume`, `/export`. Fuzzy `@mention` + `/command` completion with grouped popup, auto-trigger on `/` and `@`, arrow navigation, `@path` completion, DSL-aware completion, in-process DSL evaluation in `/dsl` mode. `/init` with deterministic profiles and conversational mode. Tree-sitter syntax highlighting for the Symbiont DSL plus Cedar and ToolClad. Artifact validation pipeline: constraint loader, DSL validator, Cedar and ToolClad validators. Theme system, OSC-8 hyperlinks, resize handling, transient-retry, Zellij detection with inline-viewport warning, `--yes`, `--profile`.
 - **Agent deployment stack**: `/deploy local` via Docker with a hardened sandbox runner, `/deploy cloudrun` for Google Cloud Run (OSS single-agent), and `/deploy aws` for AWS App Runner (OSS single-agent).
 - **Cross-instance agent messaging**: `RemoteCommunicationBus` with HTTP messaging endpoints wired into `RuntimeBridge`'s default context. Cron + heartbeat architecture documented in the spec.
 - **`symbi-approval-relay` crate**: Dual-channel human approval relay.
 - **`symbi schemapin` and `symbi policy` CLI subcommands**.
 - **`symbi-invis-strip` crate**: Zero-dependency Unicode invisible-stripping helper (ASCII C0/DEL, C1, zero-width, bidi overrides, word-joiner/invisible-operator block, BOM, variation selectors, Unicode Tag block, supplementary variation selectors). Opt-in `sanitize_field_with_markup` variant additionally strips `<!-- ... -->` HTML comments and triple-backtick fenced blocks for surfaces where renderer-hidden markup has no legitimate use.
-- **Cedar policy linter** (`scripts/lint-cedar-policies.py`): Detects homoglyph identifiers and invisible control chars in `.cedar` files. Wired to the repo pre-commit hook and CI test job.
+- **Cedar policy linter** (`.github/scripts/lint-cedar-policies.py`): Detects homoglyph identifiers and invisible control chars in `.cedar` files. Wired to the repo pre-commit hook and CI test job.
 - **AgentPin fully wired; SchemaPin enforcement hardened**.
 - **`symbi-e2e` end-to-end test crate**: Covers AgentPin messaging, API auth scope, cross-runtime bus, Docker volumes, messaging ingress, rate limit, and webhook signature verification.
 - **Opt-in OpenRouter app attribution**: Runtime now sets the OpenRouter app-name headers when enabled.
+- **`symbi repl` shim subcommand** forwards to the `repl-cli` binary (mirrors the existing `symbi shell` shim) so the command every docs page has referenced is now a first-class subcommand rather than a separately-built binary.
 
 ### Changed
 - **OSS vs Enterprise licensing**: Documented in the spec and plan.
+- **Docs rewrite**: `docs/index.md`, `docs/getting-started.md`, `docs/docker.md` lead with a 2-command Docker init flow. New `docs/symbi-shell.md` covers the Beta interactive TUI end-to-end. `docs/repl-guide.md` cross-links to the shell. `docs/api-reference.md` gains a `CLI subcommands` section covering `symbi schemapin`, `symbi policy`, and `symbi agents-md`. `docs/runtime-architecture.md` gains a `Cross-instance agent messaging` subsection. `docs/security-model.md` gains `Invisible-Character Sanitization (symbi-invis-strip)`, `Cedar Policy Linter`, and `Human Approval Relay (symbi-approval-relay)` sections. All five translations (zh-cn, es, pt, ja, de) synced.
+- **Staleness sweep**: Fixed broken copy-paste commands across all language variants — `symbiont-runtime` → `symbi-runtime` package name, rewrote the Runtime HTTP API quickstart to use `symbi up --http-bind 0.0.0.0` + `$SYMBI_HTTP_TOKEN` (not the non-existent `symbiont-runtime --http-api`), `docker build -f runtime/Dockerfile .` → `docker build .`, and `symbi-runtime = { version = "1.6" }` snippet → `"1.11"`. Documented the previously-undocumented `symbi new` templates (`webhook-min`, `webscraper-agent`, `slm-first`, `rag-lite`) and the `OPENROUTER_REFERER` / `OPENROUTER_TITLE` env vars.
+- **`/attach` scheme policy**: Documentation clarified that `/attach` accepts HTTP **or** HTTPS; `https://` is required for any remote or production target.
 
 ### Fixed
 - `symbi-shell`: `/spawn`, `/policy`, `/tool`, `/behavior` now actually persist their artifacts; Enter submits on first press even when the completion popup is visible; content scroll fix with all warnings eliminated; batched UX fixes.

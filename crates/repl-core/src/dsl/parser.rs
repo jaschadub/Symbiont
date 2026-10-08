@@ -66,8 +66,6 @@ impl Parser {
             Ok(Declaration::Behavior(self.parse_behavior_definition()?))
         } else if self.match_keyword(Keyword::Function) {
             Ok(Declaration::Function(self.parse_function_definition()?))
-        } else if self.match_keyword(Keyword::On) {
-            Ok(Declaration::EventHandler(self.parse_event_handler()?))
         } else if self.match_keyword(Keyword::Struct) {
             Ok(Declaration::Struct(self.parse_struct_definition()?))
         } else {
@@ -122,10 +120,19 @@ impl Parser {
                 self.consume_token(TokenType::Colon, "Expected ':' after 'description'")?;
                 metadata.description = Some(self.parse_string_literal()?);
             } else if self.match_keyword(Keyword::Resources) {
+                if resources.is_some() {
+                    return Err(ReplError::Parsing("Duplicate agent resources block".into()));
+                }
                 resources = Some(self.parse_resource_config()?);
             } else if self.match_keyword(Keyword::Security) {
+                if security.is_some() {
+                    return Err(ReplError::Parsing("Duplicate agent security block".into()));
+                }
                 security = Some(self.parse_security_config()?);
             } else if self.match_keyword(Keyword::Policies) {
+                if policies.is_some() {
+                    return Err(ReplError::Parsing("Duplicate agent policies block".into()));
+                }
                 policies = Some(self.parse_policy_config()?);
             } else {
                 return Err(ReplError::Parsing(format!(
@@ -245,34 +252,6 @@ impl Parser {
         })
     }
 
-    /// Parse an event handler
-    fn parse_event_handler(&mut self) -> Result<EventHandler> {
-        let start_span = self.previous_span();
-
-        let event_name = if let TokenType::Identifier(name) = &self.advance().token_type {
-            name.clone()
-        } else {
-            return Err(ReplError::Parsing("Expected event name".to_string()));
-        };
-
-        self.consume_token(TokenType::LeftParen, "Expected '(' after event name")?;
-        let parameters = self.parse_parameter_list()?;
-        self.consume_token(TokenType::RightParen, "Expected ')' after parameters")?;
-
-        let body = self.parse_block()?;
-        let end_span = self.previous_span();
-
-        Ok(EventHandler {
-            event_name,
-            parameters,
-            body,
-            span: Span {
-                start: start_span.start,
-                end: end_span.end,
-            },
-        })
-    }
-
     /// Parse a struct definition
     fn parse_struct_definition(&mut self) -> Result<StructDefinition> {
         let start_span = self.previous_span();
@@ -364,8 +343,6 @@ impl Parser {
             Ok(Statement::If(self.parse_if_statement()?))
         } else if self.match_keyword(Keyword::Return) {
             Ok(Statement::Return(self.parse_return_statement()?))
-        } else if self.match_keyword(Keyword::Emit) {
-            Ok(Statement::Emit(self.parse_emit_statement()?))
         } else if self.match_keyword(Keyword::Require) {
             Ok(Statement::Require(self.parse_require_statement()?))
         } else {
@@ -478,34 +455,6 @@ impl Parser {
 
         Ok(ReturnStatement {
             value,
-            span: Span {
-                start: start_span.start,
-                end: end_span.end,
-            },
-        })
-    }
-
-    /// Parse an emit statement
-    fn parse_emit_statement(&mut self) -> Result<EmitStatement> {
-        let start_span = self.previous_span();
-
-        let event_name = if let TokenType::Identifier(name) = &self.advance().token_type {
-            name.clone()
-        } else {
-            return Err(ReplError::Parsing("Expected event name".to_string()));
-        };
-
-        let data = if self.check_token(&TokenType::LeftBrace) {
-            Some(self.parse_expression()?)
-        } else {
-            None
-        };
-
-        let end_span = self.previous_span();
-
-        Ok(EmitStatement {
-            event_name,
-            data,
             span: Span {
                 start: start_span.start,
                 end: end_span.end,
@@ -971,7 +920,7 @@ impl Parser {
         self.consume_token(TokenType::LeftBrace, "Expected '{' after 'security'")?;
 
         let mut tier = None;
-        let mut capabilities = Vec::new();
+        let mut capabilities = None;
         let mut sandbox = None;
 
         while !self.check_token(&TokenType::RightBrace) && !self.is_at_end() {
@@ -981,8 +930,13 @@ impl Parser {
                 self.consume_token(TokenType::Colon, "Expected ':' after 'tier'")?;
                 tier = Some(self.parse_security_tier()?);
             } else if self.match_keyword(Keyword::Capabilities) {
+                if capabilities.is_some() {
+                    return Err(ReplError::Parsing(
+                        "Duplicate agent capabilities field".into(),
+                    ));
+                }
                 self.consume_token(TokenType::Colon, "Expected ':' after 'capabilities'")?;
-                capabilities = self.parse_string_list()?;
+                capabilities = Some(self.parse_string_list()?);
             } else if self.match_keyword(Keyword::Sandbox) {
                 self.consume_token(TokenType::Colon, "Expected ':' after 'sandbox'")?;
                 sandbox = Some(self.parse_sandbox_mode()?);
@@ -999,7 +953,7 @@ impl Parser {
 
         Ok(SecurityConfig {
             tier,
-            capabilities,
+            capabilities: capabilities.unwrap_or_default(),
             sandbox,
         })
     }

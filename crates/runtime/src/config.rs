@@ -52,6 +52,8 @@ pub struct Config {
     /// CLI executor configuration (optional, requires `cli-executor` feature)
     #[cfg(feature = "cli-executor")]
     pub cli_executor: Option<CliExecutorConfigToml>,
+    /// Escalation configuration (optional)
+    pub escalation: Option<EscalationConfig>,
 }
 
 /// API configuration.
@@ -246,6 +248,42 @@ pub struct AdapterConfigToml {
     pub allowed_tools: Option<Vec<String>>,
     /// Disallowed tools list (adapter-specific).
     pub disallowed_tools: Option<Vec<String>>,
+}
+
+/// Approval channel for escalation requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalChannelConfig {
+    /// Chat platform identifier ("slack", "teams", "mattermost").
+    pub platform: String,
+    /// Platform-specific channel identifier.
+    pub channel_id: String,
+    /// Allowlisted sender IDs; empty list means fail-closed.
+    #[serde(default)]
+    pub approvers: Vec<String>,
+}
+
+/// Escalation configuration for operator approval flows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationConfig {
+    /// Seconds to wait for an approval response before timing out.
+    #[serde(default = "default_escalation_timeout")]
+    pub timeout_seconds: u64,
+    /// Chat channels that may approve escalated actions.
+    #[serde(default)]
+    pub approval_channels: Vec<ApprovalChannelConfig>,
+}
+
+fn default_escalation_timeout() -> u64 {
+    120
+}
+
+impl Default for EscalationConfig {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: 120,
+            approval_channels: vec![],
+        }
+    }
 }
 
 /// Storage configuration
@@ -870,6 +908,9 @@ impl Config {
                 .map_err(|e| ConfigError::IoError {
                     message: e.to_string(),
                 }),
+            // Bindings are only read by the `keychain` arm below; without that
+            // feature they are genuinely unused.
+            #[cfg_attr(not(feature = "keychain"), allow(unused_variables))]
             KeyProvider::Keychain { service, account } => {
                 #[cfg(feature = "keychain")]
                 {
@@ -931,13 +972,32 @@ impl Config {
             "qwerty",
             "abc123",
             "password123",
+            // Known shipped default that was previously baked into
+            // docker-compose.test.yml — refuse it even if an operator
+            // re-introduces the literal string.
+            "testtoken123",
         ];
 
-        if weak_tokens.contains(&trimmed.to_lowercase().as_str()) {
+        let lower = trimmed.to_lowercase();
+
+        if weak_tokens.contains(&lower.as_str()) {
             return Err(ConfigError::InvalidValue {
                 key: "auth_token".to_string(),
                 reason: format!(
                     "Token '{}' is a known weak/default token. Use a strong random token instead.",
+                    trimmed
+                ),
+            });
+        }
+
+        // Belt-and-suspenders: any token starting with "test" (case-insensitive)
+        // and shorter than 20 characters is treated as a placeholder. Real
+        // production tokens are typically random strings well over 20 chars.
+        if lower.starts_with("test") && trimmed.len() < 20 {
+            return Err(ConfigError::InvalidValue {
+                key: "auth_token".to_string(),
+                reason: format!(
+                    "Token '{}' looks like a test/placeholder value (starts with 'test', shorter than 20 chars). Use a strong random token >=20 chars instead.",
                     trimmed
                 ),
             });
@@ -1635,6 +1695,46 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_auth_token_rejects_testtoken123() {
+        // Belt-and-suspenders against re-introducing the historical
+        // docker-compose default.
+        let result = Config::validate_auth_token("testtoken123");
+        assert!(result.is_err(), "'testtoken123' must be rejected");
+        if let Err(ConfigError::InvalidValue { reason, .. }) = result {
+            assert!(
+                reason.contains("weak/default token") || reason.contains("test/placeholder"),
+                "Expected weak/placeholder rejection, got: {}",
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_auth_token_rejects_short_test_prefix() {
+        // Any token starting with "test" (case-insensitive) and shorter
+        // than 20 chars is rejected as a placeholder.
+        let cases = vec![
+            "testabcdef",     // 10 chars
+            "TESTabcdefghij", // 14 chars
+            "Testing1234",    // 11 chars
+        ];
+        for token in cases {
+            let result = Config::validate_auth_token(token);
+            assert!(
+                result.is_err(),
+                "Short test-prefixed token '{}' should be rejected",
+                token
+            );
+        }
+
+        // A test-prefixed token >=20 chars passes the prefix check (still
+        // permitted, since long random tokens that happen to start with
+        // "test" are not necessarily placeholders).
+        let long = "testxxxxxxxxxxxxxxxxxxxxx"; // 25 chars
+        assert!(Config::validate_auth_token(long).is_ok());
+    }
+
+    #[test]
     fn test_validate_auth_token_special_characters_allowed() {
         let tokens = vec![
             "token-with-dashes",
@@ -1651,5 +1751,36 @@ mod tests {
                 token
             );
         }
+    }
+
+    #[test]
+    fn parses_escalation_section() {
+        let toml = r#"
+[escalation]
+timeout_seconds = 90
+
+[[escalation.approval_channels]]
+platform = "slack"
+channel_id = "C0APPROVERS"
+approvers = ["U0ALICE", "U0BOB"]
+"#;
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            escalation: Option<EscalationConfig>,
+        }
+        let cfg: EscalationConfig = toml::from_str::<Wrapper>(toml).unwrap().escalation.unwrap();
+        assert_eq!(cfg.timeout_seconds, 90);
+        assert_eq!(cfg.approval_channels.len(), 1);
+        assert_eq!(cfg.approval_channels[0].channel_id, "C0APPROVERS");
+        assert_eq!(
+            cfg.approval_channels[0].approvers,
+            vec!["U0ALICE".to_string(), "U0BOB".to_string()]
+        );
+    }
+
+    #[test]
+    fn escalation_defaults() {
+        assert_eq!(EscalationConfig::default().timeout_seconds, 120);
+        assert!(EscalationConfig::default().approval_channels.is_empty());
     }
 }

@@ -72,10 +72,10 @@ metadata {
     description: "Healthcare data analysis agent with HIPAA compliance"
     license: "Proprietary"
     tags: ["healthcare", "hipaa", "analysis"]
-    min_runtime_version: "1.0.0"
-    dependencies: ["medical_nlp", "privacy_tools"]
 }
 ```
+
+メタデータのペアは区切り文字として `=` または `:` のいずれかを使用できます。
 
 ### メタデータフィールド
 
@@ -86,8 +86,46 @@ metadata {
 | `description` | String | はい | エージェント機能の簡潔な説明 |
 | `license` | String | いいえ | ライセンス識別子 |
 | `tags` | Array[String] | いいえ | 分類タグ |
-| `min_runtime_version` | String | いいえ | 必要な最小ランタイムバージョン |
-| `dependencies` | Array[String] | いいえ | 外部依存関係 |
+
+マネージドCLIエージェント（モードB）は、以下の追加メタデータキーを認識します。これらは `symbi run` によって読み取られ、ガバナンス下の Claude Code サブプロセスを起動するために使用されます（`agents/code_reviewer.symbi` を参照）：
+
+| フィールド | 型 | 説明 |
+|-------|------|-------------|
+| `executor` | String | `"claude_code"` に設定すると、推論ループの代わりに、エージェントをガバナンス下の Claude Code サブプロセスとして実行します |
+| `model` | String | サブプロセスに渡されるモデル（例：`"claude-sonnet-4-5"`） |
+| `allowed_tools` | String | サブプロセス向けのカンマ区切りツール許可リスト（例：`"Read,Grep,Glob"`）。**必須** — 宣言のないエージェントは、無制限に起動される代わりに拒否されます |
+| `system_prompt` | String | サブプロセスに追加される追加システムプロンプト |
+| `permission_mode` | String | 省略可。`--permission-mode` としてそのまま渡されます。未設定の場合はフラグ自体を省略し、サブプロセスは自身の既定値を保ちます。既定値は `allowed_tools` の範囲外については引き続き確認を求めます。無人実行が必要なエージェントには `"dontAsk"` を指定します |
+
+起動は `tool_call::claude_code` としてポリシーゲートを通り、その判断は
+`policies/managed-cli/` から読み込まれます（`policies/run/` では**ありません**）。
+サブプロセスの起動は、プロセス内の推論ループとは影響範囲が異なるため、2 つの
+サーフェスはポリシーディレクトリを共有しません。最小限の permit は次のとおりです。
+
+```cedar
+// policies/managed-cli/claude_code.cedar
+permit(principal, action == Action::"tool_call::claude_code", resource);
+```
+
+起動の判断だけが唯一の判断ではありません。子プロセスは、選択された Docker、
+gVisor、Firecracker のワーカー内で、スクラッチストレージと専用の推論チャネル・
+ツールチャネルを用いて動作します。ソースのマウント、外部ネットワーク、ホストの
+ログイン状態、ホストの資格情報はいずれもありません。CLI の組み込みツールと
+プロジェクト・プラグインの自動検出は無効化され、`--plugin-dir` は拒否されます。
+ソースへのアクセスは登録済みの ToolClad ツールの集合であり、**子プロセスが行う
+ツール呼び出しはすべてランタイムを介して仲介されます**。すなわち、準備と正規化、
+必須となる厳密な承認の取得、Cedar の評価、必須の事前レコードの永続化、
+ディスパッチ、そして結果の記録です。`allowed_tools` は登録済みツールの厳密な
+部分集合を指定します。ワイルドカードの権限式や CLI の組み込みツール名は
+レジストリのエントリとして受け付けられません。
+
+`allowed_tools` を必須とし、`permission_mode` をオプトインとしているのはそのためです。
+これらは子プロセスが*要求できる*範囲を限定するものであり、実際に何が起こるかを
+決めるのは子プロセスではなくランタイムです。管理 CLI の各セッションは、独自の
+署名付きジャーナルを保持します。イメージ、マウント、ポリシー、
+`[managed_cli.inference]` の設定については[管理 CLI の封じ込め](/managed-cli-containment)を、
+仲介の契約については[ガバナンス下のツールブローカー](/governed-tool-broker)を参照してください。
+
 
 ---
 

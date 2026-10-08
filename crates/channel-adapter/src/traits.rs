@@ -14,6 +14,17 @@ use crate::types::{FilteredContent, InteractionLog, PolicyDecision};
 /// adds Teams and Mattermost.
 #[async_trait]
 pub trait ChannelAdapter: Send + Sync {
+    /// Describe the exact credential-free transport request before authorization.
+    /// Custom adapters must implement this to support governed response delivery.
+    fn prepare_response(
+        &self,
+        _response: &OutboundMessage,
+    ) -> Result<serde_json::Value, ChannelAdapterError> {
+        Err(ChannelAdapterError::Config(
+            "adapter does not support prepared response delivery".into(),
+        ))
+    }
+
     /// Start receiving messages from the platform.
     async fn start(&self) -> Result<(), ChannelAdapterError>;
 
@@ -39,6 +50,14 @@ pub trait ChannelAdapter: Send + Sync {
 #[async_trait]
 pub trait InboundHandler: Send + Sync {
     async fn handle_message(&self, message: InboundMessage) -> Result<(), ChannelAdapterError>;
+}
+
+/// First-look hook for inbound messages. If it returns `Some(reply)`, the manager
+/// sends that reply and does NOT invoke an agent. Used for control commands like
+/// `/symbi gate approve <id>`.
+#[async_trait]
+pub trait InboundCommandInterceptor: Send + Sync {
+    async fn try_handle(&self, message: &InboundMessage) -> Option<String>;
 }
 
 /// Extension point for enterprise governance layer.

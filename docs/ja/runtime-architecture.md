@@ -9,6 +9,8 @@ Symbi ランタイムシステムアーキテクチャとコアコンポーネ�
 
 ## 概要
 
+実装済みの封じ込めに関する変更点については、[封じ込めの運用・アーキテクチャガイド](/containment-branch-guide)を参照してください。ランタイムは、準備済みの呼び出しを検証、承認、Cedar、必須の監査、単回限りのディスパッチを通じて束縛します。独立したスーパーバイザーが封じ込められたワーカーを所有します。対象となる CLI、HTTP、スケジューラー、DSL の既定経路は保護されたジャーナルを使用します。以下に述べる原則は設計を説明するものであり、残された実行経路と監査経路があるため、完全な封じ込めを主張することはできません。
+
 Symbi ランタイムシステムは、自律エージェント向けに安全でスケーラブル、かつポリシー対応の実行環境を提供します。パフォーマンスと安全性のためにRustで構築され、包括的な監査機能を備えた多層セキュリティモデルを実装しています。
 
 ### コア原則
@@ -64,6 +66,7 @@ graph TB
     subgraph "Sandbox Tiers"
         T1[Tier 1: Docker]
         T2[Tier 2: gVisor]
+        T3[Tier 3: Firecracker microVM]
     end
 
     ARS --> ACM
@@ -81,6 +84,7 @@ graph TB
     PG --> PE
     SO --> T1
     SO --> T2
+    SO --> T3
     MCP --> TV
     PE --> AT
 ```
@@ -175,7 +179,7 @@ pub struct ResourceLimits {
 
 ### サンドボックスアーキテクチャ
 
-ランタイムは操作リスクに基づいて2つのセキュリティ層を実装:
+ランタイムは3つのホスト分離ティア（すべて OSS）と、独立したホスト型クラウドバックエンド（E2B）を提供します。運用者は DSL の `with { sandbox = ... }` ブロックでエージェントごとにティアを選択するか、`[sandbox] tier = "..."` でプロジェクトのデフォルトを設定します。
 
 #### 層1: Docker分離
 **使用例**: 低リスク操作、開発タスク
@@ -191,7 +195,15 @@ pub struct ResourceLimits {
 - 最小限のパフォーマンス影響で強化されたセキュリティ
 - ほとんどのエージェント操作のデフォルト層
 
-> **注意**: エンタープライズエディションでは最大セキュリティ要件向けの追加分離層が利用可能。
+#### 層3: Firecracker microVM
+**使用例**: 信頼されないコード、マルチテナント、規制対象データなど、最高レベルの分離が必要なワークロード
+- KVM によるハードウェア仮想化と専用ゲストカーネル
+- 実行ごとの microVM ライフサイクル — ホストとカーネル表面を共有しない
+- デフォルトで読み取り専用のルートファイルシステム
+- `firecracker` バイナリと、対応する `symbi-sandbox-guest` の PID 1 サービスおよびスーパーバイザーが必要 — [`docs/firecracker-setup.md`](/firecracker-setup) を参照。
+
+#### ホスト型実行：E2B（ティアではない）
+E2B は独立したホスト型クラウドバックエンドであり、Tier 1/2/3 の **対等な存在ではありません**。`SecurityTier::Hosted` にマップされ、順序付け上 `Tier1` よりも下にソートされます — ホスト分離（`tier >= Tier1`）を要求するポリシーはホスト型実行を拒否します。DSL（`with { sandbox = "e2b" }`）経由でのみオプトイン可能です。
 
 ---
 
@@ -257,6 +269,20 @@ pub struct SecureMessage {
 - `sender_agent_id` -- 呼び出し元エージェントのID
 - `comm_bus` -- メッセージルーティング用CommunicationBusへの参照
 - `comm_policy` -- 認可用CommunicationPolicyGateへの参照
+
+### クロスインスタンスエージェントメッセージング
+
+インプロセスの `CommunicationBus` には分散対応版である `RemoteCommunicationBus` があり、別々のランタイムインスタンス間で同じメッセージタイプ（`ask`、`send_to`、`delegate`、`parallel`、`race`）を HTTP 経由で転送します。これにより、あるホストにデプロイされたコーディネーターが、別のホストにデプロイされたワーカーと、ポリシー実施、署名、監査証跡を手放すことなく対話できるようになります。
+
+主な特性：
+
+- **同一の契約** — `RemoteCommunicationBus` はローカルバスと同じトレイトを実装しているため、エージェントコードと DSL ビルトインはインプロセスとクロスインスタンスのトポロジー間で変更されません。
+- **HTTP メッセージングエンドポイント** — ランタイム HTTP API 上に公開され、`RuntimeBridge` のデフォルトコンテキストに組み込まれているため、ある場所での `symbi up` が別の場所の `symbi up` からメッセージを受信できます。
+- **AgentPin 固定アイデンティティ** — 送信者は AgentPin ES256 トークンを提示し、受信者はポリシーゲートが実行される前に送信者のドメイン固定キーに対して検証します。
+- **SchemaPin 検証** — インスタンス間で参照されるツールマニフェストは、実行前にピン留めされた署名に対して検証されます。
+- **監査** — リモートメッセージの送受信は、ローカルメッセージと同じ暗号学的改ざん防止フォーマットでログに記録されるため、監査証跡はメッセージホップに追従します。
+
+デプロイトポロジーは通常、コーディネーターインスタンスと 1 つ以上のワーカーインスタンスで構成され、それぞれが `symbi shell /deploy …`（Beta）経由で Docker、Cloud Run、または App Runner にデプロイされます。[Symbi Shell デプロイガイド](/symbi-shell#deployment-beta) を参照してください。
 
 ---
 
@@ -444,18 +470,9 @@ pub struct AuditEvent {
 - **タイムスタンプ検証**: 暗号タイムスタンプ
 - **バッチ検証**: 効率的な一括検証
 
-### コンプライアンス機能
-
-**規制サポート:**
-- **HIPAA**: 健康データ保護コンプライアンス
-- **GDPR**: ヨーロッパデータ保護要件
-- **SOX**: 財務監査証跡要件
-- **カスタム**: 設定可能なコンプライアンスフレームワーク
-
 **監査機能:**
 - リアルタイムイベントストリーミング
 - 履歴イベントクエリ
-- コンプライアンスレポート生成
 - 完全性検証
 
 ---
@@ -491,7 +508,7 @@ pub struct AuditEvent {
 - **リーク防止**: 自動クリーンアップと監視
 
 **CPU使用率:**
-- **スケジューラーオーバーヘッド**: 10,000エージェントでCPU2%未満
+- **スケジューラーオーバーヘッド**: 登録と上限付きキューの待ち時間をテストしています。10,000エージェント実行時のCPU使用率は実証されていません。
 - **コンテキストスイッチ**: ハードウェア支援仮想スレッド
 - **負荷分散**: 動的負荷分散
 - **優先度スケジューリング**: リアルタイムとバッチ処理層
@@ -537,26 +554,29 @@ max_concurrent_connections = 100
 ### 環境変数
 
 ```bash
-# Core runtime
-export SYMBI_LOG_LEVEL=info
-export SYMBI_RUNTIME_MODE=production
-export SYMBI_CONFIG_PATH=/etc/symbi/config.toml
+# 必須: 永続状態の暗号化に使用する32バイトのhexキー。
+# `symbi init` が .env に書き込みます。生成方法: openssl rand -hex 32
+export SYMBIONT_MASTER_KEY=...
 
-# Security
-export SYMBI_CRYPTO_PROVIDER=ring
-export SYMBI_AUDIT_STORAGE=/var/log/symbi/audit
+# LLMプロバイダー（いずれか1つを設定）
+export ANTHROPIC_API_KEY=...   # または OPENAI_API_KEY / OPENROUTER_API_KEY
 
-# ベクトルデータベース（LanceDBがゼロコンフィグのデフォルト）
-export SYMBIONT_VECTOR_BACKEND=lancedb          # または "qdrant"
-export SYMBIONT_VECTOR_DATA_PATH=./data/vectors # LanceDBストレージパス
+# ポリシーゲート: Cedar はデフォルトで有効で、policies/*.cedar から自動的に配線されます。
+# export SYMBI_INSECURE_ALLOW_ALL=1   # ローカル開発専用 — 全許可ゲート
 
-# オプション: Qdrantバックエンド使用時のみ必要
-# export SYMBIONT_VECTOR_HOST=localhost
-# export SYMBIONT_VECTOR_PORT=6334
+# スケジューラーの log_file 配信（そのチャネルに必須。このディレクトリ内に限定）
+# export SYMBIONT_LOG_DIR=/var/log/symbiont
 
-# 外部依存関係
-export OPENAI_API_KEY=your_api_key_here
-export MCP_SERVER_DISCOVERY=enabled
+# ベクトル検索: LanceDB がゼロコンフィグのデフォルト。代わりに Qdrant を使う場合:
+# export SYMBIONT_VECTOR_BACKEND=qdrant
+# export QDRANT_URL=http://localhost:6333
+
+# OPA ポリシーバックエンド（使用する場合。非ループバックホストには https + bearer が必須）:
+# export SYMBIONT_OPA_URL=https://opa.internal:8181
+# export SYMBIONT_OPA_AUTH_TOKEN=...
+
+# X-Forwarded-For 用の信頼されたリバースプロキシ CIDR 許可リスト
+# export SYMBI_TRUSTED_PROXIES=10.0.0.0/8
 ```
 
 ---
@@ -614,7 +634,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates
 COPY --from=builder /app/target/release/symbi /usr/local/bin/
 EXPOSE 8080
-CMD ["symbi", "mcp", "--config", "/etc/symbi/config.toml"]
+CMD ["symbi", "up"]
 ```
 
 ### Kubernetesデプロイメント
@@ -640,8 +660,11 @@ spec:
         ports:
         - containerPort: 8080
         env:
-        - name: SYMBI_RUNTIME_MODE
-          value: "production"
+        - name: SYMBIONT_MASTER_KEY
+          valueFrom:
+            secretKeyRef:
+              name: symbi-secrets
+              key: master-key
         resources:
           requests:
             memory: "1Gi"

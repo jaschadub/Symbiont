@@ -72,10 +72,10 @@ metadata {
     description: "Healthcare data analysis agent with HIPAA compliance"
     license: "Proprietary"
     tags: ["healthcare", "hipaa", "analysis"]
-    min_runtime_version: "1.0.0"
-    dependencies: ["medical_nlp", "privacy_tools"]
 }
 ```
+
+Os pares de metadados aceitam tanto `=` quanto `:` como separador.
 
 ### Campos de Metadados
 
@@ -86,8 +86,50 @@ metadata {
 | `description` | String | Sim | Breve descrição da funcionalidade do agente |
 | `license` | String | Não | Identificador da licença |
 | `tags` | Array[String] | Não | Tags de classificação |
-| `min_runtime_version` | String | Não | Versão mínima necessária do runtime |
-| `dependencies` | Array[String] | Não | Dependências externas |
+
+Os agentes gerenciados via CLI (Modo B) reconhecem estas chaves de metadados adicionais, lidas por `symbi run` para iniciar um subprocesso governado do Claude Code (veja `agents/code_reviewer.symbi`):
+
+| Campo | Tipo | Descrição |
+|-------|------|-----------|
+| `executor` | String | Defina como `"claude_code"` para executar o agente como um subprocesso governado do Claude Code em vez do loop de raciocínio |
+| `model` | String | Modelo passado ao subprocesso (ex.: `"claude-sonnet-4-5"`) |
+| `allowed_tools` | String | Lista de permissão de ferramentas separada por vírgulas para o subprocesso (ex.: `"Read,Grep,Glob"`). **Obrigatório** — um agente que não a declare é recusado em vez de iniciado sem restrições |
+| `system_prompt` | String | Prompt de sistema adicional anexado ao subprocesso |
+| `permission_mode` | String | Opcional. Repassado como `--permission-mode`. Quando ausente, a flag é omitida e o subprocesso mantém o próprio padrão, que continua pedindo confirmação para qualquer coisa fora de `allowed_tools`. Use `"dontAsk"` para agentes que precisem rodar sem supervisão |
+
+O spawn passa pelo gate de política como `tool_call::claude_code`, e essa decisão
+é lida de `policies/managed-cli/` — **não** de `policies/run/`. Iniciar um
+subprocesso tem um raio de impacto diferente do loop de raciocínio em processo,
+então as duas superfícies não compartilham diretório de políticas. Um permit
+mínimo:
+
+```cedar
+// policies/managed-cli/claude_code.cedar
+permit(principal, action == Action::"tool_call::claude_code", resource);
+```
+
+A decisão sobre o spawn não é a única decisão. O filho roda dentro do worker
+Docker, gVisor ou Firecracker selecionado, com armazenamento temporário e canais
+privados de inferência e de ferramentas — sem montagem do código-fonte, sem rede
+externa, sem estado de login do host, sem credenciais do host. As ferramentas
+embutidas da CLI e a descoberta automática de projetos/plugins ficam desativadas,
+e `--plugin-dir` é rejeitado. O acesso ao código-fonte se dá por um conjunto de
+ferramentas ToolClad registradas, e **cada chamada de ferramenta feita pelo filho
+é intermediada de volta pelo runtime**: preparar e normalizar, obter qualquer
+aprovação exata obrigatória, avaliar o Cedar, persistir o registro obrigatório
+pré-efeito, despachar e então registrar o resultado. `allowed_tools` nomeia um
+subconjunto exato das ferramentas registradas; expressões de permissão com
+curinga e nomes de ferramentas embutidas da CLI não são aceitos como entradas do
+registro.
+
+Por isso `allowed_tools` é obrigatório e `permission_mode` é opt-in: eles
+delimitam o que o filho pode *pedir*, enquanto o runtime — e não o filho — decide
+o que de fato acontece. Cada sessão de CLI gerenciada mantém o próprio journal
+assinado. Veja [Contenção da CLI gerenciada](/managed-cli-containment) para a
+configuração de imagem, montagens, políticas e `[managed_cli.inference]`, e o
+[broker de ferramentas governado](/governed-tool-broker) para o contrato de
+intermediação.
+
 
 ---
 

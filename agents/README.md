@@ -1,6 +1,6 @@
 # Symbiont Example Agents
 
-This directory contains ten reusable agent examples that demonstrate core Symbiont capabilities and common use cases. These agents serve as both learning resources and production-ready templates for building your own intelligent automation workflows.
+This directory contains fifteen reusable agent examples that demonstrate core Symbiont capabilities and common use cases. These agents serve as both learning resources and production-ready templates for building your own intelligent automation workflows.
 
 ## 📋 Overview
 
@@ -20,6 +20,26 @@ This directory contains ten reusable agent examples that demonstrate core Symbio
 | [SchemaPin Researcher](#schemapin-researcher) | Supply-chain secure research | Only executes cryptographically verified tools and sources |
 | [HITL DevOps](#hitl-devops) | Human-in-the-loop infra | Read-only with cryptographic approval for privilege escalation |
 | [Code Review Pipeline](#code-review-pipeline) | Multi-agent trust boundary | Untrusted developer + AgentPin-authenticated reviewer |
+| [Code Reviewer (Mode B)](#code-reviewer-mode-b) | Governed Claude Code subprocess | `executor = "claude_code"`; spawns Claude Code under CliExecutor with the `SYMBIONT_*` handshake |
+
+### Mode B: Governed Claude Code
+
+**Code Reviewer** (`code_reviewer.symbi`) is the reference *managed-CLI* agent. Its
+metadata declares `executor = "claude_code"`, so `symbi run code_reviewer` spawns
+a governed Claude Code subprocess via the runtime's `CliExecutor` instead of the
+LLM reasoning loop. The spawn passes the policy Gate, sets the `SYMBIONT_MANAGED`
+handshake (the symbi-claude-code plugin then defers its hooks to the outer Gate),
+and wires the stdio `symbi mcp` back-channel.
+
+```bash
+# Allow the spawn at the Gate via a Cedar policy, or for local dev:
+SYMBI_INSECURE_ALLOW_ALL=1 symbi run code_reviewer --target /path/to/repo \
+  --max-turns 12 --budget-timeout 15m
+```
+
+`--max-turns` is the primary cooperative bound; `--budget-timeout` is a hard
+wall-clock backstop. See the "Mode B" section of `docs/getting-started.md` for the
+full env handshake and flag reference.
 
 ### v1.8.0 Governance Examples
 
@@ -63,11 +83,10 @@ cp examples/agents/* ./agents/
 
 ```bash
 # Parse and validate an agent definition
-cargo run -- dsl parse agents/nlp_processor.dsl
+symbi dsl -f agents/nlp_processor.symbi
 
-# Run an agent in the runtime
-cd crates/runtime
-cargo run --example basic_agent -- --agent ../../agents/nlp_processor.dsl
+# Run an agent (needs an LLM key: OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)
+symbi run agents/nlp_processor.symbi -i '{"text": "Analyze this feedback."}'
 ```
 
 ---
@@ -90,7 +109,7 @@ cargo run --example basic_agent -- --agent ../../agents/nlp_processor.dsl
 echo '{
   "text": "I love this product! The customer service was excellent and delivery was fast.",
   "tasks": ["sentiment", "entities", "keywords"]
-}' | cargo run --example basic_agent -- --agent agents/nlp_processor.dsl
+}' | cargo run --example basic_agent -- --agent agents/nlp_processor.symbi
 ```
 
 ### Expected Output
@@ -152,7 +171,7 @@ echo '{
       {"name": "age", "type": "integer", "min": 0, "max": 120}
     ]
   }
-}' | cargo run --example basic_agent -- --agent agents/data_validator.dsl
+}' | cargo run --example basic_agent -- --agent agents/data_validator.symbi
 ```
 
 ### Expected Output
@@ -214,7 +233,7 @@ echo '{
     "content": "name,email,age\nJohn,john@example.com,30\nJane,jane@example.com,25"
   },
   "target_format": "json"
-}' | cargo run --example basic_agent -- --agent agents/format_converter.dsl
+}' | cargo run --example basic_agent -- --agent agents/format_converter.symbi
 ```
 
 ### Expected Output
@@ -280,7 +299,7 @@ echo '{
     }
   ],
   "query": "New York, NY"
-}' | cargo run --example basic_agent -- --agent agents/api_aggregator.dsl
+}' | cargo run --example basic_agent -- --agent agents/api_aggregator.symbi
 ```
 
 ### Expected Output
@@ -350,7 +369,7 @@ echo '{
     "classification": "internal"
   },
   "scan_type": "comprehensive"
-}' | cargo run --example basic_agent -- --agent agents/security_scanner.dsl
+}' | cargo run --example basic_agent -- --agent agents/security_scanner.symbi
 ```
 
 ### Expected Output
@@ -447,7 +466,7 @@ echo '{
     "timestamp": "2024-01-15T10:30:00Z",
     "login_attempts": 5
   }
-}' | cargo run --example basic_agent -- --agent agents/webhook_handler.dsl
+}' | cargo run --example basic_agent -- --agent agents/webhook_handler.symbi
 ```
 
 ### Expected Output
@@ -530,7 +549,7 @@ echo '{
     ],
     "allowed_agents": ["data_validator", "format_converter", "nlp_processor"]
   }
-}' | cargo run --example basic_agent -- --agent agents/workflow_orchestrator.dsl
+}' | cargo run --example basic_agent -- --agent agents/workflow_orchestrator.symbi
 ```
 
 ### Expected Output
@@ -618,7 +637,7 @@ echo '{
       }
     ]
   }
-}' | cargo run --example basic_agent -- --agent agents/notification_router.dsl
+}' | cargo run --example basic_agent -- --agent agents/notification_router.symbi
 ```
 
 ### Expected Output
@@ -692,13 +711,13 @@ echo '{
     "source": "adr-001",
     "user": {"name": "alice", "role": "editor"}
   }
-}' | cargo run --example basic_agent -- --agent agents/knowledge_curator.dsl
+}' | cargo run --example basic_agent -- --agent agents/knowledge_curator.symbi
 
 # Search the knowledge base
 echo '{
   "query": "What database did we choose?",
   "context": {"user": {"name": "bob", "role": "viewer"}}
-}' | cargo run --example basic_agent -- --agent agents/knowledge_curator.dsl
+}' | cargo run --example basic_agent -- --agent agents/knowledge_curator.symbi
 ```
 
 ### Use Cases
@@ -766,7 +785,7 @@ echo '{
   "verified": true,
   "summary": "Critical dependency vulnerability in lodash",
   "severity": "critical"
-}' | cargo run --example basic_agent -- --agent agents/incident_tracker.dsl
+}' | cargo run --example basic_agent -- --agent agents/incident_tracker.symbi
 ```
 
 ### Expected Output
@@ -848,10 +867,10 @@ export SLACK_WEBHOOK_URL=your_slack_webhook
 
 ```bash
 # Validate agent syntax
-cargo run -- dsl parse agents/your_agent.dsl
+cargo run -- dsl parse agents/your_agent.symbi
 
 # Test with mock data
-echo '{"test": "data"}' | cargo run --example basic_agent -- --agent agents/your_agent.dsl
+echo '{"test": "data"}' | cargo run --example basic_agent -- --agent agents/your_agent.symbi
 
 # Run integration tests
 cargo test --test agent_integration_tests

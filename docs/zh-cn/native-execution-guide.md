@@ -15,6 +15,8 @@ Symbiont 支持在没有 Docker 或容器隔离的情况下运行智能体，适
 - 无资源限制执行
 - 直接访问主机系统
 
+> **`native-sandbox` 功能在 release 构建中无法编译。** 它在 `not(debug_assertions)` 下被 `compile_error!` 保护，因此 release 二进制永远不会包含原生运行器。它是一个仅限 debug 的开发辅助工具。
+
 **仅在以下情况使用**：
 - 使用受信任代码的本地开发
 - 使用受信任智能体的受控环境
@@ -63,26 +65,22 @@ graph LR
 ### 选项 1：TOML 配置
 
 ```toml
-# config.toml
+# symbiont.toml
 
 [security]
-# Allow native execution (default: false)
+# 允许原生执行（默认值：false）
 allow_native_execution = true
-# Default sandbox tier
-default_sandbox_tier = "None"  # or "Tier1", "Tier2", "Tier3"
 
-[security.native_execution]
-# Apply resource limits even in native mode
-enforce_resource_limits = true
-# Maximum memory in MB
-max_memory_mb = 2048
-# Maximum CPU cores
-max_cpu_cores = 4.0
-# Maximum execution time in seconds
-max_execution_time_seconds = 300
-# Working directory for native execution
+# 原生执行是其自身的顶级配置节（并非嵌套在 [security] 之下）。
+[native_execution]
+enabled = true
+default_executable = "python3"
 working_directory = "/tmp/symbiont-native"
-# Allowed commands/executables
+# 即使在原生模式下也应用操作系统资源限制
+enforce_resource_limits = true
+max_memory_mb = 2048              # Option<u64>
+max_cpu_seconds = 300             # Option<u64> —— CPU 时间，而非核心数量
+max_execution_time_seconds = 300  # 挂钟超时
 allowed_executables = ["python3", "node", "bash"]
 ```
 
@@ -99,13 +97,12 @@ timeout_seconds = 30
 max_body_size = 10485760
 
 [database]
-# Default: LanceDB embedded (zero-config, no external services needed)
-vector_backend = "lancedb"
-vector_data_path = "./data/vector_db"
+# 嵌入向量维度。LanceDB（默认的嵌入式后端）无需进一步配置。
+# 后端在构建时通过 `vector-lancedb`（默认）或 `vector-qdrant` Cargo 功能选择，
+# 不存在 `vector_backend` 配置键；可使用 SYMBIONT_VECTOR_BACKEND 环境变量在运行时切换。
 vector_dimension = 384
 
-# Optional: Qdrant (uncomment to use Qdrant instead of LanceDB)
-# vector_backend = "qdrant"
+# 在使用 Qdrant 后端（SYMBIONT_VECTOR_BACKEND=qdrant）时使用：
 # qdrant_url = "http://localhost:6333"
 # qdrant_collection = "symbiont"
 
@@ -150,34 +147,36 @@ allowed_executables = ["python3", "python", "node", "bash", "sh"]
 | `max_execution_time_seconds` | u64 | `300` | 挂钟超时 |
 | `allowed_executables` | Vec<String> | `[bash, python3, etc.]` | 可执行文件白名单 |
 
-### 选项 2：环境变量
+### 选项 2：运行时安全守卫（环境变量）
+
+不存在 `SYMBIONT_NATIVE_*` / `SYMBIONT_ALLOW_NATIVE_EXECUTION` /
+`SYMBIONT_DEFAULT_SANDBOX_TIER` 等设置——原生执行通过上文的
+`[native_execution]` 配置节进行配置。唯一与原生相关的环境变量是这两项运行时安全守卫，
+二者都必须设置才能实际运行原生（零隔离）运行器：
 
 ```bash
-export SYMBIONT_ALLOW_NATIVE_EXECUTION=true
-export SYMBIONT_DEFAULT_SANDBOX_TIER=None
-export SYMBIONT_NATIVE_MAX_MEMORY_MB=2048
-export SYMBIONT_NATIVE_MAX_CPU_CORES=4.0
-export SYMBIONT_NATIVE_WORKING_DIR=/tmp/symbiont-native
+export SYMBI_UNSAFE_NATIVE_SANDBOX=1   # acknowledge the native runner
+export SYMBIONT_ALLOW_UNISOLATED=1     # permit SandboxTier::None
 ```
 
 ### 选项 3：智能体级别配置
 
 ```symbi
-agent NativeWorker {
-  metadata {
-    name: "Local Development Agent"
-    version: "1.0.0"
+metadata {
+  version = "1.0.0"
+  description = "Local Development Agent"
+}
+
+agent native_worker(task: String) -> String {
+  capabilities = ["local_filesystem", "network"]
+
+  policy dev_only {
+    allow: ["local_filesystem", "network"] if true
   }
 
-  security {
-    tier: None
-    sandbox: Permissive
-    capabilities: ["local_filesystem", "network"]
-  }
-
-  on trigger "local_processing" {
-    // Executes directly on host
-    execute_native("python3 process.py")
+  # tier 0 = 无沙箱（主机执行）；需要上述各项 opt-in
+  with sandbox = "none" {
+    return process(task);
   }
 }
 ```
@@ -194,7 +193,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Enable native execution for development
     let mut config = Config::default();
     config.security.allow_native_execution = true;
-    config.security.default_sandbox_tier = SecurityTier::None;
 
     let orchestrator = SandboxOrchestrator::new(config)?;
 
@@ -210,20 +208,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### 示例 2：CLI 标志
+### 示例 2：使用原生运行器构建并运行
+
+不存在 `--native` CLI 标志。原生（主机）执行需要三项显式的 opt-in：
+
+1. **使用 `native-sandbox` 功能构建 —— 仅限 debug 构建。** 该功能不提供任何隔离，并在 release 构建中被 `compile_error!` 保护：
+
+   ```bash
+   cargo build --features native-sandbox    # 仅限 debug；release 无法编译
+   ```
+
+2. **确认两项运行时守卫：**
+
+   ```bash
+   export SYMBI_UNSAFE_NATIVE_SANDBOX=1   # 确认使用原生运行器
+   export SYMBIONT_ALLOW_UNISOLATED=1     # 在非 dev 运行中允许 SandboxTier::None
+   ```
+
+3. **在智能体 DSL 中选择 tier 0（无沙箱）：**
+
+   ```
+   with sandbox = "none" {
+       // ...
+   }
+   ```
+
+   资源限制（内存/CPU/超时）来自 `with` 块/配置（见上文），而非 CLI 标志。
+
+随后正常运行：
 
 ```bash
-# Run with native execution
-symbiont run agent.dsl --native
-
-# Or with explicit tier
-symbiont run agent.dsl --sandbox-tier=none
-
-# With resource limits
-symbiont run agent.dsl --native \
-  --max-memory=1024 \
-  --max-cpu=2.0 \
-  --timeout=300
+symbi run agent.symbi
 ```
 
 ### 示例 3：混合执行
@@ -303,23 +318,31 @@ impl NativeRunner {
 ### 步骤 1：更新配置
 
 ```diff
-# config.toml
+# symbiont.toml
 [security]
-- default_sandbox_tier = "Tier1"
-+ default_sandbox_tier = "None"
 + allow_native_execution = true
++
+++ [native_execution]
+++ enabled = true
 ```
 
-### 步骤 2：移除 Docker 依赖
+然后在 DSL 中为每个智能体选择第 0 层（无沙箱）：
+
+```
+with sandbox = "none" { ... }
+```
+
+### 步骤 2：构建并运行（仅限 debug）
 
 ```bash
 # No longer required
 # docker build -t symbi:latest .
 # docker run ...
 
-# Direct execution
-cargo build --release
-./target/release/symbiont run agent.dsl
+# native-sandbox 特性仅限 debug（release 构建中会触发 compile_error!）：
+cargo build --features native-sandbox
+SYMBI_UNSAFE_NATIVE_SANDBOX=1 SYMBIONT_ALLOW_UNISOLATED=1 \
+  ./target/debug/symbi run agent.symbi
 ```
 
 ### 混合方案
@@ -349,7 +372,9 @@ Docker 自动隔离环境变量。使用原生执行时，需要显式设置它�
 ```bash
 export AGENT_API_KEY="xxx"
 export AGENT_DB_URL="postgresql://..."
-symbiont run agent.dsl --native
+export SYMBI_UNSAFE_NATIVE_SANDBOX=1
+export SYMBIONT_ALLOW_UNISOLATED=1
+symbi run agent.symbi   # 智能体必须声明：with sandbox = "none" { ... }
 ```
 
 ## 性能对比

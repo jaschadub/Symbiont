@@ -9,6 +9,15 @@ Verstehen Sie die Architektur des Symbi-Laufzeitsystems und die Kernkomponenten.
 
 ## Überblick
 
+Die umgesetzten Änderungen zur Eindämmung beschreibt der
+[Betreiber- und Architektur-Leitfaden zur Eindämmung](/containment-branch-guide).
+Die Runtime bindet vorbereitete Aufrufe über Validierung, Genehmigung, Cedar,
+erforderliches Audit und einmaligen Dispatch; ein unabhängiger Supervisor
+verwaltet die eingedaemmten Worker. Die abgedeckten CLI-, HTTP-, Scheduler- und
+DSL-Standardwege verwenden geschützte Journale. Die nachfolgenden Prinzipien
+beschreiben den Entwurf; verbleibende Ausführungs- und Audit-Pfade verhindern
+eine vollständige Aussage zur Eindämmung.
+
 Das Symbi-Laufzeitsystem bietet eine sichere, skalierbare und richtlinienorientierte Ausführungsumgebung für autonome Agenten. Auf Rust für Leistung und Sicherheit aufgebaut, implementiert es ein mehrstufiges Sicherheitsmodell mit umfassenden Audit-Funktionen.
 
 ### Grundprinzipien
@@ -56,8 +65,9 @@ graph TB
     subgraph "Sandbox Tiers"
         T1[Tier 1: Docker]
         T2[Tier 2: gVisor]
+        T3[Tier 3: Firecracker microVM]
     end
-    
+
     ARS --> ACM
     ARS --> PE
     ALC --> SO
@@ -66,6 +76,7 @@ graph TB
     ACM --> RAG
     SO --> T1
     SO --> T2
+    SO --> T3
     MCP --> TV
     PE --> AT
 ```
@@ -160,7 +171,7 @@ pub struct ResourceLimits {
 
 ### Sandbox-Architektur
 
-Die Laufzeit implementiert zwei Sicherheitsstufen basierend auf dem Operationsrisiko:
+Die Laufzeit liefert drei Host-Isolationsstufen — alle OSS — plus ein separates Hosted-Cloud-Backend (E2B). Betreiber waehlen die Stufe pro Agent ueber den DSL-Block `with { sandbox = ... }` oder setzen einen Projekt-Standard in `[sandbox] tier = "..."`.
 
 #### Stufe 1: Docker-Isolation
 **Anwendungsfall**: Risikoarme Operationen, Entwicklungsaufgaben
@@ -170,13 +181,21 @@ Die Laufzeit implementiert zwei Sicherheitsstufen basierend auf dem Operationsri
 - Geeignet für vertrauenswürdigen Code mit minimalen Sicherheitsanforderungen
 
 #### Stufe 2: gVisor-Isolation
-**Anwendungsfall**: Standard-Produktionsaufgaben, Datenverarbeitung
+**Anwendungsfall**: Standard-Produktionsaufgaben, Datenverarbeitung, nicht vertrauenswuerdiger Code
 - Userspace-Kernel mit Systemaufruf-Abfangung
 - Speicherschutz und I/O-Virtualisierung
 - Verbesserte Sicherheit mit minimalen Leistungsauswirkungen
-- Standard-Stufe für die meisten Agentenoperationen
+- Erfordert `runsc`, registriert als Docker-Runtime
 
-> **Hinweis**: Zusätzliche Isolationsstufen sind in Enterprise-Editionen für maximale Sicherheitsanforderungen verfügbar.
+#### Stufe 3: Firecracker microVM
+**Anwendungsfall**: Workloads mit hoechster Isolation — mandantenfaehiger nicht vertrauenswuerdiger Code, regulierte Daten, Blast-Radius-Eindaemmung
+- Hardware-Virtualisierung via KVM mit einem dedizierten Kernel pro Ausfuehrung
+- Vom Betreiber bereitgestellte vmlinux + rootfs (standardmaessig schreibgeschuetzt)
+- Keine geteilte Kernel-Oberflaeche mit dem Host
+- Erfordert das `firecracker`-Binary plus den passenden `symbi-sandbox-guest` PID-1-Dienst und Supervisor — siehe [`docs/firecracker-setup.md`](/firecracker-setup).
+
+#### Hosted-Ausfuehrung: E2B (keine Stufe)
+E2B ist ein separates Hosted-Cloud-Backend, **kein** Peer von Stufe 1/2/3. Es wird auf `SecurityTier::Hosted` abgebildet, das beim Sortieren **unterhalb** von `Tier1` einsortiert wird — Richtlinien, die Host-Isolation verlangen (`tier >= Tier1`), lehnen Hosted-Ausfuehrung ab. Opt-in ausschliesslich ueber DSL (`with { sandbox = "e2b" }`).
 
 ---
 
@@ -242,6 +261,20 @@ Der `ReasoningBuiltinContext` traegt drei optionale Felder:
 - `sender_agent_id` -- Identitaet des aufrufenden Agenten
 - `comm_bus` -- Referenz auf den CommunicationBus fuer Nachrichtenrouting
 - `comm_policy` -- Referenz auf das CommunicationPolicyGate fuer Autorisierung
+
+### Instanzenuebergreifendes Agent-Messaging
+
+Der In-Process-`CommunicationBus` hat ein verteiltes Gegenstueck -- `RemoteCommunicationBus` -- das dieselben Nachrichtentypen (`ask`, `send_to`, `delegate`, `parallel`, `race`) per HTTP zwischen separaten Runtime-Instanzen weiterleitet. Dadurch kann ein auf einem Host bereitgestellter Koordinator mit auf einem anderen Host bereitgestellten Workern kommunizieren, ohne auf Richtliniendurchsetzung, Signaturen oder Audit-Trails zu verzichten.
+
+Wichtige Eigenschaften:
+
+- **Gleicher Kontrakt** -- `RemoteCommunicationBus` implementiert dasselbe Trait wie der lokale Bus, sodass sich Agent-Code und DSL-Builtins zwischen In-Process- und instanzenuebergreifenden Topologien nicht aendern.
+- **HTTP-Messaging-Endpunkte** -- auf der Runtime-HTTP-API exponiert und in den Standardkontext des `RuntimeBridge` eingebunden, sodass `symbi up` an einem Standort Nachrichten von `symbi up` an anderer Stelle empfangen kann.
+- **AgentPin-verankerte Identitaet** -- Sender praesentieren ein AgentPin ES256-Token; Empfaenger verifizieren gegen den domainverankerten Schluessel des Senders, bevor das Policy Gate laeuft.
+- **SchemaPin-Verifikation** -- alle ueber Instanzen hinweg referenzierten Tool-Manifeste werden vor der Ausfuehrung gegen ihre gepinnten Signaturen verifiziert.
+- **Audit** -- Remote-Nachrichtensendung und -empfang werden im selben kryptographisch manipulationssicheren Format wie lokale Nachrichten protokolliert, sodass der Audit-Trail dem Nachrichten-Hop folgt.
+
+Die Deployment-Topologie besteht typischerweise aus einer Koordinator-Instanz und einer oder mehreren Worker-Instanzen, die jeweils via `symbi shell /deploy …` (Beta) auf Docker, Cloud Run oder App Runner deployt werden. Siehe den [Symbi Shell-Deployment-Leitfaden](/symbi-shell#deployment-beta).
 
 ---
 
@@ -429,18 +462,9 @@ pub struct AuditEvent {
 - **Zeitstempel-Verifizierung**: Kryptographische Zeitstempel
 - **Batch-Verifizierung**: Effiziente Massenverifizierung
 
-### Compliance-Features
-
-**Regulatorische Unterstützung:**
-- **HIPAA**: Gesundheitsdatenschutz-Compliance
-- **GDPR**: Europäische Datenschutzanforderungen
-- **SOX**: Finanzaudit-Spur-Anforderungen
-- **Angepasst**: Konfigurierbare Compliance-Frameworks
-
 **Audit-Fähigkeiten:**
 - Echtzeit-Event-Streaming
 - Historische Event-Abfragen
-- Compliance-Berichtserstellung
 - Integritätsverifizierung
 
 ---
@@ -476,7 +500,7 @@ pub struct AuditEvent {
 - **Leck-Prävention**: Automatische Bereinigung und Überwachung
 
 **CPU-Auslastung:**
-- **Scheduler-Overhead**: <2% CPU für 10.000 Agenten
+- **Scheduler-Overhead**: Die Latenz der Registrierung und der begrenzten Warteschlange wird getestet. Der CPU-Aufwand für 10.000 ausführende Agenten ist nicht nachgewiesen.
 - **Kontextwechsel**: Hardware-unterstützte virtuelle Threads
 - **Lastverteilung**: Dynamische Lastverteilung
 - **Prioritäts-Scheduling**: Echtzeit- und Batch-Verarbeitungsebenen
@@ -522,26 +546,29 @@ max_concurrent_connections = 100
 ### Umgebungsvariablen
 
 ```bash
-# Core runtime
-export SYMBI_LOG_LEVEL=info
-export SYMBI_RUNTIME_MODE=production
-export SYMBI_CONFIG_PATH=/etc/symbi/config.toml
+# Erforderlich: 32-Byte-Hex-Schluessel zur Verschluesselung des persistenten Zustands.
+# `symbi init` schreibt einen in .env. Generieren mit: openssl rand -hex 32
+export SYMBIONT_MASTER_KEY=...
 
-# Security
-export SYMBI_CRYPTO_PROVIDER=ring
-export SYMBI_AUDIT_STORAGE=/var/log/symbi/audit
+# LLM-Anbieter (einen setzen)
+export ANTHROPIC_API_KEY=...   # oder OPENAI_API_KEY / OPENROUTER_API_KEY
 
-# Vektordatenbank (LanceDB ist der konfigurationsfreie Standard)
-export SYMBIONT_VECTOR_BACKEND=lancedb          # oder "qdrant"
-export SYMBIONT_VECTOR_DATA_PATH=./data/vectors # LanceDB-Speicherpfad
+# Policy-Gate: Cedar ist standardmaessig aktiv und verdrahtet sich automatisch aus policies/*.cedar.
+# export SYMBI_INSECURE_ALLOW_ALL=1   # NUR FUER LOKALE ENTWICKLUNG -- permissives Gate
 
-# Optional: nur erforderlich bei Verwendung des Qdrant-Backends
-# export SYMBIONT_VECTOR_HOST=localhost
-# export SYMBIONT_VECTOR_PORT=6334
+# Scheduler-log_file-Zustellung (fuer diesen Kanal erforderlich; auf dieses Verzeichnis beschraenkt)
+# export SYMBIONT_LOG_DIR=/var/log/symbiont
 
-# Externe Abhängigkeiten
-export OPENAI_API_KEY=your_api_key_here
-export MCP_SERVER_DISCOVERY=enabled
+# Vektorsuche: LanceDB ist der konfigurationsfreie Standard. Um stattdessen Qdrant zu verwenden:
+# export SYMBIONT_VECTOR_BACKEND=qdrant
+# export QDRANT_URL=http://localhost:6333
+
+# OPA-Policy-Backend, falls verwendet (https + Bearer erforderlich fuer Nicht-Loopback-Hosts):
+# export SYMBIONT_OPA_URL=https://opa.internal:8181
+# export SYMBIONT_OPA_AUTH_TOKEN=...
+
+# Zulassungsliste vertrauenswuerdiger Reverse-Proxy-CIDRs fuer X-Forwarded-For
+# export SYMBI_TRUSTED_PROXIES=10.0.0.0/8
 ```
 
 ---
@@ -599,7 +626,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates
 COPY --from=builder /app/target/release/symbi /usr/local/bin/
 EXPOSE 8080
-CMD ["symbi", "mcp", "--config", "/etc/symbi/config.toml"]
+CMD ["symbi", "up"]
 ```
 
 ### Kubernetes-Deployment
@@ -625,8 +652,11 @@ spec:
         ports:
         - containerPort: 8080
         env:
-        - name: SYMBI_RUNTIME_MODE
-          value: "production"
+        - name: SYMBIONT_MASTER_KEY
+          valueFrom:
+            secretKeyRef:
+              name: symbi-secrets
+              key: master-key
         resources:
           requests:
             memory: "1Gi"

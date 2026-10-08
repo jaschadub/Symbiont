@@ -19,6 +19,8 @@ Symbiont unterstuetzt den Betrieb von Agenten ohne Docker oder Container-Isolati
 - Keine Durchsetzung von Ressourcenlimits
 - Direkter Zugriff auf das Hostsystem
 
+> **Das `native-sandbox`-Feature laesst sich in Release-Builds nicht kompilieren.** Es ist durch ein `compile_error!` unter `not(debug_assertions)` geschuetzt, sodass ein Release-Binary niemals den nativen Runner ausliefern kann. Es ist eine Entwicklungshilfe nur fuer Debug-Builds.
+
 **NUR VERWENDEN FUER**:
 - Lokale Entwicklung mit vertrauenswuerdigem Code
 - Kontrollierte Umgebungen mit vertrauenswuerdigen Agenten
@@ -67,26 +69,22 @@ graph LR
 ### Option 1: TOML-Konfiguration
 
 ```toml
-# config.toml
+# symbiont.toml
 
 [security]
 # Native Ausfuehrung erlauben (Standard: false)
 allow_native_execution = true
-# Standard-Sandbox-Stufe
-default_sandbox_tier = "None"  # oder "Tier1", "Tier2", "Tier3"
 
-[security.native_execution]
-# Ressourcenlimits auch im nativen Modus anwenden
-enforce_resource_limits = true
-# Maximaler Speicher in MB
-max_memory_mb = 2048
-# Maximale CPU-Kerne
-max_cpu_cores = 4.0
-# Maximale Ausfuehrungszeit in Sekunden
-max_execution_time_seconds = 300
-# Arbeitsverzeichnis fuer native Ausfuehrung
+# Native Ausfuehrung ist ein eigener Top-Level-Abschnitt (nicht unter [security] verschachtelt).
+[native_execution]
+enabled = true
+default_executable = "python3"
 working_directory = "/tmp/symbiont-native"
-# Erlaubte Befehle/ausfuehrbare Dateien
+# OS-Ressourcenlimits auch im nativen Modus anwenden
+enforce_resource_limits = true
+max_memory_mb = 2048              # Option<u64>
+max_cpu_seconds = 300             # Option<u64> -- CPU-Zeit, keine Kernanzahl
+max_execution_time_seconds = 300  # Echtzeit-Timeout
 allowed_executables = ["python3", "node", "bash"]
 ```
 
@@ -103,13 +101,14 @@ timeout_seconds = 30
 max_body_size = 10485760
 
 [database]
-# Standard: LanceDB eingebettet (keine Konfiguration noetig, keine externen Dienste erforderlich)
-vector_backend = "lancedb"
-vector_data_path = "./data/vector_db"
+# Embedding-Vektordimension. LanceDB (das standardmaessige eingebettete Backend)
+# benoetigt keine weitere Konfiguration. Das Backend wird zur Build-Zeit ueber das
+# Cargo-Feature `vector-lancedb` (Standard) oder `vector-qdrant` ausgewaehlt -- es
+# gibt keinen `vector_backend`-Konfigurationsschluessel; verwende die
+# Umgebungsvariable SYMBIONT_VECTOR_BACKEND, um zur Laufzeit zu wechseln.
 vector_dimension = 384
 
-# Optional: Qdrant (auskommentieren, um Qdrant statt LanceDB zu verwenden)
-# vector_backend = "qdrant"
+# Wird beim Betrieb mit dem Qdrant-Backend verwendet (SYMBIONT_VECTOR_BACKEND=qdrant):
 # qdrant_url = "http://localhost:6333"
 # qdrant_collection = "symbiont"
 
@@ -154,34 +153,38 @@ allowed_executables = ["python3", "python", "node", "bash", "sh"]
 | `max_execution_time_seconds` | u64 | `300` | Echtzeit-Timeout |
 | `allowed_executables` | Vec<String> | `[bash, python3, etc.]` | Whitelist ausfuehrbarer Dateien |
 
-### Option 2: Umgebungsvariablen
+### Option 2: Laufzeit-Sicherheitsvorkehrungen (Umgebung)
+
+Es gibt keine `SYMBIONT_NATIVE_*` / `SYMBIONT_ALLOW_NATIVE_EXECUTION` /
+`SYMBIONT_DEFAULT_SANDBOX_TIER` Einstellungen -- native Ausfuehrung wird ueber den
+oben gezeigten `[native_execution]`-Konfigurationsabschnitt konfiguriert. Die
+einzigen nativ-bezogenen Umgebungsvariablen sind die beiden
+Laufzeit-Sicherheitsvorkehrungen, die beide gesetzt sein muessen, um den nativen
+(isolationsfreien) Runner tatsaechlich auszufuehren:
 
 ```bash
-export SYMBIONT_ALLOW_NATIVE_EXECUTION=true
-export SYMBIONT_DEFAULT_SANDBOX_TIER=None
-export SYMBIONT_NATIVE_MAX_MEMORY_MB=2048
-export SYMBIONT_NATIVE_MAX_CPU_CORES=4.0
-export SYMBIONT_NATIVE_WORKING_DIR=/tmp/symbiont-native
+export SYMBI_UNSAFE_NATIVE_SANDBOX=1   # acknowledge the native runner
+export SYMBIONT_ALLOW_UNISOLATED=1     # permit SandboxTier::None
 ```
 
 ### Option 3: Konfiguration auf Agentenebene
 
 ```symbi
-agent NativeWorker {
-  metadata {
-    name: "Local Development Agent"
-    version: "1.0.0"
+metadata {
+  version = "1.0.0"
+  description = "Local Development Agent"
+}
+
+agent native_worker(task: String) -> String {
+  capabilities = ["local_filesystem", "network"]
+
+  policy dev_only {
+    allow: ["local_filesystem", "network"] if true
   }
 
-  security {
-    tier: None
-    sandbox: Permissive
-    capabilities: ["local_filesystem", "network"]
-  }
-
-  on trigger "local_processing" {
-    // Wird direkt auf dem Host ausgefuehrt
-    execute_native("python3 process.py")
+  # tier 0 = keine Sandbox (Host-Ausfuehrung); erfordert die oben genannten Opt-ins
+  with sandbox = "none" {
+    return process(task);
   }
 }
 ```
@@ -198,7 +201,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Native Ausfuehrung fuer Entwicklung aktivieren
     let mut config = Config::default();
     config.security.allow_native_execution = true;
-    config.security.default_sandbox_tier = SecurityTier::None;
 
     let orchestrator = SandboxOrchestrator::new(config)?;
 
@@ -214,20 +216,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Beispiel 2: CLI-Flag
+### Beispiel 2: Bauen und Ausfuehren mit dem nativen Runner
+
+Es gibt kein `--native`-CLI-Flag. Native (Host-)Ausfuehrung erfordert drei explizite Opt-ins:
+
+1. **Mit dem `native-sandbox`-Feature bauen -- nur Debug-Builds.** Das Feature bietet keinerlei Isolation und ist durch ein `compile_error!` in Release-Builds geschuetzt:
+
+   ```bash
+   cargo build --features native-sandbox    # nur Debug; Release laesst sich nicht kompilieren
+   ```
+
+2. **Beide Laufzeit-Schutzmechanismen bestaetigen:**
+
+   ```bash
+   export SYMBI_UNSAFE_NATIVE_SANDBOX=1   # den nativen Runner bestaetigen
+   export SYMBIONT_ALLOW_UNISOLATED=1     # SandboxTier::None in Nicht-Dev-Laeufen erlauben
+   ```
+
+3. **Stufe 0 (keine Sandbox) im Agenten-DSL waehlen:**
+
+   ```
+   with sandbox = "none" {
+       // ...
+   }
+   ```
+
+   Ressourcenlimits (Speicher/CPU/Timeout) stammen aus dem `with`-Block / der Konfiguration (siehe oben), nicht aus CLI-Flags.
+
+Dann normal ausfuehren:
 
 ```bash
-# Mit nativer Ausfuehrung starten
-symbiont run agent.dsl --native
-
-# Oder mit expliziter Stufe
-symbiont run agent.dsl --sandbox-tier=none
-
-# Mit Ressourcenlimits
-symbiont run agent.dsl --native \
-  --max-memory=1024 \
-  --max-cpu=2.0 \
-  --timeout=300
+symbi run agent.symbi
 ```
 
 ### Beispiel 3: Gemischte Ausfuehrung
@@ -307,23 +326,31 @@ Auf Unix-Systemen kann die native Ausfuehrung dennoch einige Limits durchsetzen:
 ### Schritt 1: Konfiguration aktualisieren
 
 ```diff
-# config.toml
+# symbiont.toml
 [security]
-- default_sandbox_tier = "Tier1"
-+ default_sandbox_tier = "None"
 + allow_native_execution = true
+
++ [native_execution]
++ enabled = true
 ```
 
-### Schritt 2: Docker-Abhaengigkeiten entfernen
+Waehlen Sie anschliessend Tier 0 (kein Sandbox) pro Agent in der DSL:
+
+```
+with sandbox = "none" { ... }
+```
+
+### Schritt 2: Erstellen und ausfuehren (nur Debug)
 
 ```bash
 # Nicht mehr erforderlich
 # docker build -t symbi:latest .
 # docker run ...
 
-# Direkte Ausfuehrung
-cargo build --release
-./target/release/symbiont run agent.dsl
+# Das Feature native-sandbox ist nur fuer Debug-Builds (compile_error! in Release-Builds):
+cargo build --features native-sandbox
+SYMBI_UNSAFE_NATIVE_SANDBOX=1 SYMBIONT_ALLOW_UNISOLATED=1 \
+  ./target/debug/symbi run agent.symbi
 ```
 
 ### Hybridansatz
@@ -353,7 +380,9 @@ Docker hat Umgebungsvariablen automatisch isoliert. Bei nativer Ausfuehrung mues
 ```bash
 export AGENT_API_KEY="xxx"
 export AGENT_DB_URL="postgresql://..."
-symbiont run agent.dsl --native
+export SYMBI_UNSAFE_NATIVE_SANDBOX=1
+export SYMBIONT_ALLOW_UNISOLATED=1
+symbi run agent.symbi   # Agent muss deklarieren: with sandbox = "none" { ... }
 ```
 
 ## Performance-Vergleich

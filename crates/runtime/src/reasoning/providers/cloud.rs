@@ -9,6 +9,86 @@ use crate::reasoning::conversation::Conversation;
 use crate::reasoning::inference::*;
 use async_trait::async_trait;
 
+/// Map an Anthropic `stop_reason` string to a [`FinishReason`].
+///
+/// `has_tool_calls` is whether the parsed content produced at least one
+/// `tool_use` block. A `"refusal"` (safety-classifier decline; Anthropic
+/// returns it with HTTP 200) maps to [`FinishReason::Refusal`] so the loop can
+/// fail over rather than reading a refused turn as an empty, successful stop.
+fn map_anthropic_stop_reason(stop_reason: &str, has_tool_calls: bool) -> FinishReason {
+    match stop_reason {
+        "tool_use" => FinishReason::ToolCalls,
+        "max_tokens" => FinishReason::MaxTokens,
+        "refusal" => FinishReason::Refusal,
+        // end_turn / stop_sequence / pause_turn / anything else: a turn that
+        // still emitted tool calls is a tool turn; otherwise a plain stop.
+        _ if has_tool_calls => FinishReason::ToolCalls,
+        _ => FinishReason::Stop,
+    }
+}
+
+fn parse_token_usage(
+    value: Option<&serde_json::Value>,
+    anthropic: bool,
+) -> Result<Usage, InferenceError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(Usage::default());
+    };
+    if !value.is_object() {
+        return Err(InferenceError::ParseError("usage must be an object".into()));
+    }
+    let count = |key: &str| -> Result<Option<u32>, InferenceError> {
+        value
+            .get(key)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        InferenceError::ParseError(format!("invalid token count: {key}"))
+                    })
+            })
+            .transpose()
+    };
+    let (input, output, total) = if anthropic {
+        let input = count("input_tokens")?;
+        let output = count("output_tokens")?;
+        let creation = count("cache_creation_input_tokens")?.unwrap_or(0);
+        let read = count("cache_read_input_tokens")?.unwrap_or(0);
+        let (Some(input), Some(output)) = (input, output) else {
+            return Ok(Usage::default());
+        };
+        let input = input
+            .checked_add(creation)
+            .and_then(|n| n.checked_add(read))
+            .ok_or_else(|| InferenceError::ParseError("input token count overflow".into()))?;
+        let total = input
+            .checked_add(output)
+            .ok_or_else(|| InferenceError::ParseError("total token count overflow".into()))?;
+        (input, output, total)
+    } else {
+        let (input, output, total) = (
+            count("prompt_tokens")?,
+            count("completion_tokens")?,
+            count("total_tokens")?,
+        );
+        let (Some(input), Some(output), Some(total)) = (input, output, total) else {
+            return Ok(Usage::default());
+        };
+        if input.checked_add(output).is_none_or(|sum| sum > total) {
+            return Err(InferenceError::ParseError(
+                "inconsistent total token count".into(),
+            ));
+        }
+        (input, output, total)
+    };
+    Ok(Usage {
+        prompt_tokens: input,
+        completion_tokens: output,
+        total_tokens: total,
+    })
+}
+
 /// Cloud inference provider wrapping `LlmClient`.
 pub struct CloudInferenceProvider {
     client: LlmClient,
@@ -23,6 +103,20 @@ impl CloudInferenceProvider {
     /// Auto-detect from environment, returning None if no API key is set.
     pub fn from_env() -> Option<Self> {
         LlmClient::from_env().map(|c| Self { client: c })
+    }
+
+    /// Like `from_env`, but also accepts an optional `SecretStore` so API
+    /// keys can be sourced from HashiCorp Vault, OpenBao, or the file
+    /// backend instead of env vars. See [`LlmClient::from_env_or_secrets`]
+    /// for the resolution order and the `*_API_KEY_REF` env vars that
+    /// point at secret-store keys. When `store` is `None` or no `*_REF` is
+    /// configured, behaviour is identical to `from_env`.
+    pub async fn from_env_or_secrets(
+        store: Option<std::sync::Arc<dyn crate::secrets::SecretStore + Send + Sync>>,
+    ) -> Option<Self> {
+        LlmClient::from_env_or_secrets(store)
+            .await
+            .map(|c| Self { client: c })
     }
 
     /// Build the request body for OpenAI-compatible APIs (OpenAI, OpenRouter).
@@ -60,6 +154,26 @@ impl CloudInferenceProvider {
                 })
                 .collect();
             body["tools"] = serde_json::Value::Array(tools);
+
+            // OpenAI Chat Completions tool_choice. Only emit when an
+            // explicit choice is supplied; absent the field, OpenAI
+            // defaults to "auto".
+            if let Some(choice) = &options.tool_choice {
+                body["tool_choice"] = match choice {
+                    crate::reasoning::inference::ToolChoice::Auto => {
+                        serde_json::Value::String("auto".into())
+                    }
+                    crate::reasoning::inference::ToolChoice::Any => {
+                        serde_json::Value::String("required".into())
+                    }
+                    crate::reasoning::inference::ToolChoice::Tool { name } => {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {"name": name}
+                        })
+                    }
+                };
+            }
         }
 
         // Add response_format if not plain text
@@ -106,13 +220,31 @@ impl CloudInferenceProvider {
             body["temperature"] = serde_json::json!(options.temperature);
         }
 
+        // Prompt caching is a prefix match: bytes up to a `cache_control`
+        // breakpoint are cached and reused verbatim, and any change
+        // anywhere in that prefix invalidates it. Render order for the
+        // Anthropic Messages API is tools -> system -> messages, so a
+        // single breakpoint on the LAST block of the stable (tools+system)
+        // prefix caches everything before it in one shot. We emit at most
+        // one breakpoint here (the API caps requests at 4 total): on the
+        // system block when a system prompt is present (system renders
+        // after tools, so this covers both tools and system), otherwise on
+        // the last tool so the tool definitions alone still cache.
+        let has_system = system.is_some();
+
         if let Some(sys) = system {
-            body["system"] = serde_json::Value::String(sys);
+            body["system"] = serde_json::json!([
+                {
+                    "type": "text",
+                    "text": sys,
+                    "cache_control": { "type": "ephemeral" }
+                }
+            ]);
         }
 
         // Add tools
         if !options.tool_definitions.is_empty() {
-            let tools: Vec<serde_json::Value> = options
+            let mut tools: Vec<serde_json::Value> = options
                 .tool_definitions
                 .iter()
                 .map(|td| {
@@ -123,7 +255,48 @@ impl CloudInferenceProvider {
                     })
                 })
                 .collect();
+
+            // No system prompt to carry the breakpoint -- put it on the
+            // last tool instead so the tool-definitions prefix still caches.
+            if !has_system {
+                if let Some(last_tool) = tools.last_mut().and_then(|t| t.as_object_mut()) {
+                    last_tool.insert(
+                        "cache_control".to_string(),
+                        serde_json::json!({"type": "ephemeral"}),
+                    );
+                }
+            }
+
             body["tools"] = serde_json::Value::Array(tools);
+
+            // Anthropic Messages API tool_choice. We emit it only when
+            // an explicit choice is set; absent the field, Anthropic
+            // defaults to {"type":"auto"}.
+            if let Some(choice) = &options.tool_choice {
+                body["tool_choice"] = match choice {
+                    crate::reasoning::inference::ToolChoice::Auto => {
+                        serde_json::json!({"type": "auto"})
+                    }
+                    crate::reasoning::inference::ToolChoice::Any => {
+                        serde_json::json!({"type": "any"})
+                    }
+                    crate::reasoning::inference::ToolChoice::Tool { name } => {
+                        serde_json::json!({"type": "tool", "name": name})
+                    }
+                };
+            }
+        }
+
+        // Forward provider-specific extras (e.g. Anthropic's `output_config`
+        // for effort, `thinking`, etc.) after the body is otherwise fully
+        // built. This is the enabling mechanism for passing Anthropic-only
+        // params without a code change here; `extra` is applied last and so
+        // overrides any same-named key set above, by design. Deliberately
+        // does NOT hardcode a default `effort` or `thinking` -- this method
+        // is shared by every Anthropic-routed call, and a hardcoded default
+        // would silently change behavior for callers that don't want it.
+        for (k, v) in &options.extra {
+            body[k] = v.clone();
         }
 
         body
@@ -187,17 +360,7 @@ impl CloudInferenceProvider {
             }
         };
 
-        let usage = resp
-            .get("usage")
-            .map(|u| Usage {
-                prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                completion_tokens: u
-                    .get("completion_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32,
-                total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-            })
-            .unwrap_or_default();
+        let usage = parse_token_usage(resp.get("usage"), false)?;
 
         let actual_model = resp
             .get("model")
@@ -260,30 +423,25 @@ impl CloudInferenceProvider {
             .and_then(|s| s.as_str())
             .unwrap_or("end_turn");
 
-        let finish_reason = match stop_reason {
-            "tool_use" => FinishReason::ToolCalls,
-            "max_tokens" => FinishReason::MaxTokens,
-            _ => {
-                if tool_calls.is_empty() {
-                    FinishReason::Stop
-                } else {
-                    FinishReason::ToolCalls
-                }
-            }
-        };
+        let finish_reason = map_anthropic_stop_reason(stop_reason, !tool_calls.is_empty());
 
-        let usage = resp
-            .get("usage")
-            .map(|u| {
-                let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                Usage {
-                    prompt_tokens: input,
-                    completion_tokens: output,
-                    total_tokens: input + output,
-                }
-            })
-            .unwrap_or_default();
+        // A turn that produced neither text nor a tool call is a no-progress
+        // turn (e.g. a thinking-only / redacted-thinking-only turn, or a
+        // block type we don't parse). It's indistinguishable downstream from a
+        // deliberate empty stop, so warn to make loop-termination diagnosable.
+        if finish_reason == FinishReason::Refusal {
+            tracing::warn!(
+                "Anthropic response was a refusal (stop_reason=refusal); returning FinishReason::Refusal"
+            );
+        } else if text_content.is_empty() && tool_calls.is_empty() {
+            tracing::warn!(
+                "Anthropic response produced no text and no tool calls (stop_reason={}); \
+                 the turn made no progress — likely a thinking-only turn or an unparsed block type",
+                stop_reason
+            );
+        }
+
+        let usage = parse_token_usage(resp.get("usage"), true)?;
 
         let actual_model = resp
             .get("model")
@@ -303,6 +461,22 @@ impl CloudInferenceProvider {
 
 #[async_trait]
 impl InferenceProvider for CloudInferenceProvider {
+    fn input_token_reservation(
+        &self,
+        conversation: &Conversation,
+        options: &InferenceOptions,
+    ) -> Result<u32, InferenceError> {
+        // Include the actual provider tool/schema wrappers as well as messages.
+        let body = if matches!(self.client.provider(), LlmProvider::Anthropic) {
+            self.build_anthropic_body(conversation, options)
+        } else {
+            self.build_openai_body(conversation, options)
+        };
+        let bytes = serde_json::to_vec(&body)
+            .map_err(|error| InferenceError::InvalidRequest(error.to_string()))?;
+        input_reservation_from_bytes(bytes.len())
+    }
+
     async fn complete(
         &self,
         conversation: &Conversation,
@@ -317,6 +491,39 @@ impl InferenceProvider for CloudInferenceProvider {
             .as_deref()
             .unwrap_or_else(|| self.client.model());
 
+        // Bedrock signs its own requests with SigV4; route through the shared
+        // LlmClient Converse path rather than the hand-built HTTP path below.
+        // Use the caller-supplied temperature and max_tokens so the reasoning
+        // loop's configured values are honoured (rather than fixed defaults).
+        #[cfg(feature = "bedrock")]
+        if matches!(self.client.provider(), LlmProvider::Bedrock) {
+            let (system_opt, messages) = conversation.to_anthropic_messages();
+            let system = system_opt.as_deref().unwrap_or("");
+            let tools: Vec<serde_json::Value> = options
+                .tool_definitions
+                .iter()
+                .map(|td| {
+                    serde_json::json!({
+                        "name": td.name,
+                        "description": td.description,
+                        "input_schema": td.parameters,
+                    })
+                })
+                .collect();
+            let resp_json = self
+                .client
+                .bedrock_converse(
+                    system,
+                    &messages,
+                    &tools,
+                    options.temperature,
+                    options.max_tokens,
+                )
+                .await
+                .map_err(|e| InferenceError::Provider(format!("Bedrock Converse error: {e}")))?;
+            return self.parse_anthropic_response(&resp_json, model);
+        }
+
         let body = if is_anthropic {
             self.build_anthropic_body(conversation, options)
         } else {
@@ -329,11 +536,13 @@ impl InferenceProvider for CloudInferenceProvider {
             .build()
             .map_err(|e| InferenceError::Provider(format!("HTTP client error: {}", e)))?;
 
+        // The base URL and API key were resolved once at LlmClient
+        // construction (env or secret store) — reuse the cached values
+        // instead of re-reading the env on every request.
+        let base = self.client.base_url();
+        let api_key = self.client.api_key();
+
         let (url, request_builder) = if is_anthropic {
-            let base = std::env::var("ANTHROPIC_BASE_URL")
-                .unwrap_or_else(|_| "https://api.anthropic.com/v1".into());
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .map_err(|_| InferenceError::Provider("ANTHROPIC_API_KEY not set".into()))?;
             let url = format!("{}/messages", base);
             let rb = http_client
                 .post(&url)
@@ -343,20 +552,6 @@ impl InferenceProvider for CloudInferenceProvider {
                 .json(&body);
             (url, rb)
         } else {
-            let (base, key_var) = match self.client.provider() {
-                LlmProvider::OpenRouter => (
-                    std::env::var("OPENROUTER_BASE_URL")
-                        .unwrap_or_else(|_| "https://openrouter.ai/api/v1".into()),
-                    "OPENROUTER_API_KEY",
-                ),
-                _ => (
-                    std::env::var("OPENAI_BASE_URL")
-                        .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
-                    "OPENAI_API_KEY",
-                ),
-            };
-            let api_key = std::env::var(key_var)
-                .map_err(|_| InferenceError::Provider(format!("{} not set", key_var)))?;
             let url = format!("{}/chat/completions", base);
             let mut rb = http_client
                 .post(&url)
@@ -376,6 +571,27 @@ impl InferenceProvider for CloudInferenceProvider {
             self.provider_name(),
             model,
             url
+        );
+        // Debug-level fingerprint of the request body. Useful for
+        // diagnosing why an agent terminates early (missing tool_choice,
+        // empty messages array, etc.). Enable with RUST_LOG=symbi_runtime=debug.
+        tracing::debug!(
+            "Cloud request fingerprint: tool_choice={} tools={} system_chars={} msg_count={}",
+            body.get("tool_choice")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "<absent>".into()),
+            body.get("tools")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0),
+            body.get("system")
+                .and_then(|v| v.as_str())
+                .map(|s| s.len())
+                .unwrap_or(0),
+            body.get("messages")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0),
         );
 
         let start = std::time::Instant::now();
@@ -405,6 +621,11 @@ impl InferenceProvider for CloudInferenceProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".into());
+            tracing::warn!(
+                "Cloud API non-success: status={} body={}",
+                status,
+                error_text.chars().take(400).collect::<String>()
+            );
             return Err(InferenceError::Provider(format!(
                 "API error ({}): {}",
                 status, error_text
@@ -418,6 +639,28 @@ impl InferenceProvider for CloudInferenceProvider {
 
         let latency = start.elapsed();
         tracing::debug!("Cloud inference completed in {:?}", latency);
+        // Debug-level response-shape log. Pairs with the request
+        // fingerprint above for diagnosing loop termination.
+        if is_anthropic {
+            let stop = resp_json
+                .get("stop_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<absent>");
+            let content_types: Vec<&str> = resp_json
+                .get("content")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| c.get("type").and_then(|t| t.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            tracing::debug!(
+                "Cloud response fingerprint: stop_reason={} content_types={:?}",
+                stop,
+                content_types
+            );
+        }
 
         if is_anthropic {
             self.parse_anthropic_response(&resp_json, model)
@@ -431,11 +674,27 @@ impl InferenceProvider for CloudInferenceProvider {
             LlmProvider::OpenRouter => "openrouter",
             LlmProvider::OpenAI => "openai",
             LlmProvider::Anthropic => "anthropic",
+            #[cfg(feature = "bedrock")]
+            LlmProvider::Bedrock => "bedrock",
         }
     }
 
     fn default_model(&self) -> &str {
         self.client.model()
+    }
+
+    fn configuration_identity(&self) -> Option<String> {
+        #[cfg(feature = "bedrock")]
+        let region = self.client.region();
+        #[cfg(not(feature = "bedrock"))]
+        let region = "";
+        crate::reasoning::prepared::digest_json(&serde_json::json!([
+            self.provider_name(),
+            self.client.model(),
+            self.client.base_url(),
+            region
+        ]))
+        .ok()
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -451,7 +710,33 @@ impl InferenceProvider for CloudInferenceProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_accounting_includes_cached_input_and_rejects_counter_truncation() {
+        let cached = serde_json::json!({"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000});
+        let usage = parse_token_usage(Some(&cached), true).unwrap();
+        assert_eq!(usage.prompt_tokens, 1110);
+        assert_eq!(usage.total_tokens, 1115);
+        for value in [
+            serde_json::json!({"prompt_tokens":4294967296u64,"completion_tokens":1,"total_tokens":4294967297u64}),
+            serde_json::json!({"prompt_tokens":10,"completion_tokens":5,"total_tokens":3}),
+            serde_json::json!({"prompt_tokens":-1,"completion_tokens":5,"total_tokens":3}),
+        ] {
+            assert!(parse_token_usage(Some(&value), false).is_err());
+        }
+        let overflow = serde_json::json!({"input_tokens":4294967295u64,"output_tokens":1});
+        assert!(parse_token_usage(Some(&overflow), true).is_err());
+        let missing = serde_json::json!({"prompt_tokens":10});
+        assert_eq!(
+            parse_token_usage(Some(&missing), false)
+                .unwrap()
+                .total_tokens,
+            0
+        );
+    }
+
     use crate::reasoning::conversation::{ConversationMessage, ToolCall};
+    use serial_test::serial;
 
     #[test]
     fn test_build_openai_body_basic() {
@@ -540,6 +825,47 @@ mod tests {
     }
 
     #[test]
+    fn test_map_anthropic_stop_reason() {
+        use super::map_anthropic_stop_reason;
+
+        // A refusal is surfaced distinctly — not collapsed into Stop — so the
+        // loop can fail over instead of reading it as an empty completion.
+        assert_eq!(
+            map_anthropic_stop_reason("refusal", false),
+            FinishReason::Refusal
+        );
+        // Even a refused turn that somehow carried tool calls stays a Refusal.
+        assert_eq!(
+            map_anthropic_stop_reason("refusal", true),
+            FinishReason::Refusal
+        );
+        // Known terminal/tool reasons map as before.
+        assert_eq!(
+            map_anthropic_stop_reason("tool_use", false),
+            FinishReason::ToolCalls
+        );
+        assert_eq!(
+            map_anthropic_stop_reason("max_tokens", false),
+            FinishReason::MaxTokens
+        );
+        // end_turn with tool calls is a tool turn; without, a plain stop.
+        assert_eq!(
+            map_anthropic_stop_reason("end_turn", true),
+            FinishReason::ToolCalls
+        );
+        assert_eq!(
+            map_anthropic_stop_reason("end_turn", false),
+            FinishReason::Stop
+        );
+        // A thinking-only turn (no text, no tool calls) reports stop_reason
+        // end_turn and no tool calls -> Stop (the parser separately warns).
+        assert_eq!(
+            map_anthropic_stop_reason("pause_turn", false),
+            FinishReason::Stop
+        );
+    }
+
+    #[test]
     fn test_conversation_to_openai_format() {
         let mut conv = Conversation::with_system("sys");
         conv.push(ConversationMessage::user("hello"));
@@ -555,5 +881,111 @@ mod tests {
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "search");
         assert_eq!(msgs[3]["tool_call_id"], "tc1");
+    }
+
+    /// FIX 1 + FIX 2: `build_anthropic_body` emits a single prompt-cache
+    /// breakpoint on the byte-stable prefix, and forwards `options.extra`
+    /// into the request body verbatim.
+    ///
+    /// Constructing a `CloudInferenceProvider` requires a real `LlmClient`,
+    /// which is only buildable via `from_env()` (no bypass constructor
+    /// exists) -- so this follows the same env-var-dance + `#[serial]`
+    /// pattern as `test_cloud_provider_name_bedrock` below.
+    #[serial]
+    #[test]
+    fn test_build_anthropic_body_cache_control_and_extra() {
+        use crate::reasoning::inference::{InferenceOptions, ToolDefinition};
+
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key-not-real");
+        for k in ["OPENROUTER_API_KEY", "OPENAI_API_KEY", "BEDROCK_MODEL_ID"] {
+            std::env::remove_var(k);
+        }
+
+        let provider = CloudInferenceProvider::from_env()
+            .expect("CloudInferenceProvider should resolve via ANTHROPIC_API_KEY");
+
+        // Case 1: system prompt present -> the breakpoint goes on the
+        // system block, emitted as a content-block array (not a bare
+        // string), and extra params are forwarded into the body.
+        let conv = Conversation::with_system("You are a helpful assistant.");
+        let mut options = InferenceOptions {
+            tool_definitions: vec![ToolDefinition {
+                name: "search".into(),
+                description: "Search the web".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }],
+            ..Default::default()
+        };
+        options.extra.insert(
+            "output_config".into(),
+            serde_json::json!({"effort": "high"}),
+        );
+
+        let body = provider.build_anthropic_body(&conv, &options);
+
+        let system = body["system"]
+            .as_array()
+            .expect("system should be a content-block array carrying cache_control");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["type"], "text");
+        assert_eq!(system[0]["text"], "You are a helpful assistant.");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+
+        // At most one breakpoint from this method: since system carried it,
+        // the tool must not also carry one.
+        let tools = body["tools"].as_array().expect("tools array");
+        assert!(tools[0].get("cache_control").is_none());
+
+        // FIX 2: `extra` lands in the body verbatim.
+        assert_eq!(body["output_config"]["effort"], "high");
+
+        // Case 2: no system prompt, tools present -> the breakpoint goes on
+        // the LAST tool instead, so the tool-definitions prefix still caches.
+        let conv_no_system = Conversation::new();
+        let options_no_system = InferenceOptions {
+            tool_definitions: vec![
+                ToolDefinition {
+                    name: "first_tool".into(),
+                    description: "d1".into(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                },
+                ToolDefinition {
+                    name: "last_tool".into(),
+                    description: "d2".into(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                },
+            ],
+            ..Default::default()
+        };
+        let body_no_system = provider.build_anthropic_body(&conv_no_system, &options_no_system);
+        assert!(body_no_system.get("system").is_none());
+        let tools_no_system = body_no_system["tools"].as_array().expect("tools array");
+        assert_eq!(tools_no_system.len(), 2);
+        assert!(tools_no_system[0].get("cache_control").is_none());
+        assert_eq!(tools_no_system[1]["cache_control"]["type"], "ephemeral");
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    /// Verify that a Bedrock-configured `CloudInferenceProvider` reports
+    /// `provider_name() == "bedrock"` without making any network calls.
+    #[cfg(feature = "bedrock")]
+    #[serial]
+    #[test]
+    fn test_cloud_provider_name_bedrock() {
+        // Temporarily set the env vars used by `CloudInferenceProvider::from_env`.
+        std::env::set_var(
+            "BEDROCK_MODEL_ID",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        );
+        std::env::set_var("AWS_REGION", "us-east-1");
+        for k in ["OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"] {
+            std::env::remove_var(k);
+        }
+        let provider = CloudInferenceProvider::from_env()
+            .expect("CloudInferenceProvider should resolve via BEDROCK_MODEL_ID");
+        assert_eq!(provider.provider_name(), "bedrock");
+        std::env::remove_var("BEDROCK_MODEL_ID");
+        std::env::remove_var("AWS_REGION");
     }
 }

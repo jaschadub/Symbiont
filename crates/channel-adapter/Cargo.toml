@@ -1,6 +1,6 @@
 [package]
 name = "symbi-channel-adapter"
-version = "0.1.2"
+version = "0.1.6"
 edition = "2021"
 authors = ["Jascha Wanger / ThirdKey.ai"]
 description = "Chat channel adapters for the Symbi platform — Slack, Teams, Mattermost"
@@ -8,6 +8,10 @@ license = "Apache-2.0"
 repository = "https://github.com/thirdkeyai/symbiont"
 readme = "README.md"
 keywords = ["chat", "slack", "adapter", "symbiont", "agents"]
+
+# Tracked for future machete cleanup — see v1.12.0 release thread.
+[package.metadata.cargo-machete]
+ignored = ["base64", "tokio-test", "tower", "tower-http"]
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
@@ -30,7 +34,7 @@ tower = { version = "0.4", optional = true }
 tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
 base64 = { version = "0.22", optional = true }
-jsonwebtoken = { version = "10", optional = true }
+jsonwebtoken = { version = "10", features = ["rust_crypto"], optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

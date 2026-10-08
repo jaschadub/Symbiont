@@ -32,7 +32,6 @@ pub enum Declaration {
     Agent(AgentDefinition),
     Behavior(BehaviorDefinition),
     Function(FunctionDefinition),
-    EventHandler(EventHandler),
     Struct(StructDefinition),
 }
 
@@ -127,15 +126,6 @@ pub struct FunctionDefinition {
     pub span: Span,
 }
 
-/// Event handler definition
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EventHandler {
-    pub event_name: String,
-    pub parameters: ParameterList,
-    pub body: Block,
-    pub span: Span,
-}
-
 /// Struct definition
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructDefinition {
@@ -200,7 +190,6 @@ pub enum Statement {
     While(WhileStatement),
     Try(TryStatement),
     Return(ReturnStatement),
-    Emit(EmitStatement),
     Require(RequireStatement),
     Check(CheckStatement),
     Expression(Expression),
@@ -287,14 +276,6 @@ pub struct TryStatement {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReturnStatement {
     pub value: Option<Expression>,
-    pub span: Span,
-}
-
-/// Emit statement for events
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EmitStatement {
-    pub event_name: String,
-    pub data: Option<Expression>,
     pub span: Span,
 }
 
@@ -551,22 +532,4 @@ impl SizeValue {
             SizeUnit::TB => self.value * 1024 * 1024 * 1024 * 1024,
         }
     }
-}
-
-/// Visitor trait for traversing the AST
-pub trait AstVisitor {
-    type Output;
-
-    fn visit_program(&mut self, program: &Program) -> Self::Output;
-    fn visit_declaration(&mut self, declaration: &Declaration) -> Self::Output;
-    fn visit_statement(&mut self, statement: &Statement) -> Self::Output;
-    fn visit_expression(&mut self, expression: &Expression) -> Self::Output;
-}
-
-/// Mutable visitor trait for transforming the AST
-pub trait AstVisitorMut {
-    fn visit_program_mut(&mut self, program: &mut Program);
-    fn visit_declaration_mut(&mut self, declaration: &mut Declaration);
-    fn visit_statement_mut(&mut self, statement: &mut Statement);
-    fn visit_expression_mut(&mut self, expression: &mut Expression);
 }

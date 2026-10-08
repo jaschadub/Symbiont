@@ -80,6 +80,25 @@ impl ApiKeyStore {
             });
         }
 
+        // The API keys file stores bearer/API-key secrets and is functionally key
+        // material; refuse to load it if it is group/other-accessible, mirroring
+        // crypto.rs::read_key_from_file (codered F-pattern-scout-0003).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(path)
+                .map_err(|e| format!("Failed to stat API keys file {}: {}", path.display(), e))?;
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(format!(
+                    "API keys file {} has insecure mode {mode:o}; expected 0600. \
+                     Run: chmod 600 {}",
+                    path.display(),
+                    path.display()
+                ));
+            }
+        }
+
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read API keys file: {}", e))?;
 
@@ -164,9 +183,26 @@ impl ApiKeyStore {
         // Legacy fallback: no `.` separator — O(n) scan over all keys.
         // This path exists for backward compatibility with keys that were
         // issued before the keyid.secret format was introduced.
-        tracing::warn!(
-            "API key without 'keyid.secret' prefix — using legacy O(n) scan. \
-             Re-issue keys in 'keyid.secret' format to avoid per-request DoS risk."
+        //
+        // M6: the path is scheduled for removal in the next minor release.
+        // Operators can opt-in to immediate rejection by exporting
+        // `SYMBI_REJECT_LEGACY_API_KEYS=1`, which short-circuits the scan
+        // and refuses any unprefixed key.
+        let reject_legacy = std::env::var("SYMBI_REJECT_LEGACY_API_KEYS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if reject_legacy {
+            tracing::warn!(
+                "SYMBI_REJECT_LEGACY_API_KEYS=1: refusing API key without 'keyid.secret' \
+                 prefix without running the O(n) Argon2 scan."
+            );
+            return None;
+        }
+
+        tracing::error!(
+            "API key without 'keyid.secret' prefix accepted via deprecated O(n) scan. \
+             This path will be REMOVED in the next minor release; re-issue all keys \
+             in 'keyid.secret' format immediately."
         );
 
         for record in &self.records {
@@ -346,6 +382,26 @@ mod tests {
     fn test_nonexistent_file() {
         let store =
             ApiKeyStore::load_from_file(Path::new("/tmp/nonexistent-api-keys-12345.json")).unwrap();
+        assert!(!store.has_records());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_insecure_file_mode_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api_keys.json");
+        std::fs::write(&path, "[]").unwrap();
+        // World-readable: must be refused.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = ApiKeyStore::load_from_file(&path)
+            .err()
+            .expect("world-readable key file must be rejected");
+        assert!(err.contains("insecure mode"), "unexpected error: {err}");
+
+        // 0600: must load fine.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let store = ApiKeyStore::load_from_file(&path).unwrap();
         assert!(!store.has_records());
     }
 }

@@ -3,6 +3,8 @@
 ## 其他语言
 
 
+[受治理执行指南](/scheduled-execution)描述了此分支的运行时行为：注册只保存配置，并不执行智能体；API 调用、手动触发和定时器调用各自获得独立的运行 ID 和真实的终态结果。历史记录在执行与清理完成后才会变为 `succeeded`，并包含输出、错误和受保护的审计引用。默认服务上仍不提供托管 CLI 调度、路由模型和外部智能体传输。当已准备好匹配的来宾工件时，所选的命令边界可以对一次性工具、解析器、MCP stdio 和 PTY 会话使用 [Firecracker](/firecracker-setup)。运维方可见的差异和剩余覆盖范围参见[分支指南](/containment-branch-guide)。
+
 Symbiont 的调度系统为 AI 智能体提供生产级的 cron 定时任务执行能力。系统支持：
 
 - **Cron 调度**：使用传统 cron 语法定义周期性任务
@@ -849,38 +851,13 @@ enable_metrics = true
 default_max_retries = 3
 shutdown_timeout_seconds = 60
 
-[scheduler.delivery]
-# Webhook 设置
-webhook_timeout_seconds = 30
-webhook_retry_attempts = 3
-
-# Slack 设置
-slack_api_token = "${SLACK_API_TOKEN}"
-slack_default_channel = "#ops"
-
-# 邮件设置
-smtp_host = "smtp.example.com"
-smtp_port = 587
-smtp_username = "${SMTP_USER}"
-smtp_password = "${SMTP_PASS}"
-email_from = "symbiont@example.com"
 ```
 
-### 环境变量
+### 交付通道
 
-```bash
-# 调度器设置
-SYMBI_SCHEDULER_MAX_JITTER=30
-SYMBI_SCHEDULER_MAX_CONCURRENT=20
+交付通道（`stdout`、`log_file`、`webhook`、`slack`、`email` 等）是在每个调度自身的 `delivery` 块中**按调度**配置的（参见上文示例），而非通过全局的 `[scheduler.delivery]` 配置节。
 
-# 交付设置
-SYMBI_SLACK_TOKEN=xoxb-...
-SYMBI_WEBHOOK_AUTH_HEADER="Bearer secret-token"
-
-# AgentPin 验证
-SYMBI_AGENTPIN_REQUIRED=true
-SYMBI_AGENTPIN_DOMAIN=agent.example.com
-```
+> **`log_file` 交付需要设置 `SYMBIONT_LOG_DIR`。** 目标路径被限制在该允许列表目录内 —— 通过 `..`、绝对路径或符号链接逃逸该目录的路径都会被拒绝；当 `SYMBIONT_LOG_DIR` 未设置时，日志文件交付为故障关闭（禁用）。
 
 ## 可观测性
 
@@ -921,11 +898,13 @@ pub enum SecurityEventType {
 }
 ```
 
-查询审计日志：
+从交互式 shell 查询审计日志：
 
-```bash
-symbi audit query --type CronJobFailed --since "2026-02-01" --limit 50
+```text
+/audit CronJobFailed
 ```
+
+或通过运行时 HTTP API 以程序化方式查询 —— 参见 [API 参考](/api-reference) 中的 `/api/v1/audit` 端点。
 
 ## 最佳实践
 

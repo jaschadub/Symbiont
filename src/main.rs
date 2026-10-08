@@ -7,8 +7,100 @@ mod mcp_server;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn main() {
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(
+            symbi_runtime::sandbox::landlock::workspace::INTERNAL_COMMAND,
+        ))
+    {
+        let arguments: Vec<_> = std::env::args_os().skip(2).collect();
+        let result = if arguments.len() == 1 {
+            symbi_runtime::sandbox::landlock::workspace::run(std::path::Path::new(&arguments[0]))
+        } else {
+            Err(anyhow::anyhow!("expected one native launch contract"))
+        };
+        if let Err(error) = result {
+            eprintln!("native workspace setup failed: {error:#}");
+        }
+        std::process::exit(125);
+    }
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(
+            symbi_runtime::sandbox::supervisor::INTERNAL_COMMAND,
+        ))
+    {
+        let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())
+            .and_then(|runtime| {
+                runtime
+                    .block_on(symbi_runtime::sandbox::supervisor::run_service(&arguments))
+                    .map_err(|e| e.to_string())
+            });
+        if let Err(error) = result {
+            eprintln!("sandbox supervisor failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Err(error) = symbi_runtime::sandbox::supervisor::use_embedded_helper() {
+        eprintln!("cannot locate sandbox supervisor executable: {error}");
+        std::process::exit(1);
+    }
+    app_main();
+}
+
+/// Locate a `.env` without letting the search escape the project.
+///
+/// `dotenvy::dotenv()` walks to the filesystem root, so running symbi anywhere
+/// picks up the nearest ancestor `.env` -- potentially one belonging to an
+/// unrelated tree, silently supplying credentials the caller never chose. Bound
+/// the search the way the runtime bounds everything else: to the project, named
+/// by the `symbiont.toml` that `symbi init` writes. With no project above the
+/// current directory, only that directory is considered.
+fn project_env_file() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let root = cwd
+        .ancestors()
+        .find(|dir| dir.join("symbiont.toml").is_file());
+    let mut search: Vec<&std::path::Path> = Vec::new();
+    match root {
+        Some(root) => {
+            for dir in cwd.ancestors() {
+                search.push(dir);
+                if dir == root {
+                    break;
+                }
+            }
+        }
+        None => search.push(cwd.as_path()),
+    }
+    search.into_iter().find_map(|dir| {
+        let candidate = dir.join(".env");
+        candidate.is_file().then_some(candidate)
+    })
+}
+
 #[tokio::main]
-async fn main() {
+async fn app_main() {
+    // Load a project-local `.env` (e.g. the one `symbi init` generates with
+    // SYMBIONT_MASTER_KEY) before anything reads the environment. Variables
+    // already set in the real environment take precedence -- from_path never
+    // overrides them -- so this is additive. We announce it on stderr rather
+    // than loading secrets silently.
+    if let Some(path) = project_env_file() {
+        match dotenvy::from_path(&path) {
+            Ok(()) => eprintln!("Loaded environment from {}", path.display()),
+            Err(error) => {
+                eprintln!("Ignored unreadable {}: {error}", path.display());
+            }
+        }
+    }
+
     let matches = Command::new("symbi")
         .version(VERSION)
         .about("Symbiont - AI Agent Runtime and DSL")
@@ -161,12 +253,32 @@ async fn main() {
                         .long("serve-agents-md")
                         .action(ArgAction::SetTrue)
                         .help("Serve AGENTS.md at /agents.md and /.well-known/agents.md (auth-gated)"),
+                )
+                .arg(
+                    Arg::new("insecure-allow-all")
+                        .long("insecure-allow-all")
+                        .action(ArgAction::SetTrue)
+                        .help("DEV ONLY: switch the policy gate into permissive mode (allows every tool call and delegation). Also enabled by SYMBI_INSECURE_ALLOW_ALL=1. Do not use in production."),
                 ),
         )
         .subcommand(
             Command::new("doctor")
                 .about("Check system health and dependencies")
         )
+        .subcommand(
+            Command::new("audit")
+                .about("Inspect protected run evidence")
+                .subcommand_required(true)
+                .subcommand(Command::new("inspect")
+                    .about("Verify a run and report incomplete or unknown outcomes without replaying work")
+                    .arg(Arg::new("journal").required(true).value_name("JOURNAL"))
+                    .arg(Arg::new("public-key").long("public-key").required(true).value_name("HEX")
+                        .help("Public audit key retained through a trusted channel"))
+                    .arg(Arg::new("run-id").long("run-id").required(true).value_name("UUID")
+                        .help("Expected invocation ID retained through a trusted channel"))),
+        )
+        .subcommand(commands::invocation::command())
+        .subcommand(commands::improvement::command())
         .subcommand(
             Command::new("logs")
                 .about("Show runtime logs")
@@ -214,12 +326,22 @@ async fn main() {
         )
         .subcommand(
             Command::new("init")
-                .about("Initialize a governed Symbiont project in the current directory")
+                .about("Create a new Symbiont project (symbiont.toml, agents/, policies/, docker-compose.yml, .env)")
+                .display_order(0)
                 .arg(Arg::new("profile").long("profile").value_name("PROFILE").help("Project profile (minimal, assistant, dev-agent, multi-agent)"))
                 .arg(Arg::new("schemapin").long("schemapin").value_name("MODE").help("SchemaPin verification mode (tofu, strict, disabled)").default_value("tofu"))
-                .arg(Arg::new("sandbox").long("sandbox").value_name("TIER").help("Sandbox isolation tier (tier0, tier1, tier2)").default_value("tier1"))
+                .arg(Arg::new("sandbox").long("sandbox").value_name("TIER").help("Sandbox isolation: landlock (Linux ABI 6+, systemd user delegation), tier0 (none, dev only), tier1 (Docker), tier2 (gVisor), tier3 (Firecracker)").default_value("tier1"))
+                .arg(Arg::new("source").long("source").value_name("PATH").help("Repository to grant read-only access (--profile dev-agent --sandbox landlock; separate from --dir)"))
+                .arg(Arg::new("managed-executable").long("managed-executable").value_name("PATH").help("Installed Claude Code executable for the Landlock dev-agent profile"))
+                .arg(Arg::new("inference-url").long("inference-url").value_name("URL").help("Explicit Anthropic Messages-compatible base URL for the Landlock dev-agent profile"))
+                .arg(Arg::new("inference-model").long("inference-model").value_name("MODEL").help("Model served by the managed inference endpoint"))
+                .arg(Arg::new("inference-key-env").long("inference-key-env").value_name("NAME").help("Host credential variable name, never its value, for managed inference"))
+                .arg(Arg::new("firecracker-kernel").long("firecracker-kernel").value_name("PATH").help("Path to a Firecracker-bootable vmlinux ELF (required when --sandbox=tier3). See docs/firecracker-setup.md."))
+                .arg(Arg::new("firecracker-rootfs").long("firecracker-rootfs").value_name("PATH").help("Path to a Firecracker root filesystem image (ext4) implementing the in-VM init contract (required when --sandbox=tier3). See docs/firecracker-setup.md."))
+                .arg(Arg::new("dir").long("dir").value_name("PATH").help("Target directory (default: current directory; useful inside Docker with -v $(pwd):/workspace --dir /workspace)"))
                 .arg(Arg::new("force").long("force").action(ArgAction::SetTrue).help("Overwrite existing symbiont.toml"))
                 .arg(Arg::new("no-interact").long("no-interact").action(ArgAction::SetTrue).help("Skip interactive prompts (use defaults or --flags)"))
+                .arg(Arg::new("no-docker-compose").long("no-docker-compose").action(ArgAction::SetTrue).help("Skip generating docker-compose.yml"))
                 .arg(
                     Arg::new("catalog")
                         .long("catalog")
@@ -230,6 +352,24 @@ async fn main() {
         .subcommand(
             Command::new("run")
                 .about("Run a single agent and exit")
+                .arg(Arg::new("improvement").long("improvement").value_name("WORKFLOW")
+                    .help("Explicitly select an enabled, approved workflow instruction version"))
+                .arg(Arg::new("improvement-trial").long("improvement-trial").value_name("SHA256")
+                    .requires("improvement").help("Explicit evaluation run of this unpromoted candidate; normal execution controls still apply"))
+                .arg(
+                    Arg::new("approval-terminal")
+                        .long("approval-terminal")
+                        .action(ArgAction::SetTrue)
+                        .help("Request mandatory tool approvals on the operator's controlling terminal"),
+                )
+                .arg(
+                    Arg::new("approval-timeout")
+                        .long("approval-timeout")
+                        .value_name("SECONDS")
+                        .value_parser(clap::value_parser!(u64).range(1..=3600))
+                        .requires("approval-terminal")
+                        .help("Time to display and answer each terminal approval (default: 120 seconds)"),
+                )
                 .arg(
                     Arg::new("agent")
                         .value_name("AGENT")
@@ -250,6 +390,48 @@ async fn main() {
                         .value_name("N")
                         .help("Maximum ORGA loop iterations")
                         .default_value("10"),
+                )
+                .arg(
+                    Arg::new("invocation-id")
+                        .long("invocation-id")
+                        .value_name("UUID")
+                        .help("Ordinary ORGA run identity: reuse this ID to retrieve a result without repeating work"),
+                )
+                .arg(
+                    Arg::new("target")
+                        .long("target")
+                        .value_name("DIR")
+                        .help("Managed tool working directory: mapped host path for Docker/gVisor; absolute guest path for Firecracker (default: configured guest directory)"),
+                )
+                .arg(
+                    Arg::new("max-turns")
+                        .long("max-turns")
+                        .value_name("N")
+                        .help("Managed CLI: max agentic turns (primary bound, default 12)"),
+                )
+                .arg(
+                    Arg::new("budget-timeout")
+                        .long("budget-timeout")
+                        .value_name("DURATION")
+                        .help(
+                            "Managed CLI: wall-clock budget backstop, e.g. 15m or 900s (default 15m)",
+                        ),
+                )
+                .arg(
+                    Arg::new("budget-tokens")
+                        .long("budget-tokens")
+                        .value_name("N")
+                        .help(
+                            "Managed CLI: total reserved inference output-token allowance (default 100000)",
+                        ),
+                )
+                .arg(
+                    Arg::new("plugin-dir")
+                        .long("plugin-dir")
+                        .value_name("DIR")
+                        .help(
+                            "Legacy managed CLI plugin option; brokered runs reject plugin loading",
+                        ),
                 ),
         )
         .subcommand(
@@ -320,6 +502,34 @@ async fn main() {
                         .long("content")
                         .value_name("CONTENT")
                         .help("DSL content to parse directly"),
+                )
+                .arg(
+                    Arg::new("check")
+                        .long("check")
+                        .action(ArgAction::SetTrue)
+                        .help("Validate only: print one line per file and set the exit code"),
+                ),
+        )
+        .subcommand(
+            Command::new("fmt")
+                .about("Canonical-format Symbi (.symbi) source files")
+                .arg(
+                    Arg::new("check")
+                        .long("check")
+                        .action(ArgAction::SetTrue)
+                        .help("Exit non-zero if any file needs formatting; do not write changes"),
+                )
+                .arg(
+                    Arg::new("stdin")
+                        .long("stdin")
+                        .action(ArgAction::SetTrue)
+                        .help("Read source from stdin, write formatted output to stdout"),
+                )
+                .arg(
+                    Arg::new("files")
+                        .help(".symbi files to format (rewritten in place by default)")
+                        .num_args(0..)
+                        .value_name("FILES"),
                 ),
         )
         .subcommand(
@@ -580,6 +790,17 @@ async fn main() {
                 ),
         )
         .subcommand(
+            Command::new("repl")
+                .about("Interactive DSL REPL (forwards to the repl-cli binary)")
+                .trailing_var_arg(true)
+                .arg(
+                    clap::Arg::new("repl-args")
+                        .num_args(0..)
+                        .allow_hyphen_values(true)
+                        .trailing_var_arg(true),
+                ),
+        )
+        .subcommand(
             Command::new("schemapin")
                 .about("TOFU integrity pinning for MCP server configs (used by SessionStart hooks)")
                 .subcommand(
@@ -678,6 +899,11 @@ async fn main() {
         Some(("doctor", _sub_matches)) => {
             commands::doctor::run().await;
         }
+        Some(("audit", sub_matches)) => {
+            commands::audit::run(sub_matches);
+        }
+        Some(("invocation", sub_matches)) => commands::invocation::run(sub_matches).await,
+        Some(("improvement", sub_matches)) => commands::improvement::run(sub_matches),
         Some(("logs", sub_matches)) => {
             commands::logs::run(sub_matches).await;
         }
@@ -702,6 +928,9 @@ async fn main() {
         Some(("agents-md", sub_matches)) => {
             commands::agents_md::run(sub_matches);
         }
+        Some(("fmt", sub_matches)) => {
+            std::process::exit(commands::fmt::run(sub_matches));
+        }
         Some(("dsl", sub_matches)) => {
             let source = if let Some(file) = sub_matches.get_one::<String>("file") {
                 match std::fs::read_to_string(file) {
@@ -717,6 +946,9 @@ async fn main() {
                 eprintln!("Either --file or --content must be provided for DSL command");
                 std::process::exit(1);
             };
+            if sub_matches.get_flag("check") {
+                std::process::exit(commands::dsl::check(&source.0, source.1));
+            }
             commands::dsl::run(&source.0, source.1);
         }
         Some(("chat", sub_matches)) => {
@@ -756,6 +988,28 @@ async fn main() {
                 std::process::exit(status.code().unwrap_or(1));
             } else {
                 eprintln!("symbi-shell binary not found. Build with: cargo build -p symbi-shell");
+                std::process::exit(1);
+            }
+        }
+        Some(("repl", sub_matches)) => {
+            let exe_dir = std::env::current_exe()
+                .expect("cannot determine executable path")
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let repl_bin = exe_dir.join("repl-cli");
+            if repl_bin.exists() {
+                let forwarded: Vec<String> = sub_matches
+                    .get_many::<String>("repl-args")
+                    .map(|vals| vals.cloned().collect())
+                    .unwrap_or_default();
+                let status = std::process::Command::new(&repl_bin)
+                    .args(forwarded)
+                    .status()
+                    .expect("failed to launch repl-cli");
+                std::process::exit(status.code().unwrap_or(1));
+            } else {
+                eprintln!("repl-cli binary not found. Build with: cargo build -p repl-cli");
                 std::process::exit(1);
             }
         }

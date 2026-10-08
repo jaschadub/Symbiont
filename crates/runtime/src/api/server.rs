@@ -2,6 +2,10 @@
 //!
 //! This module provides the main HTTP server implementation using Axum.
 
+// clippy::result_large_err — handlers return axum's idiomatic
+// `(StatusCode, Json<ErrorResponse>)` error pair (~128 bytes). Boxing it would
+// fight IntoResponse for no runtime benefit on an I/O-bound path.
+#![allow(clippy::result_large_err)]
 #[cfg(feature = "http-api")]
 use axum::{http::StatusCode, response::Json, Router};
 
@@ -35,8 +39,8 @@ use super::types::{
     ReceiveMessagesResponse, RegisterChannelRequest, RegisterChannelResponse, ResourceUsage,
     ScheduleActionResponse, ScheduleDetail, ScheduleHistoryResponse, ScheduleRunEntry,
     ScheduleSummary, SchedulerHealthResponse, SendMessageRequest, SendMessageResponse,
-    UpdateAgentRequest, UpdateAgentResponse, UpdateChannelRequest, UpdateScheduleRequest,
-    WorkflowExecutionRequest,
+    StatusResponse, UpdateAgentRequest, UpdateAgentResponse, UpdateChannelRequest,
+    UpdateScheduleRequest, WorkflowExecutionRequest,
 };
 
 #[cfg(feature = "http-api")]
@@ -54,6 +58,10 @@ use crate::types::RuntimeError;
         super::routes::get_agent_status,
         super::routes::list_agents,
         super::routes::get_metrics,
+        super::routes::get_status,
+        super::routes::inspect_run,
+        super::routes::inspect_capacity,
+        super::routes::inspect_worker_usage,
         super::routes::create_agent,
         super::routes::update_agent,
         super::routes::delete_agent,
@@ -138,7 +146,8 @@ use crate::types::RuntimeError;
             SendMessageResponse,
             ReceiveMessagesResponse,
             MessageEnvelope,
-            MessageStatusResponse
+            MessageStatusResponse,
+            StatusResponse
         )
     ),
     tags(
@@ -207,6 +216,7 @@ pub struct HttpApiServer {
     start_time: Instant,
     api_key_store: Option<Arc<super::api_keys::ApiKeyStore>>,
     coordinator_state: Option<Arc<super::coordinator::CoordinatorState>>,
+    escalation_queue: Option<Arc<crate::escalation::EscalationQueue>>,
 }
 
 #[cfg(feature = "http-api")]
@@ -219,6 +229,7 @@ impl HttpApiServer {
             start_time: Instant::now(),
             api_key_store: None,
             coordinator_state: None,
+            escalation_queue: None,
         }
     }
 
@@ -234,6 +245,12 @@ impl HttpApiServer {
         coordinator_state: Arc<super::coordinator::CoordinatorState>,
     ) -> Self {
         self.coordinator_state = Some(coordinator_state);
+        self
+    }
+
+    /// Attach the escalation queue so REST callers can list, approve, and deny held actions.
+    pub fn with_escalation_queue(mut self, queue: Arc<crate::escalation::EscalationQueue>) -> Self {
+        self.escalation_queue = Some(queue);
         self
     }
 
@@ -358,10 +375,10 @@ impl HttpApiServer {
                 execute_workflow, get_agent_history, get_agent_status, get_channel,
                 get_channel_audit, get_channel_health, get_message_status, get_metrics,
                 get_schedule, get_schedule_history, get_schedule_next_runs, get_scheduler_health,
-                list_agents, list_channel_mappings, list_channels, list_schedules, pause_schedule,
-                receive_agent_messages, register_channel, remove_channel_mapping, resume_schedule,
-                send_agent_message, start_channel, stop_channel, trigger_schedule, update_agent,
-                update_channel, update_schedule,
+                get_status, list_agents, list_channel_mappings, list_channels, list_schedules,
+                pause_schedule, receive_agent_messages, register_channel, remove_channel_mapping,
+                resume_schedule, send_agent_message, start_channel, stop_channel, trigger_schedule,
+                update_agent, update_channel, update_schedule,
             };
             use axum::extract::DefaultBodyLimit;
             use axum::middleware;
@@ -442,13 +459,28 @@ impl HttpApiServer {
                 .layer(middleware::from_fn(auth_middleware))
                 .with_state(provider.clone());
 
-            // Protected routes (workflows + metrics + scheduler health) with authentication.
-            // Note: /api/v1/health (basic) remains public for load-balancer probes;
-            // /api/v1/health/scheduler exposes job counts and run stats so it requires auth.
+            // Protected routes (workflows + metrics + scheduler health + status) with
+            // authentication. Note: /api/v1/health (basic) remains public for
+            // load-balancer probes; /api/v1/health/scheduler exposes job counts and
+            // run stats so it requires auth. /api/v1/status is an aggregated rollup
+            // useful for operators and monitoring.
             let protected_router = Router::new()
                 .route("/api/v1/workflows/execute", post(execute_workflow))
                 .route("/api/v1/metrics", get(get_metrics))
                 .route("/api/v1/health/scheduler", get(get_scheduler_health))
+                .route("/api/v1/status", get(get_status))
+                .route(
+                    "/api/v1/sandbox/capacity",
+                    get(super::routes::inspect_capacity),
+                )
+                .route(
+                    "/api/v1/sandbox/workers/:lease/usage",
+                    get(super::routes::inspect_worker_usage),
+                )
+                .route(
+                    "/api/v1/audit/runs/:agent_id/:run_id",
+                    get(super::routes::inspect_run),
+                )
                 .layer(middleware::from_fn(auth_middleware))
                 .with_state(provider.clone());
 
@@ -467,6 +499,29 @@ impl HttpApiServer {
                 .route("/ws/chat", get(super::ws_handler::ws_chat_handler))
                 .with_state(coordinator_state.clone());
             router = router.merge(ws_router);
+        }
+
+        // Escalation queue REST endpoints (list / approve / deny held actions).
+        if let Some(queue) = &self.escalation_queue {
+            use super::middleware::auth_middleware;
+            use axum::middleware;
+
+            let escalation_router = Router::new()
+                .route(
+                    "/api/v1/approvals",
+                    get(super::escalation_routes::list_approvals),
+                )
+                .route(
+                    "/api/v1/approvals/:id/approve",
+                    axum::routing::post(super::escalation_routes::approve),
+                )
+                .route(
+                    "/api/v1/approvals/:id/deny",
+                    axum::routing::post(super::escalation_routes::deny),
+                )
+                .layer(axum::Extension(queue.clone()))
+                .layer(middleware::from_fn(auth_middleware));
+            router = router.merge(escalation_router);
         }
 
         // Mount Swagger UI + OpenAPI spec only if explicitly enabled and not
@@ -525,7 +580,15 @@ impl HttpApiServer {
             let cors = CorsLayer::new()
                 .allow_origin(allowed_origins)
                 .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+                .allow_headers([
+                    header::AUTHORIZATION,
+                    header::CONTENT_TYPE,
+                    header::HeaderName::from_static("idempotency-key"),
+                ])
+                .expose_headers([
+                    header::HeaderName::from_static("idempotency-key"),
+                    header::HeaderName::from_static("idempotency-replayed"),
+                ])
                 .allow_credentials(false);
 
             router = router.layer(cors);

@@ -5,11 +5,16 @@
 //! `parallel`, and `race`.
 
 use crate::dsl::evaluator::DslValue;
-use crate::dsl::reasoning_builtins::ReasoningBuiltinContext;
+use crate::dsl::inference_audit::InferenceExchange;
+use crate::dsl::reasoning_builtins::{optional_protocol_label, ReasoningBuiltinContext};
 use crate::error::{ReplError, Result};
 use std::collections::HashMap;
-use std::time::Duration;
 use symbi_runtime::communication::policy_gate::CommunicationRequest;
+use symbi_runtime::reasoning::{
+    agent_registry::RegisteredAgent,
+    conversation::{Conversation, ConversationMessage},
+    inference::InferenceOptions,
+};
 use symbi_runtime::types::{AgentId, MessageType, RequestId};
 
 /// Execute the `spawn_agent` builtin: register a new named agent.
@@ -33,8 +38,9 @@ pub async fn builtin_spawn_agent(
     let (name, system_prompt, tools, response_format) = parse_spawn_args(args)?;
 
     let agent_id = registry
-        .spawn_agent(&name, &system_prompt, tools, response_format)
-        .await;
+        .spawn_prompt_agent(name.clone(), system_prompt, tools, response_format)
+        .await
+        .map_err(|error| ReplError::Execution(error.to_string()))?;
 
     let mut result = HashMap::new();
     result.insert(
@@ -45,408 +51,339 @@ pub async fn builtin_spawn_agent(
     Ok(DslValue::Map(result))
 }
 
-/// Execute the `ask` builtin: send a message to a named agent and wait for response.
-///
-/// Arguments:
-/// - agent: string — agent name
-/// - message: string
-///
-/// Returns the agent's response as a string.
-pub async fn builtin_ask(args: &[DslValue], ctx: &ReasoningBuiltinContext) -> Result<DslValue> {
-    let registry = ctx
-        .agent_registry
-        .as_ref()
-        .ok_or_else(|| ReplError::Execution("No agent registry configured".into()))?;
-
-    let provider = ctx
-        .provider
-        .as_ref()
-        .ok_or_else(|| ReplError::Execution("No inference provider configured".into()))?;
-
-    let (agent_name, message) = parse_ask_args(args)?;
-
-    // Communication bus wiring: policy check + message logging
-    let recipient_id = resolve_agent_id(&agent_name, ctx).await?;
-    let sender_id = ctx.sender_agent_id.unwrap_or_default();
+/// Resolve and retain a registered recipient through authorization and inference.
+pub async fn governed_ask(
+    ctx: &ReasoningBuiltinContext,
+    target: &str,
+    message: &str,
+    explicit_label: Option<&str>,
+) -> Result<String> {
+    let agent = resolve_agent(target, ctx).await?;
+    let ctx = caller_context(ctx)?;
     let request_id = RequestId::new();
-
     check_comm_policy(
-        ctx,
-        sender_id,
-        recipient_id,
+        &ctx,
+        ctx.sender_agent_id.unwrap(),
+        agent.agent_id,
         MessageType::Request(request_id),
+        explicit_label,
     )?;
-    log_comm_message(
-        ctx,
-        sender_id,
-        recipient_id,
-        &message,
-        MessageType::Request(request_id),
-        Duration::from_secs(30),
+    let conversation = agent_conversation(&agent, message);
+    ctx.infer(
+        "ask",
+        &conversation,
+        &InferenceOptions::default(),
+        Some(InferenceExchange {
+            recipient: agent,
+            request_type: MessageType::Request(request_id),
+            response_type: Some(MessageType::Response(request_id)),
+            message: Some(message.into()),
+        }),
     )
-    .await;
-
-    let response = registry
-        .ask_agent(&agent_name, &message, provider.as_ref())
-        .await
-        .map_err(|e| ReplError::Execution(format!("ask({}) failed: {}", agent_name, e)))?;
-
-    log_comm_message(
-        ctx,
-        recipient_id,
-        sender_id,
-        &response,
-        MessageType::Response(request_id),
-        Duration::from_secs(30),
-    )
-    .await;
-
-    Ok(DslValue::String(response))
+    .await
+    .map(|response| response.content)
 }
 
-/// Execute the `send_to` builtin: fire-and-forget message to a named agent.
-///
-/// Arguments:
-/// - agent: string — agent name
-/// - message: string
-///
-/// Returns null (fire-and-forget).
-pub async fn builtin_send_to(args: &[DslValue], ctx: &ReasoningBuiltinContext) -> Result<DslValue> {
-    let registry = ctx
-        .agent_registry
-        .as_ref()
-        .ok_or_else(|| ReplError::Execution("No agent registry configured".into()))?;
-
-    let provider = ctx
-        .provider
-        .as_ref()
-        .ok_or_else(|| ReplError::Execution("No inference provider configured".into()))?;
-
-    let (agent_name, message) = parse_ask_args(args)?;
-
-    // Communication bus wiring: policy check + message logging
-    let recipient_id = resolve_agent_id(&agent_name, ctx).await?;
-    let sender_id = ctx.sender_agent_id.unwrap_or_default();
-
+/// Complete an explicit conversation for the same target snapshot that passed
+/// communication authorization. The typed conversation is included in its hash.
+pub async fn governed_ask_conversation(
+    ctx: &ReasoningBuiltinContext,
+    target: &str,
+    conversation: &Conversation,
+) -> Result<String> {
+    let agent = resolve_agent(target, ctx).await?;
+    let ctx = caller_context(ctx)?;
+    let request_id = RequestId::new();
     check_comm_policy(
-        ctx,
-        sender_id,
-        recipient_id,
-        MessageType::Direct(recipient_id),
+        &ctx,
+        ctx.sender_agent_id.unwrap(),
+        agent.agent_id,
+        MessageType::Request(request_id),
+        None,
     )?;
-    log_comm_message(
-        ctx,
-        sender_id,
-        recipient_id,
-        &message,
-        MessageType::Direct(recipient_id),
-        Duration::from_secs(30),
+    // Preserve the threaded API's explicit conversation without copying its
+    // history into communication queues. Its typed request hash binds the call.
+    ctx.infer(
+        "ask_conversation",
+        conversation,
+        &InferenceOptions::default(),
+        Some(InferenceExchange {
+            recipient: agent,
+            request_type: MessageType::Request(request_id),
+            response_type: None,
+            message: None,
+        }),
     )
-    .await;
+    .await
+    .map(|response| response.content)
+}
 
-    // Fire-and-forget: spawn a background task. Errors are logged so an
-    // auditor can trace failed deliveries without the DSL caller needing
-    // to await completion.
-    let registry = registry.clone();
-    let provider = provider.clone();
+/// Ask a registered agent and wait for its reply.
+pub async fn builtin_ask(args: &[DslValue], ctx: &ReasoningBuiltinContext) -> Result<DslValue> {
+    let (agent_name, message) = parse_ask_args(args)?;
+    let label = optional_protocol_label(args);
+    governed_ask(ctx, &agent_name, &message, label.as_deref())
+        .await
+        .map(DslValue::String)
+}
+
+/// Queue a bounded background call. Null means queued, not completed. Its
+/// retained owner records the result even after this builtin has returned.
+pub async fn builtin_send_to(args: &[DslValue], ctx: &ReasoningBuiltinContext) -> Result<DslValue> {
+    let (agent_name, message) = parse_ask_args(args)?;
+    let agent = resolve_agent(&agent_name, ctx).await?;
+    let ctx = caller_context(ctx)?;
+    let recipient = agent.agent_id;
+    check_comm_policy(
+        &ctx,
+        ctx.sender_agent_id.unwrap(),
+        recipient,
+        MessageType::Direct(recipient),
+        None,
+    )?;
+    let conversation = agent_conversation(&agent, &message);
+    let pending = ctx
+        .start_inference(
+            "send_to",
+            &conversation,
+            &InferenceOptions::default(),
+            Some(InferenceExchange {
+                recipient: agent,
+                request_type: MessageType::Direct(recipient),
+                response_type: None,
+                message: Some(message),
+            }),
+        )
+        .await?;
     tokio::spawn(async move {
-        match registry
-            .ask_agent(&agent_name, &message, provider.as_ref())
-            .await
-        {
-            Ok(_) => {
-                tracing::debug!(
-                    agent = %agent_name,
-                    sender = %sender_id,
-                    "send_to: background ask_agent succeeded",
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    agent = %agent_name,
-                    sender = %sender_id,
-                    error = %e,
-                    "send_to: background ask_agent failed",
-                );
-            }
+        if let Err(error) = pending.wait().await {
+            tracing::warn!(agent = %agent_name, error = %error, "send_to delivery failed");
         }
     });
-
     Ok(DslValue::Null)
 }
 
-/// Execute the `parallel` builtin: run multiple agent calls concurrently.
-///
-/// Arguments:
-/// - tasks: list of maps, each with `{agent: string, message: string}`
-///
-/// Returns a list of results (strings or error maps).
+/// Run calls concurrently after every target snapshot passes policy. Child
+/// futures belong to this invocation; dropping it cancels their audit owners.
 pub async fn builtin_parallel(
     args: &[DslValue],
     ctx: &ReasoningBuiltinContext,
 ) -> Result<DslValue> {
-    let registry = ctx
-        .agent_registry
-        .as_ref()
-        .ok_or_else(|| ReplError::Execution("No agent registry configured".into()))?;
-
-    let provider = ctx
-        .provider
-        .as_ref()
-        .ok_or_else(|| ReplError::Execution("No inference provider configured".into()))?;
-
-    let tasks = parse_parallel_args(args)?;
-
-    // Pre-spawn policy checks: all must pass before any task is spawned
-    let sender_id = ctx.sender_agent_id.unwrap_or_default();
-    let mut checked_tasks = Vec::new();
-    for (agent_name, message) in &tasks {
-        let recipient_id = resolve_agent_id(agent_name, ctx).await?;
-        let request_id = RequestId::new();
-        check_comm_policy(
-            ctx,
-            sender_id,
-            recipient_id,
-            MessageType::Request(request_id),
-        )?;
-        checked_tasks.push((
-            agent_name.clone(),
-            message.clone(),
-            recipient_id,
-            request_id,
-        ));
-    }
-
-    // All checks passed — log outbound messages and spawn tasks
-    let comm_bus = ctx.comm_bus.clone();
-    let mut handles = Vec::new();
-    for (agent_name, message, recipient_id, request_id) in checked_tasks {
-        log_comm_message(
-            ctx,
-            sender_id,
-            recipient_id,
-            &message,
-            MessageType::Request(request_id),
-            Duration::from_secs(30),
-        )
+    let ctx = caller_context(ctx)?;
+    let tasks = checked_tasks(args, &ctx).await?;
+    let results =
+        futures::future::join_all(tasks.into_iter().map(|(agent, message, request_id)| {
+            call_checked_agent(&ctx, "parallel", agent, message, request_id)
+        }))
         .await;
-
-        let registry = registry.clone();
-        let provider = provider.clone();
-        let bus = comm_bus.clone();
-        handles.push(tokio::spawn(async move {
-            let result = registry
-                .ask_agent(&agent_name, &message, provider.as_ref())
-                .await
-                .map_err(|e| format!("{}", e));
-
-            // Log response via cloned bus
-            if let Ok(ref response) = result {
-                if let Some(ref bus) = bus {
-                    let msg = bus.create_internal_message(
-                        recipient_id,
-                        sender_id,
-                        bytes::Bytes::from(response.clone()),
-                        MessageType::Response(request_id),
-                        Duration::from_secs(30),
-                    );
-                    if let Err(e) = bus.send_message(msg).await {
-                        tracing::warn!("Failed to log inter-agent response: {}", e);
-                    }
-                }
-            }
-
-            result
-        }));
-    }
-
-    let mut results = Vec::new();
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(response)) => results.push(DslValue::String(response)),
-            Ok(Err(e)) => {
-                let mut error_map = HashMap::new();
-                error_map.insert("error".to_string(), DslValue::String(e));
-                results.push(DslValue::Map(error_map));
-            }
-            Err(e) => {
-                let mut error_map = HashMap::new();
-                error_map.insert("error".to_string(), DslValue::String(e.to_string()));
-                results.push(DslValue::Map(error_map));
-            }
-        }
-    }
-
-    Ok(DslValue::List(results))
+    Ok(DslValue::List(
+        results
+            .into_iter()
+            .map(|result| match result {
+                Ok(response) => DslValue::String(response),
+                Err(error) => DslValue::Map(HashMap::from([(
+                    "error".into(),
+                    DslValue::String(error.to_string()),
+                )])),
+            })
+            .collect(),
+    ))
 }
 
-/// Execute the `race` builtin: run multiple agent calls, return first to complete.
-///
-/// Arguments:
-/// - tasks: list of maps, each with `{agent: string, message: string}`
-///
-/// Returns the first successful result as a string.
+/// Return the first successful call; an earlier failure cannot discard a later
+/// success. Dropping the remaining futures signals their retained audit owners.
 pub async fn builtin_race(args: &[DslValue], ctx: &ReasoningBuiltinContext) -> Result<DslValue> {
-    let registry = ctx
-        .agent_registry
-        .as_ref()
-        .ok_or_else(|| ReplError::Execution("No agent registry configured".into()))?;
-
-    let provider = ctx
-        .provider
-        .as_ref()
-        .ok_or_else(|| ReplError::Execution("No inference provider configured".into()))?;
-
-    let tasks = parse_parallel_args(args)?;
-
+    use futures::StreamExt;
+    let ctx = caller_context(ctx)?;
+    let tasks = checked_tasks(args, &ctx).await?;
     if tasks.is_empty() {
         return Err(ReplError::Execution(
             "race requires at least one task".into(),
         ));
     }
+    let mut pending: futures::stream::FuturesUnordered<_> = tasks
+        .into_iter()
+        .map(|(agent, message, request_id)| {
+            call_checked_agent(&ctx, "race", agent, message, request_id)
+        })
+        .collect();
+    let mut errors = Vec::new();
+    while let Some(result) = pending.next().await {
+        match result {
+            Ok(response) => return Ok(DslValue::String(response)),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    Err(ReplError::Execution(format!(
+        "race: all calls failed: {}",
+        errors.join("; ")
+    )))
+}
 
-    // Pre-spawn policy checks: all must pass before any task is spawned
-    let sender_id = ctx.sender_agent_id.unwrap_or_default();
-    let mut checked_tasks = Vec::new();
-    for (agent_name, message) in &tasks {
-        let recipient_id = resolve_agent_id(agent_name, ctx).await?;
+fn caller_context(ctx: &ReasoningBuiltinContext) -> Result<ReasoningBuiltinContext> {
+    if ctx.provider.is_none() {
+        return Err(ReplError::Execution(
+            "No inference provider configured".into(),
+        ));
+    }
+    let mut invocation = ctx.clone();
+    invocation.sender_agent_id = Some(ctx.sender_agent_id.unwrap_or_default());
+    Ok(invocation)
+}
+
+fn agent_conversation(agent: &RegisteredAgent, message: &str) -> Conversation {
+    let mut conversation = Conversation::with_system(&agent.system_prompt);
+    conversation.push(ConversationMessage::user(message));
+    conversation
+}
+
+async fn checked_tasks(
+    args: &[DslValue],
+    ctx: &ReasoningBuiltinContext,
+) -> Result<Vec<(RegisteredAgent, String, RequestId)>> {
+    let mut checked = Vec::new();
+    for (name, message) in parse_parallel_args(args)? {
+        let agent = resolve_agent(&name, ctx).await?;
         let request_id = RequestId::new();
         check_comm_policy(
             ctx,
-            sender_id,
-            recipient_id,
+            ctx.sender_agent_id.unwrap(),
+            agent.agent_id,
             MessageType::Request(request_id),
+            None,
         )?;
-        checked_tasks.push((
-            agent_name.clone(),
-            message.clone(),
-            recipient_id,
-            request_id,
-        ));
+        checked.push((agent, message, request_id));
     }
+    Ok(checked)
+}
 
-    // All checks passed — log outbound messages and spawn tasks
-    let comm_bus = ctx.comm_bus.clone();
-    let mut join_set = tokio::task::JoinSet::new();
-    for (agent_name, message, recipient_id, request_id) in checked_tasks {
-        log_comm_message(
-            ctx,
-            sender_id,
-            recipient_id,
-            &message,
-            MessageType::Request(request_id),
-            Duration::from_secs(30),
-        )
-        .await;
-
-        let registry = registry.clone();
-        let provider = provider.clone();
-        let bus = comm_bus.clone();
-        join_set.spawn(async move {
-            let result = registry
-                .ask_agent(&agent_name, &message, provider.as_ref())
-                .await
-                .map_err(|e| format!("{}", e));
-
-            // Log response via cloned bus
-            if let Ok(ref response) = result {
-                if let Some(ref bus) = bus {
-                    let msg = bus.create_internal_message(
-                        recipient_id,
-                        sender_id,
-                        bytes::Bytes::from(response.clone()),
-                        MessageType::Response(request_id),
-                        Duration::from_secs(30),
-                    );
-                    if let Err(e) = bus.send_message(msg).await {
-                        tracing::warn!("Failed to log inter-agent response: {}", e);
-                    }
-                }
-            }
-
-            result
-        });
-    }
-
-    // Return the first completed result
-    match join_set.join_next().await {
-        Some(Ok(Ok(response))) => {
-            join_set.abort_all();
-            Ok(DslValue::String(response))
-        }
-        Some(Ok(Err(e))) => {
-            join_set.abort_all();
-            Err(ReplError::Execution(format!(
-                "race: first completed with error: {}",
-                e
-            )))
-        }
-        Some(Err(e)) => {
-            join_set.abort_all();
-            Err(ReplError::Execution(format!("race: task panic: {}", e)))
-        }
-        None => Err(ReplError::Execution("race: no tasks to run".into())),
-    }
+async fn call_checked_agent(
+    ctx: &ReasoningBuiltinContext,
+    operation: &str,
+    agent: RegisteredAgent,
+    message: String,
+    request_id: RequestId,
+) -> Result<String> {
+    let conversation = agent_conversation(&agent, &message);
+    ctx.infer(
+        operation,
+        &conversation,
+        &InferenceOptions::default(),
+        Some(InferenceExchange {
+            recipient: agent,
+            request_type: MessageType::Request(request_id),
+            response_type: Some(MessageType::Response(request_id)),
+            message: Some(message),
+        }),
+    )
+    .await
+    .map(|response| response.content)
 }
 
 // --- Communication helpers ---
 
 /// Resolve an agent name to its AgentId via the registry.
-pub(crate) async fn resolve_agent_id(name: &str, ctx: &ReasoningBuiltinContext) -> Result<AgentId> {
+pub(crate) async fn resolve_agent(
+    name: &str,
+    ctx: &ReasoningBuiltinContext,
+) -> Result<RegisteredAgent> {
     let registry = ctx
         .agent_registry
         .as_ref()
         .ok_or_else(|| ReplError::Execution("No agent registry configured".into()))?;
 
-    registry
+    let agent = registry
         .get_agent(name)
         .await
-        .map(|agent| agent.agent_id)
-        .ok_or_else(|| ReplError::Execution(format!("Unknown agent: {}", name)))
+        .ok_or_else(|| ReplError::Execution(format!("Unknown agent: {}", name)))?;
+    if agent.definition.is_some() {
+        return Err(ReplError::Execution("canonical agents require their governed source-bound executor; direct composition cannot enforce their requirements".into()));
+    }
+    Ok(agent)
 }
 
-/// Check communication policy. Returns Ok(()) if allowed or if no policy gate is configured.
+/// Check communication policy. Missing governance cannot authorize a message.
+///
+/// When a session is active in `ctx`, the protocol label is auto-derived from
+/// the monitor using `legal_labels_to`. If the label is unambiguous (exactly
+/// one legal option), it is used automatically and the session FSMs are stepped
+/// by the gate. Pass `explicit_label` to resolve ambiguity when multiple labels
+/// are legal for the same sender→recipient pair.
+///
+/// v1a note: only `ask` and `delegate` thread an `explicit_label` (via the
+/// optional `protocol_label` named arg). The fire-and-forget / fan-out
+/// primitives (`send_to`, `parallel`, `race`) pass `None`, so they rely on
+/// unambiguous auto-derivation; an ambiguous edge reached through them will
+/// error. Wiring the escape hatch for those primitives is a v1b refinement.
 pub(crate) fn check_comm_policy(
     ctx: &ReasoningBuiltinContext,
     sender: AgentId,
     recipient: AgentId,
     message_type: MessageType,
+    explicit_label: Option<&str>,
 ) -> Result<()> {
+    #[cfg(feature = "session")]
+    let (session_id, protocol_label) = match (
+        ctx.active_session.lock().unwrap().clone(),
+        ctx.session_monitor.as_ref(),
+    ) {
+        (Some(sid), Some(mon)) => {
+            let labels = mon
+                .legal_labels_to(&sid, &sender.to_string(), &recipient.to_string())
+                .map_err(|e| ReplError::Execution(format!("session: {e}")))?;
+            let label = match labels.len() {
+                1 => labels.into_iter().next().unwrap(),
+                0 => {
+                    let opts = mon
+                        .legal_next(&sid, &sender.to_string())
+                        .map(|evs| {
+                            evs.iter()
+                                .map(|e| e.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    return Err(ReplError::Execution(format!(
+                        "session: no legal message to this recipient now; legal next: {opts}"
+                    )));
+                }
+                _ => match explicit_label {
+                    Some(l) if labels.iter().any(|x| x == l) => l.to_string(),
+                    _ => {
+                        return Err(ReplError::Execution(format!(
+                            "session: ambiguous label to this recipient; specify protocol_label \
+                             as one of: {}",
+                            labels.join(", ")
+                        )));
+                    }
+                },
+            };
+            (Some(sid.to_string()), Some(label))
+        }
+        _ => (None, None),
+    };
+    #[cfg(not(feature = "session"))]
+    let (session_id, protocol_label): (Option<String>, Option<String>) = {
+        let _ = explicit_label; // unused without the session feature
+        (None, None)
+    };
+
     if let Some(policy) = &ctx.comm_policy {
         let request = CommunicationRequest {
             sender,
             recipient,
             message_type,
             topic: None,
+            session_id,
+            protocol_label,
         };
         policy
             .evaluate(&request)
             .map_err(|e| ReplError::Execution(format!("Inter-agent communication denied: {}", e)))
     } else {
-        Ok(())
-    }
-}
-
-/// Log an outbound message via the CommunicationBus. Best-effort (errors logged, not propagated).
-pub(crate) async fn log_comm_message(
-    ctx: &ReasoningBuiltinContext,
-    sender: AgentId,
-    recipient: AgentId,
-    payload: &str,
-    message_type: MessageType,
-    ttl: Duration,
-) {
-    if let Some(bus) = &ctx.comm_bus {
-        let msg = bus.create_internal_message(
-            sender,
-            recipient,
-            bytes::Bytes::from(payload.to_string()),
-            message_type,
-            ttl,
-        );
-        if let Err(e) = bus.send_message(msg).await {
-            tracing::warn!("Failed to log inter-agent message: {}", e);
-        }
+        Err(ReplError::Execution(
+            "Inter-agent communication requires a configured policy gate".into(),
+        ))
     }
 }
 
@@ -516,7 +453,7 @@ fn parse_ask_args(args: &[DslValue]) -> Result<(String, String)> {
 
 /// Maximum number of tasks accepted by `parallel()` / `race()`.
 ///
-/// Each task spawns a tokio task and issues a policy-gated inter-agent
+/// Each task owns an audited provider call and issues a policy-gated inter-agent
 /// message, so an unbounded list is both a cheap local DoS (fork-bomb of
 /// tasks) and an amplification vector into the inference provider. The
 /// limit can be widened via `SYMBIONT_MAX_PARALLEL_TASKS` for operators
@@ -748,5 +685,94 @@ mod tests {
         let res = parse_parallel_args(&args);
         std::env::remove_var("SYMBIONT_MAX_PARALLEL_TASKS");
         assert!(res.is_ok(), "override must widen the cap");
+    }
+
+    #[cfg(feature = "session")]
+    #[tokio::test]
+    async fn check_comm_policy_auto_derives_label_and_enforces_order() {
+        use crate::dsl::reasoning_builtins::ReasoningBuiltinContext;
+        use std::sync::{Arc, Mutex};
+        use symbi_runtime::communication::policy_gate::CommunicationPolicyGate;
+        use symbi_runtime::types::AgentId;
+        use symbi_runtime::types::MessageType;
+        use symbi_session::examples::coordinator_pipeline;
+        use symbi_session::monitor::{SessionId, SessionMonitor};
+
+        let (g, _r) = coordinator_pipeline();
+        let monitor = Arc::new(SessionMonitor::new());
+        let (coord, validator, processor) = (AgentId::new(), AgentId::new(), AgentId::new());
+        let sid = SessionId("cp1".into());
+        let mut assign = std::collections::HashMap::new();
+        assign.insert(coord.to_string(), "Coordinator".to_string());
+        assign.insert(validator.to_string(), "Validator".to_string());
+        assign.insert(processor.to_string(), "Processor".to_string());
+        monitor.establish(sid.clone(), &g, assign).unwrap();
+
+        let gate =
+            Arc::new(CommunicationPolicyGate::permissive().with_session_monitor(monitor.clone()));
+        let ctx = ReasoningBuiltinContext {
+            comm_policy: Some(gate),
+            session_monitor: Some(monitor.clone()),
+            active_session: Arc::new(Mutex::new(Some(sid.clone()))),
+            ..Default::default()
+        };
+
+        // Conforming first step (label auto-derived to "task"); explicit_label None.
+        check_comm_policy(&ctx, coord, validator, MessageType::Direct(validator), None).unwrap();
+        // Out-of-order: no legal send to Processor yet -> denied with guidance.
+        let err = check_comm_policy(&ctx, coord, processor, MessageType::Direct(processor), None)
+            .unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("session") || msg.contains("legal"),
+            "got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "session")]
+    #[test]
+    fn dsl_path_enforces_pipeline_with_autoderived_labels() {
+        use crate::runtime_bridge::RuntimeBridge;
+        use symbi_runtime::session::RoleBinding;
+        use symbi_runtime::types::AgentId;
+        use symbi_runtime::types::MessageType;
+        use symbi_session::examples::coordinator_pipeline;
+
+        let bridge = RuntimeBridge::new_permissive_for_dev();
+        let (g, _r) = coordinator_pipeline();
+        let (c, v, p) = (AgentId::new(), AgentId::new(), AgentId::new());
+        let rb = RoleBinding::new()
+            .bind(c, "Coordinator")
+            .bind(v, "Validator")
+            .bind(p, "Processor");
+        let _sid = bridge
+            .open_session(&g, rb, Duration::from_secs(60))
+            .unwrap();
+        let ctx = bridge.reasoning_context();
+
+        // Fully auto-derived labels — the caller never names a label (explicit_label = None):
+        check_comm_policy(&ctx, c, v, MessageType::Direct(v), None).unwrap(); // -> "task"
+        check_comm_policy(&ctx, v, c, MessageType::Direct(c), None).unwrap(); // -> "ok"
+        check_comm_policy(&ctx, c, p, MessageType::Direct(p), None).unwrap(); // -> "task"
+        check_comm_policy(&ctx, p, c, MessageType::Direct(c), None).unwrap(); // -> "done"
+
+        // Fresh session: out-of-order first move denied with guidance.
+        let bridge2 = RuntimeBridge::new_permissive_for_dev();
+        let (g2, _r2) = coordinator_pipeline();
+        let (c2, v2, p2) = (AgentId::new(), AgentId::new(), AgentId::new());
+        let rb2 = RoleBinding::new()
+            .bind(c2, "Coordinator")
+            .bind(v2, "Validator")
+            .bind(p2, "Processor");
+        bridge2
+            .open_session(&g2, rb2, Duration::from_secs(60))
+            .unwrap();
+        let ctx2 = bridge2.reasoning_context();
+        let err = check_comm_policy(&ctx2, c2, p2, MessageType::Direct(p2), None).unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("session") || msg.contains("legal"),
+            "got: {msg}"
+        );
     }
 }

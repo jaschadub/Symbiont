@@ -5,8 +5,111 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: this workflow only checks out and builds/tests the code.
+permissions:
+  contents: read
+
 jobs:
   test:
+    runs-on: ubuntu-latest
+    # Statically linking the fat feature test binaries (runtime + rsa/p384 +
+    # tree-sitter + crypto crates) with full debuginfo exhausts the runner's
+    # RAM during `ld`, which faults on the mmap'd output (SIGBUS). Trim debug
+    # info to line tables only for CI: keeps panic backtraces, cuts linker
+    # memory and artifact size sharply, and doesn't touch the repo's profiles.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable (pinned)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Validate release graph and offline release tooling
+        run: |
+          python3 scripts/test-release-tools.py
+          python3 scripts/publish-crates.py
+      - run: cargo fmt --check
+      # --all-targets so test and bench code is linted too. Without it a
+      # warning inside a #[cfg(test)] module merges green and only surfaces
+      # when someone runs clippy locally.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: Test Docker containment against the daemon
+        env:
+          SYMBI_DOCKER_AMBIENT_CANARY: synthetic-ambient-value
+        run: |
+          docker pull python:3.12-slim
+          docker image inspect python:3.12-slim --format '{{.Id}}'
+          cargo build -p symbi-sandbox-supervisor
+          export SYMBIONT_SANDBOX_SUPERVISOR="$PWD/target/debug/symbi-sandbox-supervisor"
+          export SYMBIONT_SANDBOX_STATE_DIR="$RUNNER_TEMP/sandbox-leases"
+          cargo test -p symbi-sandbox-supervisor --test lifecycle -- --ignored --test-threads=2
+          cargo test -p symbi-runtime --lib sandbox::docker::tests::e2e:: -- --ignored --test-threads=2
+      - name: Lint Cedar policies
+        run: |
+          files=$(git ls-files '*.cedar' 2>/dev/null || true)
+          if [ -n "$files" ]; then
+            python3 .github/scripts/lint-cedar-policies.py $files
+          else
+            echo "No .cedar files tracked — skipping lint."
+          fi
+      # Feature combination tests — verify minimal and no-default builds compile
+      # clippy, not check: this is the combination downstream consumers build
+      # with (the enterprise console pulls symbi-runtime with
+      # default-features = false), and `check` does not fail on lint warnings,
+      # so warnings that only appear with features off went unnoticed here.
+      - name: Test minimal build (no default features)
+        run: cargo clippy -p symbi-runtime --no-default-features --all-targets -- -D warnings
+      - name: Test without vector backends
+        run: cargo test -p symbi-runtime --no-default-features --features keychain
+      # Lint ALL feature-gated code with -D warnings (compile-only; mirrors the
+      # `just clippy` all-features gate so feature code can't merge with warnings
+      # the default-features clippy above never sees).
+      - name: Clippy with all features
+        run: cargo clippy -p symbi-runtime --all-features -- -D warnings
+      # Test the commonly-enabled features adopters actually build with. Excludes
+      # embedding-models / vector backends, whose tests pull large model/data
+      # downloads unsuitable for CI — those stay covered by the clippy step above.
+      - name: Test major features
+        run: cargo test -p symbi-runtime --features http-api,cloud-llm,cedar,metrics,cron
+      # MCP-backed tool execution. The mcp_*.rs / toolclad_mcp.rs suites are
+      # `#![cfg(feature = "mcp-client")]`, so without this step they are only
+      # ever compiled by the all-features clippy above — never executed. That
+      # left the SchemaPin verification and stdio round-trip assertions
+      # unverified. The tests spawn a local fixture server; no network.
+      - name: Test mcp-client feature
+        run: cargo test -p symbi-runtime --features mcp-client
+      # Browser backend seam — currently honest-error only, but the tests assert
+      # that (no fabricated success), which is worth keeping executed.
+      - name: Test toolclad-browser feature
+        run: cargo test -p symbi-runtime --features toolclad-browser --lib toolclad::browser_executor
+      # Bedrock is off by default and no workspace member enables it, so
+      # `cargo test --workspace` never compiles it. Its message-serialization
+      # tests — including the regression that tool results reach the model
+      # instead of flattening to an empty string — only run here.
+      - name: Test bedrock feature
+        run: cargo test -p symbi-runtime --features bedrock --lib http_input::bedrock
+      # Experimental session feature (off by default) — verify the opt-in build.
+      - name: Check session feature (runtime)
+        run: cargo check -p symbi-runtime --no-default-features --features keychain,session
+      - name: Test session feature (repl-core)
+        run: cargo test -p repl-core --features session
+
+  msrv:
+    # Verify the declared MSRV (workspace.package.rust-version) actually builds.
+    # CI's main job uses `stable`, which silently tolerates newer-than-MSRV APIs;
+    # this job pins the floor so an accidental bump can't merge green.
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space
@@ -14,31 +117,16 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           df -h /
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
       - name: Install protoc
         run: sudo apt-get install -y protobuf-compiler
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace -- -D warnings
-      - run: cargo test --workspace
-      - name: Lint Cedar policies
-        run: |
-          files=$(git ls-files '*.cedar' 2>/dev/null || true)
-          if [ -n "$files" ]; then
-            python3 scripts/lint-cedar-policies.py $files
-          else
-            echo "No .cedar files tracked — skipping lint."
-          fi
-      # Feature combination tests — verify minimal and no-default builds compile
-      - name: Test minimal build (no default features)
-        run: cargo check -p symbi-runtime --no-default-features
-      - name: Test without vector backends
-        run: cargo test -p symbi-runtime --no-default-features --features keychain
-      - name: Test with all features
-        run: cargo check -p symbi-runtime --all-features
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned action, explicit MSRV toolchain
+        with:
+          toolchain: "1.89"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo check --workspace
 
   fuzz:
     runs-on: ubuntu-latest
@@ -48,21 +136,21 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           df -h /
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
       - name: Install protoc
         run: sudo apt-get install -y protobuf-compiler
       # Pin nightly to avoid str::as_str() breakage in shellexpand 3.1.1
       # (rust-lang/rust#152961). Unpin once revert #152963 lands in nightly.
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable (pinned, used here with explicit toolchain override)
         with:
           toolchain: nightly-2026-02-21
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: tools/fuzz
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.1 --locked
       - name: Fuzz (short CI run)
         run: |
           cd tools/fuzz
@@ -77,7 +165,6 @@ jobs:
             sensitive_arg_masking \
             tool_substitution_detection \
             dsl_structure_aware \
-            sse_jsonrpc_parsing \
             schemapin_keystore_roundtrip \
             dsl_evaluator \
             mattermost_signature_verification \

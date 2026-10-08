@@ -9,6 +9,8 @@
 
 ## 概述
 
+已实现的收容（containment）变更参见[收容运维与架构指南](/containment-branch-guide)。运行时通过校验、审批、Cedar、必需审计和一次性派发来绑定预备调用；受收容的工作进程由一个独立的监督进程拥有。已覆盖的 CLI、HTTP、调度器和 DSL 默认路径使用受保护日志。下文的原则描述的是设计；仍有执行与审计路径未覆盖，因此还不能宣称完整的收容。
+
 Symbi 运行时系统为自主代理提供安全、可扩展且策略感知的执行环境。基于 Rust 构建以确保性能和安全性，它实现了具有全面审计功能的多层安全模型。
 
 ### 核心原则
@@ -56,6 +58,7 @@ graph TB
     subgraph "Sandbox Tiers"
         T1[Tier 1: Docker]
         T2[Tier 2: gVisor]
+        T3[Tier 3: Firecracker microVM]
     end
     
     ARS --> ACM
@@ -66,6 +69,7 @@ graph TB
     ACM --> RAG
     SO --> T1
     SO --> T2
+    SO --> T3
     MCP --> TV
     PE --> AT
 ```
@@ -160,7 +164,7 @@ pub struct ResourceLimits {
 
 ### 沙箱架构
 
-运行时基于操作风险实现两个安全层：
+运行时附带三个主机隔离层 —— 全部为 OSS —— 外加一个独立的托管云后端（E2B）。运维方可在 DSL 的 `with { sandbox = ... }` 块中按智能体选择层级，或在 `[sandbox] tier = "..."` 中设置项目默认值。
 
 #### 第 1 层：Docker 隔离
 **用例**：低风险操作、开发任务
@@ -170,13 +174,21 @@ pub struct ResourceLimits {
 - 适用于具有最小安全要求的可信代码
 
 #### 第 2 层：gVisor 隔离
-**用例**：标准生产任务、数据处理
+**用例**：标准生产任务、数据处理、不受信任代码
 - 具有系统调用拦截的用户空间内核
 - 内存保护和 I/O 虚拟化
 - 增强安全性，性能影响最小
-- 大多数代理操作的默认层
+- 需要将 `runsc` 注册为 Docker 运行时
 
-> **注意**：企业版中提供了额外的隔离层，以满足最大安全要求。
+#### 第 3 层：Firecracker microVM
+**用例**：最高隔离级别工作负载 —— 多租户不受信任代码、受监管数据、爆炸半径控制
+- 通过 KVM 实现的硬件虚拟化，每次执行使用独立内核
+- 由运维方提供 vmlinux 与 rootfs（默认只读）
+- 与主机不共享任何内核表面
+- 需要 `firecracker` 二进制，以及与之匹配的 `symbi-sandbox-guest` PID 1 服务和监督进程 —— 见 [`docs/firecracker-setup.md`](/firecracker-setup)。
+
+#### 托管执行：E2B（不是一个层级）
+E2B 是一个独立的托管云后端，**不是**第 1/2/3 层的对等项。它映射到 `SecurityTier::Hosted`，在排序上位于 `Tier1` **之下** —— 任何要求主机隔离（`tier >= Tier1`）的策略都会拒绝托管执行。仅可通过 DSL（`with { sandbox = "e2b" }`）选择启用。
 
 ---
 
@@ -242,6 +254,20 @@ pub struct SecureMessage {
 - `sender_agent_id` —— 调用方智能体的身份
 - `comm_bus` —— 指向 `CommunicationBus` 的引用，用于消息路由
 - `comm_policy` —— 指向 `CommunicationPolicyGate` 的引用，用于授权
+
+### 跨实例智能体消息传递
+
+进程内的 `CommunicationBus` 有一个分布式对应物 —— `RemoteCommunicationBus` —— 它通过 HTTP 在独立的运行时实例之间转发相同的消息类型（`ask`、`send_to`、`delegate`、`parallel`、`race`）。这就是让部署在一台主机上的协调器能够在不放弃策略执行、签名或审计轨迹的情况下，与部署在另一台主机上的工作者通信。
+
+关键特性：
+
+- **相同契约** —— `RemoteCommunicationBus` 实现与本地总线相同的 trait，因此智能体代码和 DSL 内置函数在进程内拓扑和跨实例拓扑之间无需改动。
+- **HTTP 消息端点** —— 暴露在运行时 HTTP API 上并接入 `RuntimeBridge` 的默认上下文，因此一个位置的 `symbi up` 可以接收来自其他位置 `symbi up` 的消息。
+- **AgentPin 锚定身份** —— 发送方出示 AgentPin ES256 令牌；接收方在策略门控运行之前针对发送方的域锚定密钥进行验证。
+- **SchemaPin 校验** —— 跨实例引用的任何工具清单在执行前都会针对其已固定的签名进行校验。
+- **审计** —— 远程消息的发送与接收以与本地消息相同的密码学防篡改格式记录，因此审计轨迹会跟随消息跳转。
+
+部署拓扑通常为一个协调器实例加上一个或多个工作者实例，每个实例通过 `symbi shell /deploy …`（Beta）部署到 Docker、Cloud Run 或 App Runner。请参阅 [Symbi Shell 部署指南](/symbi-shell#deployment-beta)。
 
 ---
 
@@ -429,18 +455,9 @@ pub struct AuditEvent {
 - **时间戳验证**：加密时间戳
 - **批量验证**：高效的批量验证
 
-### 合规性功能
-
-**监管支持：**
-- **HIPAA**：医疗数据保护合规性
-- **GDPR**：欧洲数据保护要求
-- **SOX**：财务审计追踪要求
-- **自定义**：可配置的合规性框架
-
 **审计功能：**
 - 实时事件流
 - 历史事件查询
-- 合规性报告生成
 - 完整性验证
 
 ---
@@ -476,7 +493,7 @@ pub struct AuditEvent {
 - **泄漏预防**：自动清理和监控
 
 **CPU 利用率：**
-- **调度器开销**：10,000 个代理的 CPU <2%
+- **调度器开销**：已测试注册和有界队列的延迟。尚未证实 10,000 个执行中代理的 CPU 开销。
 - **上下文切换**：硬件辅助虚拟线程
 - **负载均衡**：动态负载分配
 - **优先级调度**：实时和批处理层
@@ -522,26 +539,29 @@ max_concurrent_connections = 100
 ### 环境变量
 
 ```bash
-# Core runtime
-export SYMBI_LOG_LEVEL=info
-export SYMBI_RUNTIME_MODE=production
-export SYMBI_CONFIG_PATH=/etc/symbi/config.toml
+# 必需：用于加密持久化状态的 32 字节十六进制密钥。
+# `symbi init` 会将一个密钥写入 .env。可用以下命令生成：openssl rand -hex 32
+export SYMBIONT_MASTER_KEY=...
 
-# Security
-export SYMBI_CRYPTO_PROVIDER=ring
-export SYMBI_AUDIT_STORAGE=/var/log/symbi/audit
+# LLM 提供方（设置其中之一）
+export ANTHROPIC_API_KEY=...   # 或 OPENAI_API_KEY / OPENROUTER_API_KEY
 
-# 向量数据库（LanceDB 是零配置的默认选项）
-export SYMBIONT_VECTOR_BACKEND=lancedb          # 或 "qdrant"
-export SYMBIONT_VECTOR_DATA_PATH=./data/vectors # LanceDB 存储路径
+# 策略门：Cedar 默认开启，并从 policies/*.cedar 自动接入。
+# export SYMBI_INSECURE_ALLOW_ALL=1   # 仅限本地开发 —— 宽松门
 
-# 可选：仅在使用 Qdrant 后端时需要
-# export SYMBIONT_VECTOR_HOST=localhost
-# export SYMBIONT_VECTOR_PORT=6334
+# 调度器 log_file 交付（该通道必需；被限制在此目录内）
+# export SYMBIONT_LOG_DIR=/var/log/symbiont
 
-# 外部依赖
-export OPENAI_API_KEY=your_api_key_here
-export MCP_SERVER_DISCOVERY=enabled
+# 向量搜索：LanceDB 是零配置的默认选项。若改用 Qdrant：
+# export SYMBIONT_VECTOR_BACKEND=qdrant
+# export QDRANT_URL=http://localhost:6333
+
+# OPA 策略后端（如使用；非环回主机需要 https 与 bearer）：
+# export SYMBIONT_OPA_URL=https://opa.internal:8181
+# export SYMBIONT_OPA_AUTH_TOKEN=...
+
+# 用于 X-Forwarded-For 的受信反向代理 CIDR 允许列表
+# export SYMBI_TRUSTED_PROXIES=10.0.0.0/8
 ```
 
 ---
@@ -599,7 +619,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates
 COPY --from=builder /app/target/release/symbi /usr/local/bin/
 EXPOSE 8080
-CMD ["symbi", "mcp", "--config", "/etc/symbi/config.toml"]
+CMD ["symbi", "up"]
 ```
 
 ### Kubernetes 部署
@@ -625,8 +645,11 @@ spec:
         ports:
         - containerPort: 8080
         env:
-        - name: SYMBI_RUNTIME_MODE
-          value: "production"
+        - name: SYMBIONT_MASTER_KEY
+          valueFrom:
+            secretKeyRef:
+              name: symbi-secrets
+              key: master-key
         resources:
           requests:
             memory: "1Gi"

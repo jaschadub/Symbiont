@@ -21,6 +21,9 @@ pub mod manager;
 pub mod traits;
 pub mod types;
 
+#[cfg(any(feature = "slack", feature = "teams", feature = "mattermost"))]
+mod transport;
+
 pub mod adapters;
 
 // Re-export core types
@@ -28,7 +31,7 @@ pub use config::{ChannelConfig, PlatformSettings, SlackConfig};
 pub use error::ChannelAdapterError;
 pub use logging::BasicInteractionLogger;
 pub use manager::{AgentInvoker, ChannelAdapterManager};
-pub use traits::{ChannelAdapter, InboundHandler};
+pub use traits::{ChannelAdapter, InboundCommandInterceptor, InboundHandler};
 pub use types::{
     AdapterHealth, ChatDeliveryReceipt, ChatPlatform, FilteredContent, InboundMessage,
     InteractionAction, InteractionLog, OutboundMessage, PolicyDecision, SlashCommand,

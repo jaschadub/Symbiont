@@ -70,10 +70,10 @@ metadata {
     description: "Healthcare data analysis agent with HIPAA compliance"
     license: "Proprietary"
     tags: ["healthcare", "hipaa", "analysis"]
-    min_runtime_version: "1.0.0"
-    dependencies: ["medical_nlp", "privacy_tools"]
 }
 ```
+
+Metadata pairs accept either `=` or `:` as the separator.
 
 ### Metadata Fields
 
@@ -84,8 +84,45 @@ metadata {
 | `description` | String | Yes | Brief description of agent functionality |
 | `license` | String | No | License identifier |
 | `tags` | Array[String] | No | Classification tags |
-| `min_runtime_version` | String | No | Minimum required runtime version |
-| `dependencies` | Array[String] | No | External dependencies |
+
+Managed-CLI agents (Mode B) recognize these additional metadata keys, read by `symbi run` to spawn a governed Claude Code subprocess (see `agents/code_reviewer.symbi`):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `executor` | String | Set to `"claude_code"` to run the agent as a governed Claude Code subprocess instead of the reasoning loop |
+| `model` | String | Model passed to the subprocess (e.g. `"claude-sonnet-4-5"`) |
+| `allowed_tools` | String | Comma-separated tool allowlist for the subprocess (e.g. `"Read,Grep,Glob"`). **Required** — an agent that declares none is refused rather than spawned unrestricted |
+| `system_prompt` | String | Extra system prompt appended for the subprocess |
+| `permission_mode` | String | Optional. Passed through as `--permission-mode`. Omitted when unset, leaving the subprocess its own default, which still prompts for anything outside `allowed_tools`. Set `"dontAsk"` for agents that must run unattended |
+
+The spawn is policy-gated as `tool_call::claude_code`, and that decision is read
+from `policies/managed-cli/` — **not** `policies/run/`. Spawning a subprocess is
+a different blast radius from the in-process reasoning loop, so the two surfaces
+do not share a policy directory. A minimal permit:
+
+```cedar
+// policies/managed-cli/claude_code.cedar
+permit(principal, action == Action::"tool_call::claude_code", resource);
+```
+
+The spawn decision is not the only decision. The child runs inside the selected
+Docker, gVisor or Firecracker worker with scratch storage and private inference
+and tool channels — no source mount, no external network, no host login state,
+no host credentials. Built-in CLI tools and automatic project/plugin discovery
+are disabled, and `--plugin-dir` is rejected. Source access is a set of
+registered ToolClad tools, and **every tool call the child makes is brokered
+back through the runtime**: prepare and normalize, obtain any mandatory exact
+approval, evaluate Cedar, persist the required pre-effect record, dispatch, then
+record the outcome. `allowed_tools` names an exact subset of registered tools;
+wildcard permission expressions and built-in CLI names are not accepted as
+registry entries.
+
+That is why `allowed_tools` is mandatory and why `permission_mode` is opt-in:
+they bound what the child may *ask for*, while the runtime — not the child —
+decides what actually happens. Each managed CLI session retains its own signed
+journal. See [Managed CLI containment](managed-cli-containment.md) for image,
+mount, policy and `[managed_cli.inference]` configuration, and the
+[governed tool broker](governed-tool-broker.md) for the brokerage contract.
 
 ---
 
@@ -707,6 +744,30 @@ agent fraud_detector(transaction: Transaction) -> FraudAssessment {
     }
 }
 ```
+
+---
+
+## Formatting
+
+`symbi fmt` rewrites `.symbi` files into a canonical layout — useful in pre-commit hooks, CI, and editor save actions.
+
+```bash
+symbi fmt agents/api_aggregator.symbi          # rewrite in place
+symbi fmt --check agents/*.symbi               # CI gate (exit 2 if changes needed)
+cat broken.symbi | symbi fmt --stdin           # editor integration
+```
+
+The formatter parses the source with tree-sitter, validates that it has no syntax errors, and emits a canonical pretty-print. If parsing fails it leaves the file untouched and exits non-zero.
+
+Style highlights:
+
+- 4-space indent
+- Single blank line between top-level items; a leading line comment is attached to the next item with no blank-line separator
+- `metadata` pairs use `key: value,` with a trailing comma to minimise diff churn
+- `with` attributes render as `with k = v, k = v { ... }` with a single space around `=` and a single space + comma between attributes
+- `capabilities: [a, b, c]` on a single line
+
+v1 covers `metadata`, `agent`, `capabilities`, and `with` blocks. Other top-level constructs (policies, schedules, channels, memories, webhooks, free-standing functions) round-trip via trimmed verbatim source while later releases extend coverage.
 
 ---
 

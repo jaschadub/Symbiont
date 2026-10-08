@@ -1,4 +1,5 @@
 //! CommunicationPolicyGate Example
+//! Docs: https://docs.symbiont.dev/api-reference
 //!
 //! Demonstrates how to configure and evaluate inter-agent communication policies.
 //! The policy gate controls which agents can communicate, using priority-based
@@ -37,6 +38,8 @@ fn main() {
         recipient: coordinator,
         message_type: MessageType::Request(RequestId::new()),
         topic: None,
+        session_id: None,
+        protocol_label: None,
     };
     match permissive.evaluate(&request) {
         Ok(()) => println!("  worker_a → coordinator: ALLOWED (no rules, default allow)"),
@@ -62,6 +65,8 @@ fn main() {
         recipient: coordinator,
         message_type: MessageType::Request(RequestId::new()),
         topic: None,
+        session_id: None,
+        protocol_label: None,
     };
     match gate.evaluate(&blocked) {
         Ok(()) => println!("  untrusted → coordinator: ALLOWED"),
@@ -74,6 +79,8 @@ fn main() {
         recipient: coordinator,
         message_type: MessageType::Request(RequestId::new()),
         topic: None,
+        session_id: None,
+        protocol_label: None,
     };
     match gate.evaluate(&allowed) {
         Ok(()) => println!("  worker_a → coordinator: ALLOWED (no matching rule, default allow)"),
@@ -119,6 +126,8 @@ fn main() {
         recipient: worker_b,
         message_type: MessageType::Request(RequestId::new()),
         topic: None,
+        session_id: None,
+        protocol_label: None,
     };
     match gate.evaluate(&lateral) {
         Ok(()) => println!("  worker_a → worker_b: ALLOWED"),
@@ -131,6 +140,8 @@ fn main() {
         recipient: coordinator,
         message_type: MessageType::Request(RequestId::new()),
         topic: None,
+        session_id: None,
+        protocol_label: None,
     };
     match gate.evaluate(&to_coord) {
         Ok(()) => println!("  worker_a → coordinator: ALLOWED"),
@@ -143,6 +154,8 @@ fn main() {
         recipient: worker_a,
         message_type: MessageType::Request(RequestId::new()),
         topic: None,
+        session_id: None,
+        protocol_label: None,
     };
     match gate.evaluate(&from_coord) {
         Ok(()) => println!("  coordinator → worker_a: ALLOWED"),
@@ -168,6 +181,8 @@ fn main() {
         recipient: worker_a,
         message_type: MessageType::Request(RequestId::new()),
         topic: None,
+        session_id: None,
+        protocol_label: None,
     };
     match gate.evaluate(&coord_sends) {
         Ok(()) => println!("  coordinator → worker_a: ALLOWED (whitelisted sender)"),
@@ -179,6 +194,8 @@ fn main() {
         recipient: coordinator,
         message_type: MessageType::Request(RequestId::new()),
         topic: None,
+        session_id: None,
+        protocol_label: None,
     };
     match gate.evaluate(&worker_sends) {
         Ok(()) => println!("  worker_a → coordinator: ALLOWED"),

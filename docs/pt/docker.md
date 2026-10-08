@@ -13,26 +13,48 @@
 
 ## Início Rápido
 
-### Usando Imagem Pré-construída
+### Criar e executar um projeto (recomendado)
+
+`symbi init` funciona dentro do container e escreve um projeto no diretório do host, incluindo um `docker-compose.yml` pronto para execução e um `.env` com `SYMBIONT_MASTER_KEY` recém-gerada:
+
+```bash
+# 1. Criar os arquivos do projeto no host
+docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest \
+  init --profile assistant --no-interact --dir /workspace
+
+# 2. Iniciar o runtime (lê o .env automaticamente)
+docker compose up
+```
+
+A flag `--dir /workspace` diz ao `symbi init` para escrever no volume montado em vez do WORKDIR da imagem. Após isso, você terá `symbiont.toml`, `agents/`, `policies/`, `.symbiont/audit/`, `AGENTS.md`, `docker-compose.yml`, `.env` e `.env.example` no diretório atual.
+
+Para pular a geração do arquivo compose:
+
+```bash
+docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest \
+  init --profile minimal --no-interact --no-docker-compose --dir /workspace
+```
+
+### Usando Imagem Pré-construída (ad-hoc)
 
 ```bash
 # Baixar imagem mais recente
 docker pull ghcr.io/thirdkeyai/symbi:latest
 
-# Fazer parsing de um arquivo DSL
+# Fazer parsing de uma definição de agente (`.symbi`; a extensão legada `.dsl` também é aceita)
 docker run --rm -v $(pwd):/workspace \
   ghcr.io/thirdkeyai/symbi:latest \
-  dsl --file /workspace/agent.dsl
+  dsl --file /workspace/agent.symbi
 
 # Executar servidor MCP (baseado em stdio, sem necessidade de porta)
 docker run --rm -i \
   ghcr.io/thirdkeyai/symbi:latest \
   mcp
 
-# Executar com API HTTP
-docker run --rm -p 8080:8080 \
+# Executar o runtime sem um projeto (efêmero, sem master key)
+docker run --rm -p 8080:8080 -p 8081:8081 \
   ghcr.io/thirdkeyai/symbi:latest \
-  up --http-bind 0.0.0.0:8080
+  up --http-bind 0.0.0.0
 ```
 
 ### Fluxo de Desenvolvimento
@@ -46,7 +68,7 @@ docker run --rm -it -v $(pwd):/workspace \
 docker run --rm -it \
   -v $(pwd):/workspace \
   -p 8080:8080 \
-  -p 3000:3000 \
+  -p 8081:8081 \
   ghcr.io/thirdkeyai/symbi:latest bash
 ```
 
@@ -99,72 +121,89 @@ O Docker automaticamente baixa a arquitetura correta para sua plataforma.
 ### Variáveis de Ambiente
 
 **Container Symbi:**
+- `SYMBIONT_MASTER_KEY` - **Obrigatório para estado persistente.** Chave hex de 32 bytes usada para criptografar o armazenamento local. Gere com `openssl rand -hex 32`. `symbi init` escreve uma no `.env` automaticamente.
 - `RUST_LOG` - Definir nível de log (debug, info, warn, error)
 - `SYMBIONT_VECTOR_BACKEND` - Backend de vetores: `lancedb` (padrão) ou `qdrant`
 - `QDRANT_URL` - URL do banco de dados vetorial Qdrant (apenas se usar backend Qdrant opcional)
+- `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` - Credenciais LLM opcionais; qualquer uma delas habilita o endpoint Coordinator Chat.
 
 ### Montagem de Volumes
 
+A imagem executa como usuário `symbi` (UID 1000) com `WORKDIR=/var/lib/symbi`. Os arquivos do projeto são montados somente-leitura nesse diretório; o estado persistente (o armazenamento SQLite local e os logs de auditoria) fica em volumes nomeados para sobreviver a reinícios do container.
+
 ```bash
-# Montar definições de agentes
--v $(pwd)/agents:/var/lib/symbi/agents
+# Arquivos do projeto (somente-leitura)
+-v $(pwd)/symbiont.toml:/var/lib/symbi/symbiont.toml:ro
+-v $(pwd)/agents:/var/lib/symbi/agents:ro
+-v $(pwd)/policies:/var/lib/symbi/policies:ro
+-v $(pwd)/tools:/var/lib/symbi/tools:ro
 
-# Montar configuração
--v $(pwd)/config:/etc/symbi
-
-# Montar diretório de dados
--v symbi-data:/var/lib/symbi/data
+# Estado persistente
+-v symbi-data:/var/lib/symbi/.symbi
+-v symbi-audit:/var/lib/symbi/.symbiont
 ```
 
 ## Exemplo com Docker Compose
 
+`symbi init` gera um `docker-compose.yml` pronto para execução que corresponde ao restante desta seção — prefira isso a escrever um compose à mão. Para referência, ou ao começar sem `init`:
+
 Por padrão, o Symbiont usa **LanceDB** como banco de dados vetorial embarcado -- sem necessidade de serviços externos. Se você precisar de um backend vetorial distribuído para implantações em escala, pode opcionalmente adicionar o Qdrant.
+
+> **Padrões de segurança (após auditoria v1.13.0).** O `docker-compose.test.yml` empacotado agora exige que `SYMBIONT_API_TOKEN` esteja definido no ambiente (sem default — `testtoken123` foi removido) e faz bind das portas publicadas em `127.0.0.1` em vez de `0.0.0.0`. O runtime adicionalmente rejeita qualquer token que seja exatamente `testtoken123` ou que comece com `test` e tenha menos de 20 caracteres; isso previne redeploy acidental do default histórico. Veja `.env.example` para as variáveis exigidas e `SECURITY_AUDIT.md` C5 para o racional.
 
 ### Mínimo (LanceDB padrão -- sem necessidade de Qdrant)
 
-```yaml
-version: '3.8'
+Combine isso com um arquivo `.env` que defina `SYMBIONT_MASTER_KEY`:
 
+```yaml
 services:
   symbi:
     image: ghcr.io/thirdkeyai/symbi:latest
+    command: ["up", "--http-bind", "0.0.0.0"]
     ports:
       - "8080:8080"
-      - "3000:3000"
+      - "8081:8081"
     volumes:
-      - ./agents:/var/lib/symbi/agents
-      - ./config:/etc/symbi
-      - symbi-data:/var/lib/symbi/data
+      - ./symbiont.toml:/var/lib/symbi/symbiont.toml:ro
+      - ./agents:/var/lib/symbi/agents:ro
+      - ./policies:/var/lib/symbi/policies:ro
+      - ./tools:/var/lib/symbi/tools:ro
+      - symbi-data:/var/lib/symbi/.symbi
+      - symbi-audit:/var/lib/symbi/.symbiont
     environment:
-      - RUST_LOG=info
-    command: ["up", "--http-bind", "0.0.0.0:8080"]
+      SYMBIONT_MASTER_KEY: ${SYMBIONT_MASTER_KEY:?set SYMBIONT_MASTER_KEY in .env}
+      RUST_LOG: ${RUST_LOG:-info}
+    restart: unless-stopped
 
 volumes:
   symbi-data:
+  symbi-audit:
 ```
 
 ### Com Backend Qdrant Opcional
 
 ```yaml
-version: '3.8'
-
 services:
   symbi:
     image: ghcr.io/thirdkeyai/symbi:latest
+    command: ["up", "--http-bind", "0.0.0.0"]
     ports:
       - "8080:8080"
-      - "3000:3000"
+      - "8081:8081"
     volumes:
-      - ./agents:/var/lib/symbi/agents
-      - ./config:/etc/symbi
-      - symbi-data:/var/lib/symbi/data
+      - ./symbiont.toml:/var/lib/symbi/symbiont.toml:ro
+      - ./agents:/var/lib/symbi/agents:ro
+      - ./policies:/var/lib/symbi/policies:ro
+      - symbi-data:/var/lib/symbi/.symbi
+      - symbi-audit:/var/lib/symbi/.symbiont
     environment:
-      - RUST_LOG=info
-      - SYMBIONT_VECTOR_BACKEND=qdrant
-      - QDRANT_URL=http://qdrant:6334
+      SYMBIONT_MASTER_KEY: ${SYMBIONT_MASTER_KEY:?set SYMBIONT_MASTER_KEY in .env}
+      RUST_LOG: ${RUST_LOG:-info}
+      SYMBIONT_VECTOR_BACKEND: qdrant
+      QDRANT_URL: http://qdrant:6334
     depends_on:
       - qdrant
-    command: ["up", "--http-bind", "0.0.0.0:8080"]
+    restart: unless-stopped
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -176,6 +215,7 @@ services:
 
 volumes:
   symbi-data:
+  symbi-audit:
   qdrant-data:
 ```
 
@@ -204,7 +244,7 @@ docker run -p 8081:8080 ghcr.io/thirdkeyai/symbi:latest
 docker builder prune -a
 
 # Reconstruir sem cache
-docker build --no-cache -f runtime/Dockerfile .
+docker build --no-cache .
 ```
 
 ### Verificações de Saúde

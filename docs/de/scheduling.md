@@ -7,6 +7,19 @@
 
 ## Ueberblick
 
+Der [Leitfaden zur kontrollierten Ausfuehrung](/scheduled-execution) beschreibt
+das Laufzeitverhalten dieses Branches: Die Registrierung speichert die
+Konfiguration, ohne einen Agenten auszufuehren; API-, manuelle und
+Timer-Aufrufe erhalten eigene Lauf-IDs und echte Endergebnisse. Die Historie
+erreicht `succeeded` nach Ausfuehrung und Bereinigung und enthaelt Ausgabe,
+Fehler und geschuetzte Audit-Referenzen. Managed-CLI-Scheduling, geroutete
+Modelle und der Transport fuer externe Agenten bleiben im Standarddienst nicht
+verfuegbar. Die ausgewaehlte Befehlsgrenze kann [Firecracker](/firecracker-setup)
+fuer Oneshot-Tools, Parser, MCP-stdio und PTY-Sitzungen nutzen, sofern passende
+Guest-Artefakte bereitgestellt sind. Siehe den
+[Branch-Leitfaden](/containment-branch-guide) fuer betreibersichtbare
+Unterschiede und die verbleibende Abdeckung.
+
 Das Scheduling-System von Symbiont bietet produktionsreife Cron-basierte Aufgabenausfuehrung fuer KI-Agenten. Das System unterstuetzt:
 
 - **Cron-Zeitplaene**: Traditionelle Cron-Syntax fuer wiederkehrende Aufgaben
@@ -853,38 +866,13 @@ enable_metrics = true
 default_max_retries = 3
 shutdown_timeout_seconds = 60
 
-[scheduler.delivery]
-# Webhook-Einstellungen
-webhook_timeout_seconds = 30
-webhook_retry_attempts = 3
-
-# Slack-Einstellungen
-slack_api_token = "${SLACK_API_TOKEN}"
-slack_default_channel = "#ops"
-
-# E-Mail-Einstellungen
-smtp_host = "smtp.example.com"
-smtp_port = 587
-smtp_username = "${SMTP_USER}"
-smtp_password = "${SMTP_PASS}"
-email_from = "symbiont@example.com"
 ```
 
-### Umgebungsvariablen
+### Zustellungskanaele
 
-```bash
-# Scheduler-Einstellungen
-SYMBI_SCHEDULER_MAX_JITTER=30
-SYMBI_SCHEDULER_MAX_CONCURRENT=20
+Zustellungskanaele (`stdout`, `log_file`, `webhook`, `slack`, `email`, ...) werden **pro Schedule** im `delivery`-Block des jeweiligen Schedules konfiguriert (siehe die Beispiele oben), nicht ueber einen globalen `[scheduler.delivery]`-Konfigurationsabschnitt.
 
-# Zustellungseinstellungen
-SYMBI_SLACK_TOKEN=xoxb-...
-SYMBI_WEBHOOK_AUTH_HEADER="Bearer secret-token"
-
-# AgentPin-Verifizierung
-SYMBI_AGENTPIN_REQUIRED=true
-SYMBI_AGENTPIN_DOMAIN=agent.example.com
-```
+> **`log_file`-Zustellung erfordert `SYMBIONT_LOG_DIR`.** Der Zielpfad ist auf dieses zugelassene Verzeichnis beschraenkt -- Pfade, die es ueber `..`, absolute Pfade oder Symlinks verlassen, werden abgelehnt, und die log_file-Zustellung ist fail-closed (deaktiviert), wenn `SYMBIONT_LOG_DIR` nicht gesetzt ist.
 
 ## Beobachtbarkeit
 
@@ -925,11 +913,13 @@ pub enum SecurityEventType {
 }
 ```
 
-Audit-Protokoll abfragen:
+Audit-Protokoll aus der interaktiven Shell abfragen:
 
-```bash
-symbi audit query --type CronJobFailed --since "2026-02-01" --limit 50
+```text
+/audit CronJobFailed
 ```
+
+Oder programmatisch ueber die Runtime-HTTP-API — siehe [API-Referenz](/api-reference) fuer die `/api/v1/audit`-Endpunkte.
 
 ## Best Practices
 

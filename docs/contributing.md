@@ -28,7 +28,7 @@ Symbiont welcomes contributions from the community! Whether you're fixing bugs, 
 
 Before contributing, ensure you have:
 
-- **Rust 1.82+** with cargo
+- **Rust 1.89+** with cargo
 - **Git** for version control
 - **Docker** for testing and development
 - **Basic knowledge** of Rust, security principles, and AI systems
@@ -51,10 +51,6 @@ git remote add upstream https://github.com/thirdkeyai/symbiont.git
 rustup update
 rustup component add rustfmt clippy
 
-# Install pre-commit hooks
-cargo install pre-commit
-pre-commit install
-
 # Build the project
 cargo build
 ```
@@ -65,21 +61,24 @@ cargo build
 cargo test --workspace
 
 # Run specific test suites
-cargo test --package symbiont-dsl
-cargo test --package symbiont-runtime
+cargo test --package symbi-dsl
+cargo test --package symbi-runtime
 
 # Run with coverage
 cargo tarpaulin --out html
 ```
 
-4. **Start Development Services**
+4. **Format and lint before committing**
 ```bash
-# Start required services with Docker Compose
-docker-compose up -d redis postgres
-
-# Verify services are running
-cargo run --example basic_agent
+cargo fmt
+cargo clippy --workspace -- -D warnings
+# Or run the full pre-release sweep (fmt, clippy, test, machete, audit, deny):
+just check
 ```
+
+> No external services are required for development. Symbi uses embedded LanceDB
+> (vector search) and SQLite by default — there is no mandatory Redis/PostgreSQL.
+> Verify your setup with `cargo run --example basic_agent`.
 
 ---
 
@@ -110,24 +109,24 @@ cargo run --example basic_agent
 
 ```
 symbiont/
-├── dsl/                    # DSL parser and grammar
-│   ├── src/
-│   ├── tests/
-│   └── tree-sitter-symbiont/
-├── runtime/                # Core runtime system
-│   ├── src/
-│   │   ├── api/           # HTTP API (optional)
-│   │   ├── context/       # Context management
-│   │   ├── integrations/  # External integrations
-│   │   ├── rag/           # RAG engine
-│   │   ├── scheduler/     # Task scheduling
-│   │   └── types/         # Core type definitions
-│   ├── examples/          # Usage examples
-│   ├── tests/             # Integration tests
-│   └── docs/              # Technical documentation
-├── enterprise/             # Enterprise features
-│   └── src/
-└── docs/                  # Community documentation
+├── src/                    # `symbi` CLI binary (init, new, run, up, dsl, shell, mcp)
+├── crates/
+│   ├── dsl/                # `symbi-dsl` — tree-sitter grammar and parser
+│   ├── runtime/            # `symbi-runtime` — runtime, policy engine, HTTP APIs, LLM clients
+│   │   ├── src/
+│   │   │   ├── context/    # Context management
+│   │   │   ├── integrations/ # External integrations
+│   │   │   ├── rag/        # RAG engine
+│   │   │   └── ...
+│   │   ├── examples/       # Usage examples
+│   │   └── tests/          # Integration tests
+│   ├── symbi-shell/        # Interactive agent-fleet shell
+│   ├── repl-core/          # Shared REPL/orchestration primitives
+│   └── ...                 # symbi-session, channel-adapter, invis-strip, ...
+├── agents/                 # Example `.symbi` agents
+├── policies/               # Cedar policies
+├── tools/fuzz/             # Fuzz targets
+└── docs/                   # Community documentation
 ```
 
 ### Commit Guidelines
@@ -485,7 +484,7 @@ Suggested Fix: [if applicable]
 
 ### Code of Conduct
 
-We are committed to providing a welcoming and inclusive environment for all contributors. Please read and follow our [Code of Conduct](CODE_OF_CONDUCT.md).
+We are committed to providing a welcoming and inclusive environment for all contributors. Please read and follow our [Code of Conduct](https://github.com/thirdkeyai/symbiont/blob/main/CODE_OF_CONDUCT.md).
 
 **Key Principles:**
 - **Respect**: Treat all community members with respect
@@ -517,7 +516,7 @@ We are committed to providing a welcoming and inclusive environment for all cont
 
 We recognize and appreciate all forms of contribution:
 
-- **Code Contributors**: Listed in CONTRIBUTORS.md
+- **Code Contributors**: Recognized in the GitHub contributor graph and release notes
 - **Documentation Contributors**: Credited in documentation
 - **Bug Reporters**: Mentioned in release notes
 - **Security Researchers**: Credited in security advisories

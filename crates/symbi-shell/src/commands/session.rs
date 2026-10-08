@@ -6,9 +6,9 @@ pub fn help(_app: &mut App) -> CommandResult {
     CommandResult::Output(
         r#"symbi shell commands:
 
-Session:    /help /clear /quit /model /cost /context
+Session:    /help /clear /quit /model /cost /tokens /context
             /snapshot /resume /branch /new /export /copy /compact
-Agents:     /spawn /agents /ask /send /pause /resume-agent
+Agents:     /spawn /agents /agent /ask /send /pause /resume-agent
             /stop /destroy /debug /memory
 Authoring:  /policy /tool /behavior /dsl /init
 Execute:    /run /chain /debate /parallel /race
@@ -16,7 +16,8 @@ Ops:        /status /monitor /logs /doctor /audit
 Cron:       /cron [add|pause|resume|run|history]
 Tools:      /tools [validate|test] /skills [verify] /verify
 Channels:   /channels /connect /disconnect
-Secrets:    /secrets [list|set|delete]"#
+Secrets:    /secrets [list|set|delete]
+Remote:     /attach /detach /gate (Ctrl+G)"#
             .to_string(),
     )
 }
@@ -53,6 +54,21 @@ pub fn model(app: &mut App, args: &str) -> CommandResult {
 
 pub fn cost(app: &App) -> CommandResult {
     CommandResult::Output(format!("Tokens used this session: {}", app.tokens_used))
+}
+
+/// `/tokens` (alias `/usage`): session token use + live context-window usage.
+pub fn tokens(app: &App) -> CommandResult {
+    let mut out = format!("Tokens used this session: {}", app.tokens_used);
+    if let Some(orch) = app.orchestrator.as_ref() {
+        if let Ok(o) = orch.try_lock() {
+            out.push_str(&format!(
+                "\nConversation: {} / {} tokens (auto-compaction budget, not the model's context limit)",
+                o.context_tokens(),
+                o.context_budget()
+            ));
+        }
+    }
+    CommandResult::Output(out)
 }
 
 pub fn context(app: &mut App) -> CommandResult {
@@ -105,9 +121,12 @@ pub fn compact(app: &mut App, _args: &str) -> CommandResult {
 }
 
 pub fn status(app: &App) -> CommandResult {
+    // Report the loaded-fleet count from the mirror so footer, sidebar, and
+    // /status all agree (the legacy `active_agents` field is always 0).
+    let loaded_agents = app.agent_cards.try_read().map(|c| c.len()).unwrap_or(0);
     CommandResult::Output(format!(
-        "Mode: {:?}\nActive agents: {}\nModel: {}\nTokens: {}",
-        app.mode, app.active_agents, app.model_name, app.tokens_used
+        "Mode: {:?}\nLoaded agents: {}\nModel: {}\nTokens: {}",
+        app.mode, loaded_agents, app.model_name, app.tokens_used
     ))
 }
 

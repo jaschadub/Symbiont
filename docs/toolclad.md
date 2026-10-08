@@ -114,14 +114,37 @@ description = "Maximum packets per second"
 | `enum` | Must match one of the `allowed` values |
 | `scope_target` | IP, CIDR, or hostname — validated against project scope |
 | `url` | Must contain "://", optional scheme whitelist |
-| `path` | No `..` traversal, symlinks canonicalized |
+| `path` | Relative path; rejects absolute/rooted paths and `..` components; preserves the validated spelling |
 | `ip_address` | Valid IPv4 or IPv6 |
 | `cidr` | Valid CIDR notation with prefix validation |
-| `credential_file` | File path that must exist on disk |
+| `credential_file` | Relative path that must name an existing regular file on the controller |
 | `duration` | Integer with suffix (s/m/h), converted to seconds |
+| `literal_text` | Explicit bounded UTF-8 content (32 KiB), preserving whitespace and metacharacters; rejects NUL. Use with a pre-tokenized argv contract. An interpreter such as `sh -c` deliberately treats it as code and requires the appropriate policy, sandbox and approval. |
 | `regex_match` | Custom regex from the `pattern` field |
+| `agent_summary` | Free text bound for a downstream agent's prompt — strips invisible Unicode and renderer-hidden markup, rejects known injection markers. Best-effort defense-in-depth, **not** a load-bearing control (see [Typed + grounded decisions](#typed-grounded-decisions)) |
 
-All types reject shell metacharacters: `;` `|` `&` `$` `` ` `` `(` `)` `{` `}` `[` `]` `<` `>` `!` `\n` `\r` `\0`
+`string` rejects shell metacharacters; the explicit `literal_text` type preserves them as data: `;` `|` `&` `$` `` ` `` `(` `)` `{` `}` `[` `]` `<` `>` `!` `\n` `\r` `\0`
+
+Path validation is lexical and portable across `/` and `\` separators. It does
+not canonicalize against the controller filesystem: a relative path remains
+relative to the selected worker's working directory. Ordinary dotted filenames
+such as `report..csv` remain valid. Absolute paths previously accepted by this
+embedded validator are now rejected, matching ToolClad's relative-path contract.
+For intentional absolute argv data, declare `literal_text` explicitly and apply
+the appropriate policy and sandbox restrictions.
+
+`credential_file` adds a controller-side regular-file preflight and preserves the
+relative argument. It follows filesystem links and does not prove that a file
+exists or is confined in the worker. Mounts, working directory and the selected
+sandbox define the worker's filesystem authority; path syntax alone does not
+prevent a tool from following symlinks within that authority.
+
+**Optional argument flags:**
+
+| Flag | Meaning |
+|------|---------|
+| `scope_check = true` | Validate the value against the project scope (IP/CIDR/hostname args) |
+| `feeds_decision = true` | This argument's value feeds a privileged downstream decision (routing, escalation, authorization). Free-text types (`string`, `literal_text`, `agent_summary`, `regex_match`) marked this way are flagged as an anti-pattern by ToolClad manifest validation — use an `enum` plus Cedar grounding instead (see [Typed + grounded decisions](#typed-grounded-decisions)) |
 
 **Custom types** can be defined in a project-level `toolclad.toml`:
 
@@ -219,7 +242,7 @@ scan_type = "mode"
 
 ### Session (interactive CLI)
 
-Spawns a tool in a pseudo-terminal and maintains conversation state across multiple commands. Requires the `toolclad-session` feature.
+Spawns a real pseudo-terminal inside the selected Docker/gVisor container and maintains state across commands in one governed run. Requires `toolclad-session`, enabled in the default CLI. See [terminal boundaries and SDK lifecycle](interactive-terminal-boundary.md) for image requirements, limits and cleanup.
 
 ```toml
 [tool]
@@ -234,17 +257,25 @@ idle_timeout_seconds = 300
 max_interactions = 50
 
 [session.commands.run]
-pattern = "use {module}; set RHOSTS {target}; run"
-description = "Run a Metasploit module"
-risk_tier = "high"
-human_approval = true
+pattern = "help"
+description = "Show command help"
+risk_tier = "low"
+human_approval = false
 ```
 
 Each declared command becomes a separate MCP tool definition (e.g., `msfconsole.run`).
 
 ### Browser (CDP)
 
-Headless or live Chrome DevTools Protocol for web interaction. Requires the `toolclad-browser` feature.
+> **Status: not yet executable.** Browser (`mode = "browser"`) tools are parsed,
+> argument-validated, and scope-checked, but Chrome DevTools Protocol execution
+> is not implemented yet. It is gated behind the `toolclad-browser` cargo feature,
+> whose real backend is still pending — until then a browser command returns an
+> honest error, never a fabricated result. Private transport fixtures can drive
+> contained Chromium, but they do not enable the public browser executor.
+
+The manifest describes the intended Chrome DevTools Protocol interface.
+Neither `connect = "launch"` nor live attachment starts a browser today.
 
 ```toml
 [tool]
@@ -261,11 +292,15 @@ allowed_domains = ["example.com", "*.test.example.com"]
 blocked_domains = ["admin.example.com"]
 allow_external = false
 
+[browser.network]
+allowed_methods = ["GET", "HEAD"]
+private_origins = []
+
 [browser.commands.navigate]
 description = "Navigate to URL"
 ```
 
-Built-in browser commands: `navigate`, `snapshot`, `click`, `type_text`, `submit_form`, `extract`, `screenshot`, `execute_js`, `wait_for`, `go_back`, `list_tabs`, `network_timing`.
+Planned browser commands: `navigate`, `snapshot`, `click`, `type_text`, `submit_form`, `extract`, `screenshot`, `execute_js`, `wait_for`, `go_back`, `list_tabs`, `network_timing`.
 
 ---
 
@@ -288,15 +323,64 @@ Arguments with `scope_check = true` are validated against this scope. IPs are ch
 
 ### URL scope (browser mode)
 
-Browser tools enforce domain-level scope via `[browser.scope]`. Navigation to disallowed domains is blocked.
+Navigation requires `[browser.scope]` and an HTTP(S) URL without embedded
+credentials. Domain comparisons use canonical hostnames, including case,
+internationalized names, encoded host characters and a final DNS dot. Blocked
+rules take precedence; `*.example.com` matches the base domain and its
+subdomains. Malformed rules fail closed, including when `allow_external = true`.
+At most 256 domain rules and an 8 KiB URL are accepted. Control characters,
+backslashes and ambiguous URL forms are rejected.
+
+Prepared navigation binds the normalized URL before policy, approval and audit.
+Its prepared context also includes the effective `[browser.network]` settings;
+the manifest digest binds these capabilities through authorization. GET and HEAD
+are the default methods. Other supported methods (POST, PUT, PATCH, DELETE and
+OPTIONS) require explicit inclusion; CONNECT and TRACE are refused.
+
+Domain scope does not grant access to private addresses. An operator can grant an
+exact literal origin, such as `private_origins = ["http://127.0.0.1:8080"]`, and
+also include its address in `allowed_domains`. The scheme, address and effective
+port must match. The exception accepts loopback, RFC1918 and IPv6 unique-local
+addresses, excluding the AWS IPv6 metadata endpoint. DNS names, link-local,
+multicast, unspecified and mapped IPv6 addresses cannot use it. A redirect to
+another port or origin needs its own grant. Blocked domain rules still win.
+
+The reusable `browser_network::BrowserNetworkPolicy` builds scoped requests from
+CDP interception events. It removes authority/framing and hop-by-hop headers,
+requires complete bounded request bodies, and refuses multipart/file uploads.
+Requests are limited to 2 MiB of application data, responses to 4 MiB, and headers
+to 128 entries / 64 KiB. The broker client uses DNS filtering, no ambient proxy,
+no redirect following and no automatic content decompression. Responses preserve
+duplicate cookies and binary header values for CDP fulfillment. Chromium receives
+redirect responses and each resulting request must be checked again.
+
+These request-construction helpers do not issue execution authority. A trusted
+driver must retain the worker, mediate every target and use the call-bound journal
+before sending each unchanged request. The public browser route stays unavailable
+while that production driver and browser lifetime ownership are integrated.
+The [contained Chromium transport fixtures](../crates/runtime/tests/fixtures/browser/README.md)
+include a real local HTTP case with pre-connection signed audit, an exact POST
+effect, denied method/subresource/redirect destinations and worker removal.
+This is component integration evidence, not a shipping browser-command E2E.
 
 ### SSRF protection (HTTP backend)
 
 HTTP backend requests automatically block:
 - Localhost (`127.0.0.1`, `::1`, `localhost`)
 - Cloud metadata (`169.254.169.254`, `metadata.google.internal`)
+- Shared address space (`100.64.0.0/10`), including `100.100.100.200`, in both URL checks and DNS answers
 - Private IP ranges (RFC 1918, link-local, broadcast)
 - Non-HTTP/HTTPS schemes
+
+HTTP exchange uses asynchronous I/O, a bounded request and response body, and the
+remaining call deadline. Automatic redirects and ambient proxies stay disabled.
+Preparation resolves the method and canonical destination before policy and
+approval, including path segments that the HTTP client would normalize. URL
+userinfo credentials are rejected; use explicit headers. URLs are limited to
+8 KiB without control characters.
+Governed calls record the built request before connecting and record the actual
+response or incomplete outcome through their existing protected journal. See
+[request audit records](run-audit.md). No new approval or UI control is required.
 
 ---
 
@@ -384,8 +468,29 @@ Symbiont ships with four example manifests in `tools/`:
 | `dig_lookup.clad.toml` | DNS record lookup | Oneshot (shell) |
 | `curl_fetch.clad.toml` | HTTP request with scope enforcement | Oneshot (shell) |
 | `nmap_scan.clad.toml` | Network port scanner with evidence capture | Oneshot (shell) |
+| `submit_triage.clad.toml` | Typed + grounded triage decision (reference) | Reference (typed decision) |
 
 These serve as reference implementations for writing your own manifests.
+
+---
+
+## Typed + grounded decisions
+
+When one agent's output drives a **privileged downstream decision** — routing, escalation, or tool authorization — that decision must not be made over the upstream agent's free text. A free-text "summary" spliced into a downstream prompt is an injection surface: a held-out red-team evaluation showed the `agent_summary` marker fence reduces orchestrator-injection escape only from ~28% to ~26% (it does not generalize to novel paraphrases), while moving the decision onto typed fields grounded in trusted context reaches 0%.
+
+The pattern that holds:
+
+1. **Type the decision.** The upstream agent emits an `enum`-constrained decision (e.g. `category`, `severity`), never a free-text instruction. Enum validation makes paraphrase injection structurally inert — there is no instruction channel.
+2. **Ground it in trusted context.** Derive the authoritative facts from trusted input (e.g. severity inferred from the ticket the system received, not from the agent's self-report), and make the decision a [Cedar policy](/security-model) over that trusted context. The lower-trust agent's output is advisory, not authoritative.
+3. **Keep `agent_summary` as defense-in-depth only.** It still strips invisible Unicode / hidden markup and logs injection-shaped attempts, but it is never the load-bearing control for a privileged decision.
+
+Mark any argument that feeds such a decision with `feeds_decision = true`. ToolClad manifest validation flags free-text decision inputs (`string`, `literal_text`, `agent_summary`, `regex_match`) as an anti-pattern, steering authors to an `enum` plus Cedar grounding.
+
+Reference implementation:
+
+- `tools/submit_triage.clad.toml` — typed `category`/`severity` enums (`feeds_decision = true`), advisory-only `rationale`
+- `examples/policies/triage_routing.cedar` — grounded escalation policy (`permit … when { context.ticket_severity == "critical" }`)
+- `crates/runtime/src/toolclad/decision.rs` — the Rust derives-facts / Cedar-decides reference (`route_grounded`, `decide_route`)
 
 ---
 
@@ -404,3 +509,22 @@ ToolClad tools are exposed to the [reasoning loop](/reasoning-loop) as MCP-compa
 9. **Observation** — the result is returned to the reasoning loop as an Observation
 
 The policy gate and argument validation happen before execution. A failed policy check or invalid argument blocks the tool call entirely.
+
+## Which surfaces execute tools
+
+Not every entry point runs ToolClad tools. Knowing which do is the difference between a policy that governs real execution and one that governs nothing:
+
+| Surface | Executes ToolClad/MCP tools | Notes |
+|---|---|---|
+| `symbi run <agent>` | Yes | Loads `tools/` at startup |
+| DSL reasoning builtins | Yes | Same loader, invoked from `.symbi` programs |
+| `symbi tools test` | Yes | Single manifest, for validating one tool |
+| HTTP input server | Yes, when `tools/` exists and holds at least one manifest | Otherwise starts with no executor and every tool call is refused |
+| `symbi up` chat coordinator | **No** | Has no ToolClad executor at all |
+| `symbi shell` (ORCH) | No | Ships its own fixed tool set — `read_file`, `search`, `edit_file`, `save_artifact` — which are not ToolClad manifests |
+
+The chat coordinator is deliberately monitoring-only: it answers questions about a running fleet and cannot act on it. A Cedar `permit` for `tool_call::<name>` has no effect there, because no tool call is ever proposed.
+
+This matters when writing policy. Policies sitting flat in `policies/*.cedar` are loaded by **every** surface's gate. A permit written for `symbi run` reaches the coordinator's gate too — harmless while the coordinator executes nothing, but it becomes a real grant the moment a surface gains an executor. Put surface-specific grants in `policies/<surface>/` instead, which only the named surface reads. The surface names are `run`, `coordinator`, `http-input`, `managed-cli`, `eval`, and `shell`.
+
+If you want the coordinator to execute tools later, scope it per tool rather than switching it on globally — otherwise every permit already written for another surface applies to chat on day one.

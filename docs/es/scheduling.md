@@ -3,6 +3,19 @@
 ## Otros idiomas
 
 
+La [guia de ejecucion gobernada](/scheduled-execution) describe el comportamiento
+del runtime en esta rama: el registro almacena la configuracion sin ejecutar un
+agente; las invocaciones por API, manuales y por temporizador reciben IDs de
+ejecucion distintos y resultados terminales reales. El historial alcanza
+`succeeded` despues de la ejecucion y la limpieza, e incluye la salida, los
+errores y las referencias de auditoria protegida. La programacion de CLI
+administrada, los modelos enrutados y el transporte de agentes externos siguen
+sin estar disponibles en el servicio predeterminado. El limite de comandos
+seleccionado puede usar [Firecracker](/firecracker-setup) para herramientas
+oneshot, parsers, MCP stdio y sesiones PTY cuando se aprovisionan los artefactos
+de invitado correspondientes. Consulte la [guia de la rama](/containment-branch-guide)
+para conocer las diferencias visibles para el operador y la cobertura pendiente.
+
 El sistema de programacion de Symbiont proporciona ejecucion de tareas basada en cron de nivel de produccion para agentes de IA. El sistema soporta:
 
 - **Programaciones cron**: Sintaxis cron tradicional para tareas recurrentes
@@ -849,38 +862,13 @@ enable_metrics = true
 default_max_retries = 3
 shutdown_timeout_seconds = 60
 
-[scheduler.delivery]
-# Configuracion de webhook
-webhook_timeout_seconds = 30
-webhook_retry_attempts = 3
-
-# Configuracion de Slack
-slack_api_token = "${SLACK_API_TOKEN}"
-slack_default_channel = "#ops"
-
-# Configuracion de correo electronico
-smtp_host = "smtp.example.com"
-smtp_port = 587
-smtp_username = "${SMTP_USER}"
-smtp_password = "${SMTP_PASS}"
-email_from = "symbiont@example.com"
 ```
 
-### Variables de Entorno
+### Canales de entrega
 
-```bash
-# Configuracion del programador
-SYMBI_SCHEDULER_MAX_JITTER=30
-SYMBI_SCHEDULER_MAX_CONCURRENT=20
+Los canales de entrega (`stdout`, `log_file`, `webhook`, `slack`, `email`, ...) se configuran **por programacion** en el bloque `delivery` de esa programacion (ver los ejemplos anteriores), no mediante una seccion de configuracion global `[scheduler.delivery]`.
 
-# Configuracion de entrega
-SYMBI_SLACK_TOKEN=xoxb-...
-SYMBI_WEBHOOK_AUTH_HEADER="Bearer secret-token"
-
-# Verificacion de AgentPin
-SYMBI_AGENTPIN_REQUIRED=true
-SYMBI_AGENTPIN_DOMAIN=agent.example.com
-```
+> **La entrega `log_file` requiere `SYMBIONT_LOG_DIR`.** La ruta de destino esta confinada a ese directorio en lista blanca — las rutas que escapan de el mediante `..`, rutas absolutas o symlinks son rechazadas, y la entrega de archivos de log es fail-closed (deshabilitada) cuando `SYMBIONT_LOG_DIR` no esta definido.
 
 ## Observabilidad
 
@@ -921,11 +909,13 @@ pub enum SecurityEventType {
 }
 ```
 
-Consultar el registro de auditoria:
+Consultar el registro de auditoria desde la shell interactiva:
 
-```bash
-symbi audit query --type CronJobFailed --since "2026-02-01" --limit 50
+```text
+/audit CronJobFailed
 ```
+
+O programaticamente a traves de la API HTTP del runtime — consulta [Referencia de la API](/api-reference) para los endpoints `/api/v1/audit`.
 
 ## Mejores Practicas
 

@@ -82,7 +82,7 @@ pub fn skills(_app: &mut App, args: &str) -> CommandResult {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().is_some_and(|e| e == "dsl") {
+                if dsl::is_symbi_file(&path) {
                     skill_list.push(path.file_name().unwrap().to_string_lossy().to_string());
                 }
             }
@@ -99,14 +99,4 @@ pub fn skills(_app: &mut App, args: &str) -> CommandResult {
     } else {
         CommandResult::Output(format!("[skills {} not yet connected]", args))
     }
-}
-
-pub fn verify(_app: &mut App, args: &str) -> CommandResult {
-    if args.is_empty() {
-        return CommandResult::Error("Usage: /verify @tool_name".to_string());
-    }
-    CommandResult::Output(format!(
-        "[SchemaPin verification not yet connected for: {}]",
-        args
-    ))
 }

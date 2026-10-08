@@ -13,6 +13,8 @@ pub enum LlmProvider {
     OpenRouter,
     OpenAI,
     Anthropic,
+    #[cfg(feature = "bedrock")]
+    Bedrock,
 }
 
 #[cfg(feature = "http-input")]
@@ -22,6 +24,8 @@ impl std::fmt::Display for LlmProvider {
             LlmProvider::OpenRouter => write!(f, "OpenRouter"),
             LlmProvider::OpenAI => write!(f, "OpenAI"),
             LlmProvider::Anthropic => write!(f, "Anthropic"),
+            #[cfg(feature = "bedrock")]
+            LlmProvider::Bedrock => write!(f, "Bedrock"),
         }
     }
 }
@@ -55,6 +59,12 @@ pub struct LlmClient {
     base_url: String,
     model: String,
     provider: LlmProvider,
+    #[cfg(feature = "bedrock")]
+    region: String,
+    // Populated by `from_env_or_secrets`; used by the SigV4 signing path in Task 4.
+    #[cfg(feature = "bedrock")]
+    #[allow(dead_code)]
+    credentials: Option<aws_credential_types::provider::SharedCredentialsProvider>,
 }
 
 #[cfg(feature = "http-input")]
@@ -68,29 +78,27 @@ impl LlmClient {
     ///
     /// Returns `None` if no API key is found.
     pub fn from_env() -> Option<Self> {
-        // LLM providers legitimately redirect (e.g. `/v1` → `/v1/`) and the
-        // LLM hostname comes from env, so we explicitly keep redirect
-        // following within reason — but force DNS through the SSRF-safe
-        // resolver so a malicious DNS response can't point us at an
-        // internal IP for the legitimate hostname.
-        let client = crate::net_guard::customise_ssrf_safe_client(
-            std::time::Duration::from_secs(120),
-            |b| b.redirect(reqwest::redirect::Policy::limited(2)),
-        )
-        .ok()?;
+        // LLM providers legitimately redirect (e.g. `/v1` → `/v1/`), so keep
+        // redirect following within reason. DNS is deliberately NOT routed
+        // through the SSRF-safe resolver here: that resolver refuses any
+        // hostname resolving to a non-public IP, which would make
+        // `OPENAI_BASE_URL=http://localhost:11434/v1` — a local model, the
+        // ordinary way to run without a cloud key — fail at connect time.
+        // See `net_guard::customise_operator_client`.
+        let client =
+            crate::net_guard::customise_operator_client(std::time::Duration::from_secs(120), |b| {
+                b.redirect(reqwest::redirect::Policy::limited(2))
+            })
+            .ok()?;
 
-        // Validate a base URL against the SSRF guard before the API key is
-        // ever sent to it. Rejects private IPs, loopback, cloud metadata,
-        // non-http(s) schemes, and obfuscated IPv4 literals.
+        /// Operator-supplied LLM endpoints are configuration, not untrusted
+        /// input — they sit at the same trust level as the API key beside
+        /// them. `reject_ssrf_url` is deliberately NOT applied here: it blocks
+        /// loopback, which is where every local model server listens, and an
+        /// operator who can set the base URL can already reach any host. The
+        /// guard stays on the paths where a destination IS attacker-influenced
+        /// (`toolclad::executor` HTTP backends, SchemaPin key discovery).
         fn validate_base_url(env_var: &str, url: &str) -> bool {
-            if let Err(reason) = crate::net_guard::reject_ssrf_url(url) {
-                tracing::error!(
-                    "Refusing LLM base URL from {}: {} — falling back or disabling provider",
-                    env_var,
-                    reason
-                );
-                return false;
-            }
             if url.starts_with("http://") {
                 tracing::warn!(
                     "LLM base URL from {} uses plaintext HTTP ({}); \
@@ -120,6 +128,10 @@ impl LlmClient {
                 base_url,
                 model,
                 provider: LlmProvider::OpenRouter,
+                #[cfg(feature = "bedrock")]
+                region: String::new(),
+                #[cfg(feature = "bedrock")]
+                credentials: None,
             });
         }
 
@@ -137,6 +149,10 @@ impl LlmClient {
                 base_url,
                 model,
                 provider: LlmProvider::OpenAI,
+                #[cfg(feature = "bedrock")]
+                region: String::new(),
+                #[cfg(feature = "bedrock")]
+                credentials: None,
             });
         }
 
@@ -155,10 +171,243 @@ impl LlmClient {
                 base_url,
                 model,
                 provider: LlmProvider::Anthropic,
+                #[cfg(feature = "bedrock")]
+                region: String::new(),
+                #[cfg(feature = "bedrock")]
+                credentials: None,
             });
         }
 
+        // Bedrock: no API key — uses AWS credential chain instead.
+        // `from_env` is sync so credentials are resolved lazily at call time
+        // (Task 4 builds the credential chain inside the async dispatch method).
+        #[cfg(feature = "bedrock")]
+        if let Ok(model) = std::env::var("BEDROCK_MODEL_ID") {
+            let region = std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                .ok();
+            if let Some(region) = region {
+                tracing::info!(
+                    "LLM client initialized: provider=Bedrock model={model} region={region}"
+                );
+                return Some(Self {
+                    client,
+                    api_key: String::new(),
+                    base_url: String::new(),
+                    model,
+                    provider: LlmProvider::Bedrock,
+                    region,
+                    // `DefaultCredentialsChain::builder().build()` is async;
+                    // stored as None here and resolved at call time in Task 4.
+                    credentials: None,
+                });
+            } else {
+                tracing::warn!(
+                    "BEDROCK_MODEL_ID set but no AWS_REGION/AWS_DEFAULT_REGION — skipping Bedrock"
+                );
+            }
+        }
+
         tracing::info!("No LLM API key found in environment, LLM invocation disabled");
+        None
+    }
+
+    /// Like `from_env`, but also accepts an optional `SecretStore` from which
+    /// API keys can be resolved when the corresponding `*_API_KEY_REF`
+    /// environment variable is set.
+    ///
+    /// Operators point at vault/openbao keys with these env vars:
+    /// * `OPENROUTER_API_KEY_REF` — secret-store key for the OpenRouter API key
+    /// * `OPENAI_API_KEY_REF` — secret-store key for the OpenAI API key
+    /// * `ANTHROPIC_API_KEY_REF` — secret-store key for the Anthropic API key
+    ///
+    /// When a `*_REF` env var is set and `store` is `Some`, the value is
+    /// fetched from the store. On store miss / failure, it falls back to the
+    /// regular `*_API_KEY` env var. When `*_REF` is unset, the regular env
+    /// var is used directly. The provider-detection order matches `from_env`:
+    /// OpenRouter → OpenAI → Anthropic.
+    ///
+    /// The `*_BASE_URL` and `*_MODEL` env vars are unchanged from `from_env`.
+    pub async fn from_env_or_secrets(
+        store: Option<std::sync::Arc<dyn crate::secrets::SecretStore + Send + Sync>>,
+    ) -> Option<Self> {
+        let client =
+            crate::net_guard::customise_operator_client(std::time::Duration::from_secs(120), |b| {
+                b.redirect(reqwest::redirect::Policy::limited(2))
+            })
+            .ok()?;
+
+        /// Operator-supplied LLM endpoints are configuration, not untrusted
+        /// input — they sit at the same trust level as the API key beside
+        /// them. `reject_ssrf_url` is deliberately NOT applied here: it blocks
+        /// loopback, which is where every local model server listens, and an
+        /// operator who can set the base URL can already reach any host. The
+        /// guard stays on the paths where a destination IS attacker-influenced
+        /// (`toolclad::executor` HTTP backends, SchemaPin key discovery).
+        fn validate_base_url(env_var: &str, url: &str) -> bool {
+            if url.starts_with("http://") {
+                tracing::warn!(
+                    "LLM base URL from {} uses plaintext HTTP ({}); \
+                     API keys will be sent in the clear. Configure HTTPS in production.",
+                    env_var,
+                    url
+                );
+            }
+            true
+        }
+
+        let store_ref: Option<&(dyn crate::secrets::SecretStore + Send + Sync)> = store.as_deref();
+
+        // OpenRouter
+        let openrouter_ref = std::env::var("OPENROUTER_API_KEY_REF").ok();
+        if let Some(api_key) = crate::secrets::resolve_secret_or_env(
+            "OPENROUTER_API_KEY",
+            openrouter_ref.as_deref(),
+            store_ref,
+        )
+        .await
+        {
+            let model = std::env::var("OPENROUTER_MODEL")
+                .unwrap_or_else(|_| "anthropic/claude-sonnet-4".to_string());
+            let base_url = std::env::var("OPENROUTER_BASE_URL")
+                .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string());
+            if !validate_base_url("OPENROUTER_BASE_URL", &base_url) {
+                return None;
+            }
+            tracing::info!(
+                "LLM client initialized: provider=OpenRouter model={} (key source: {})",
+                model,
+                if openrouter_ref.is_some() && store_ref.is_some() {
+                    "secret store (with env fallback)"
+                } else {
+                    "env"
+                }
+            );
+            return Some(Self {
+                client,
+                api_key,
+                base_url,
+                model,
+                provider: LlmProvider::OpenRouter,
+                #[cfg(feature = "bedrock")]
+                region: String::new(),
+                #[cfg(feature = "bedrock")]
+                credentials: None,
+            });
+        }
+
+        // OpenAI
+        let openai_ref = std::env::var("OPENAI_API_KEY_REF").ok();
+        if let Some(api_key) = crate::secrets::resolve_secret_or_env(
+            "OPENAI_API_KEY",
+            openai_ref.as_deref(),
+            store_ref,
+        )
+        .await
+        {
+            let model = std::env::var("CHAT_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
+            let base_url = std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+            if !validate_base_url("OPENAI_BASE_URL", &base_url) {
+                return None;
+            }
+            tracing::info!(
+                "LLM client initialized: provider=OpenAI model={} (key source: {})",
+                model,
+                if openai_ref.is_some() && store_ref.is_some() {
+                    "secret store (with env fallback)"
+                } else {
+                    "env"
+                }
+            );
+            return Some(Self {
+                client,
+                api_key,
+                base_url,
+                model,
+                provider: LlmProvider::OpenAI,
+                #[cfg(feature = "bedrock")]
+                region: String::new(),
+                #[cfg(feature = "bedrock")]
+                credentials: None,
+            });
+        }
+
+        // Anthropic
+        let anthropic_ref = std::env::var("ANTHROPIC_API_KEY_REF").ok();
+        if let Some(api_key) = crate::secrets::resolve_secret_or_env(
+            "ANTHROPIC_API_KEY",
+            anthropic_ref.as_deref(),
+            store_ref,
+        )
+        .await
+        {
+            let model = std::env::var("ANTHROPIC_MODEL")
+                .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+            let base_url = std::env::var("ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com/v1".to_string());
+            if !validate_base_url("ANTHROPIC_BASE_URL", &base_url) {
+                return None;
+            }
+            tracing::info!(
+                "LLM client initialized: provider=Anthropic model={} (key source: {})",
+                model,
+                if anthropic_ref.is_some() && store_ref.is_some() {
+                    "secret store (with env fallback)"
+                } else {
+                    "env"
+                }
+            );
+            return Some(Self {
+                client,
+                api_key,
+                base_url,
+                model,
+                provider: LlmProvider::Anthropic,
+                #[cfg(feature = "bedrock")]
+                region: String::new(),
+                #[cfg(feature = "bedrock")]
+                credentials: None,
+            });
+        }
+
+        // Bedrock: uses AWS credential chain, not a secret-store API key.
+        // `from_env_or_secrets` is async so we can build the credentials chain here.
+        #[cfg(feature = "bedrock")]
+        if let Ok(model) = std::env::var("BEDROCK_MODEL_ID") {
+            let region = std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                .ok();
+            if let Some(region) = region {
+                let provider =
+                    aws_config::default_provider::credentials::DefaultCredentialsChain::builder()
+                        .region(aws_config::Region::new(region.clone()))
+                        .build()
+                        .await;
+                let credentials =
+                    Some(aws_credential_types::provider::SharedCredentialsProvider::new(provider));
+                tracing::info!(
+                    "LLM client initialized: provider=Bedrock model={model} region={region}"
+                );
+                return Some(Self {
+                    client,
+                    api_key: String::new(),
+                    base_url: String::new(),
+                    model,
+                    provider: LlmProvider::Bedrock,
+                    region,
+                    credentials,
+                });
+            } else {
+                tracing::warn!(
+                    "BEDROCK_MODEL_ID set but no AWS_REGION/AWS_DEFAULT_REGION — skipping Bedrock"
+                );
+            }
+        }
+
+        tracing::info!(
+            "No LLM API key found in environment or secret store, LLM invocation disabled"
+        );
         None
     }
 
@@ -172,9 +421,55 @@ impl LlmClient {
         &self.provider
     }
 
+    /// Get the AWS region (only populated for the Bedrock provider).
+    // Used in `from_env_selects_bedrock_when_model_id_set` test and Task 4 signing.
+    #[cfg(feature = "bedrock")]
+    #[allow(dead_code)]
+    pub(crate) fn region(&self) -> &str {
+        &self.region
+    }
+
+    /// Get the configured API base URL.
+    ///
+    /// Crate-private and gated on `cloud-llm`: only the cloud inference
+    /// provider needs this to make HTTP requests directly without re-reading
+    /// the env var on every call. External callers should keep using the
+    /// public `chat_completion` methods, which never expose the URL.
+    #[cfg(feature = "cloud-llm")]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Get the configured API key.
+    ///
+    /// Crate-private and gated on `cloud-llm`: only the cloud inference
+    /// provider needs raw access to the key in order to construct
+    /// provider-specific HTTP headers. Public callers must go through
+    /// `chat_completion`, which never exposes the key. The value never
+    /// appears in `Debug` output.
+    #[cfg(feature = "cloud-llm")]
+    pub(crate) fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
     /// Send a chat completion request with system and user messages.
     pub async fn chat_completion(&self, system: &str, user: &str) -> Result<String, RuntimeError> {
         match self.provider {
+            #[cfg(feature = "bedrock")]
+            LlmProvider::Bedrock => {
+                let messages = vec![serde_json::json!({"role": "user", "content": user})];
+                let resp = self
+                    .bedrock_converse_with_tools(system, &messages, &[])
+                    .await?;
+                Ok(resp["content"]
+                    .as_array()
+                    .and_then(|b| {
+                        b.iter()
+                            .find_map(|x| x.get("text").and_then(|t| t.as_str()))
+                    })
+                    .unwrap_or("")
+                    .to_string())
+            }
             LlmProvider::Anthropic => self.anthropic_completion(system, user).await,
             _ => self.openai_completion(system, user).await,
         }
@@ -194,6 +489,11 @@ impl LlmClient {
         tools: &[serde_json::Value],
     ) -> Result<serde_json::Value, RuntimeError> {
         match self.provider {
+            #[cfg(feature = "bedrock")]
+            LlmProvider::Bedrock => {
+                self.bedrock_converse_with_tools(system, messages, tools)
+                    .await
+            }
             LlmProvider::Anthropic => {
                 self.anthropic_completion_with_tools(system, messages, tools)
                     .await
@@ -203,6 +503,60 @@ impl LlmClient {
                     .await
             }
         }
+    }
+
+    /// SigV4-signed Bedrock Converse call with explicit generation parameters.
+    ///
+    /// `from_env` is sync and stores `credentials: None`, so when the provider
+    /// was not pre-resolved we build the default AWS credentials chain on demand
+    /// here rather than erroring out.
+    #[cfg(feature = "bedrock")]
+    pub(crate) async fn bedrock_converse(
+        &self,
+        system: &str,
+        messages: &[serde_json::Value],
+        tools: &[serde_json::Value],
+        temperature: f32,
+        max_tokens: u32,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        use aws_credential_types::provider::SharedCredentialsProvider;
+
+        let creds: SharedCredentialsProvider = match &self.credentials {
+            Some(c) => c.clone(),
+            None => {
+                let chain =
+                    aws_config::default_provider::credentials::DefaultCredentialsChain::builder()
+                        .region(aws_config::Region::new(self.region.clone()))
+                        .build()
+                        .await;
+                SharedCredentialsProvider::new(chain)
+            }
+        };
+
+        let body = crate::http_input::bedrock::build_converse_request(
+            system,
+            messages,
+            tools,
+            temperature,
+            max_tokens,
+        );
+        crate::http_input::bedrock::converse(&self.client, &self.region, &self.model, &creds, &body)
+            .await
+    }
+
+    /// SigV4-signed Bedrock Converse call using default generation parameters.
+    ///
+    /// Delegates to [`bedrock_converse`] with the fixed defaults used by the
+    /// http_input / `chat_with_tools` path (temperature=0.3, max_tokens=4096).
+    #[cfg(feature = "bedrock")]
+    async fn bedrock_converse_with_tools(
+        &self,
+        system: &str,
+        messages: &[serde_json::Value],
+        tools: &[serde_json::Value],
+    ) -> Result<serde_json::Value, RuntimeError> {
+        self.bedrock_converse(system, messages, tools, 0.3, 4096)
+            .await
     }
 
     /// Convert Anthropic-format tool definitions to OpenAI function-calling format.
@@ -569,6 +923,86 @@ impl LlmClient {
 #[cfg(all(test, feature = "http-input"))]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The LLM base URL is operator configuration, not attacker-influenced input,
+    /// so a local model endpoint must be usable. Ollama/vLLM/LM Studio all listen
+    /// on loopback; rejecting it made free evaluation impossible.
+    #[serial]
+    #[test]
+    fn local_llm_endpoint_is_actually_reachable() {
+        // `from_env().is_some()` proves nothing here: `validate_base_url` now
+        // always returns true, so it would pass for "ftp://nope" just as
+        // readily. The property that matters is whether a request reaches a
+        // local server, so this drives a real one.
+        //
+        // Both spellings are covered on purpose. URL screening only ever saw
+        // IP literals, so an implementation that drops `reject_ssrf_url` but
+        // keeps the SSRF DNS resolver passes for "127.0.0.1" and fails for
+        // "localhost" — which is the spelling this repo's own docs recommend.
+        let _g = env_lock();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming().take(2) {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                hits_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = concat!(
+                    r#"{"id":"x","object":"chat.completion","created":0,"model":"m","#,
+                    r#""choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"#,
+                    r#""finish_reason":"stop"}],"#,
+                    r#""usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
+                );
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        for host in ["127.0.0.1", "localhost"] {
+            std::env::remove_var("OPENROUTER_API_KEY");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::set_var("OPENAI_API_KEY", "test-key");
+            std::env::set_var("OPENAI_BASE_URL", format!("http://{host}:{port}/v1"));
+
+            let client = LlmClient::from_env()
+                .unwrap_or_else(|| panic!("provider must be configured for {host}"));
+
+            let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+            let res = rt.block_on(client.chat_completion("you are a test", "hi"));
+            let after = hits.load(std::sync::atomic::Ordering::SeqCst);
+
+            assert!(
+                after > before,
+                "no request reached the local server via {host} \u{2014} the endpoint is \
+                 still blocked (result: {res:?})"
+            );
+        }
+
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_BASE_URL");
+    }
 
     #[test]
     fn test_provider_display() {
@@ -577,15 +1011,38 @@ mod tests {
         assert_eq!(format!("{}", LlmProvider::Anthropic), "Anthropic");
     }
 
+    #[serial]
     #[test]
     fn test_from_env_no_keys() {
         // Remove any existing keys for the test
         std::env::remove_var("OPENROUTER_API_KEY");
         std::env::remove_var("OPENAI_API_KEY");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        #[cfg(feature = "bedrock")]
+        std::env::remove_var("BEDROCK_MODEL_ID");
 
         let client = LlmClient::from_env();
         assert!(client.is_none());
+    }
+
+    #[cfg(feature = "bedrock")]
+    #[serial]
+    #[test]
+    fn from_env_selects_bedrock_when_model_id_set() {
+        std::env::set_var(
+            "BEDROCK_MODEL_ID",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        );
+        std::env::set_var("AWS_REGION", "us-east-1");
+        // Ensure higher-priority providers don't preempt:
+        for k in ["OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"] {
+            std::env::remove_var(k);
+        }
+        let client = LlmClient::from_env().expect("bedrock client");
+        assert!(matches!(client.provider(), LlmProvider::Bedrock));
+        assert_eq!(client.region(), "us-east-1");
+        std::env::remove_var("BEDROCK_MODEL_ID");
+        std::env::remove_var("AWS_REGION");
     }
 
     #[test]

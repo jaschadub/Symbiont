@@ -2,6 +2,8 @@
 
 ## 概要
 
+[管理された実行ガイド](/scheduled-execution)は、このブランチのランタイム動作を説明しています。登録は設定を保存するだけでエージェントを実行しません。API、手動、タイマーによる各実行には異なる実行 ID が割り当てられ、実際の終了結果が返されます。履歴は実行とクリーンアップの完了後に `succeeded` となり、出力、エラー、保護された監査の参照情報を含みます。管理 CLI のスケジューリング、ルーティングされたモデル、外部エージェントのトランスポートは、既定のサービスでは引き続き利用できません。選択されたコマンド境界は、対応するゲストアーティファクトが用意されていれば、ワンショットツール、パーサー、MCP stdio、PTY セッションに [Firecracker](/firecracker-setup) を使用できます。運用者から見える差分と現在のカバー範囲については[ブランチガイド](/containment-branch-guide)を参照してください。
+
 Symbiontのスケジューリングシステムは、AIエージェント向けの本番レベルのcronベースタスク実行機能を提供します。以下の機能をサポートしています：
 
 - **cronスケジュール**: 定期タスク用の標準的なcron構文
@@ -848,38 +850,13 @@ enable_metrics = true
 default_max_retries = 3
 shutdown_timeout_seconds = 60
 
-[scheduler.delivery]
-# Webhook設定
-webhook_timeout_seconds = 30
-webhook_retry_attempts = 3
-
-# Slack設定
-slack_api_token = "${SLACK_API_TOKEN}"
-slack_default_channel = "#ops"
-
-# メール設定
-smtp_host = "smtp.example.com"
-smtp_port = 587
-smtp_username = "${SMTP_USER}"
-smtp_password = "${SMTP_PASS}"
-email_from = "symbiont@example.com"
 ```
 
-### 環境変数
+### 配信チャネル
 
-```bash
-# スケジューラー設定
-SYMBI_SCHEDULER_MAX_JITTER=30
-SYMBI_SCHEDULER_MAX_CONCURRENT=20
+配信チャネル（`stdout`、`log_file`、`webhook`、`slack`、`email` など）は、グローバルな `[scheduler.delivery]` 設定セクションではなく、各スケジュールの `delivery` ブロック内で**スケジュールごとに**設定します（上記の例を参照）。
 
-# 配信設定
-SYMBI_SLACK_TOKEN=xoxb-...
-SYMBI_WEBHOOK_AUTH_HEADER="Bearer secret-token"
-
-# AgentPin検証
-SYMBI_AGENTPIN_REQUIRED=true
-SYMBI_AGENTPIN_DOMAIN=agent.example.com
-```
+> **`log_file` 配信には `SYMBIONT_LOG_DIR` が必要です。** 出力先パスはその許可ディレクトリ内に限定されます。`..` による相対脱出、絶対パス、シンボリックリンクで外部に出るパスは拒否され、`SYMBIONT_LOG_DIR` が未設定の場合、ログファイル配信はフェイルクローズ（無効化）されます。
 
 ## 可観測性
 
@@ -920,11 +897,13 @@ pub enum SecurityEventType {
 }
 ```
 
-監査ログのクエリ：
+インタラクティブシェルから監査ログをクエリ：
 
-```bash
-symbi audit query --type CronJobFailed --since "2026-02-01" --limit 50
+```text
+/audit CronJobFailed
 ```
+
+またはランタイム HTTP API 経由でプログラム的に — `/api/v1/audit` エンドポイントについては [API リファレンス](/api-reference) を参照してください。
 
 ## ベストプラクティス
 

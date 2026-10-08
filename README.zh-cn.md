@@ -6,11 +6,21 @@
 [![Crates.io](https://img.shields.io/crates/v/symbi)](https://crates.io/crates/symbi)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-online-brightgreen)](https://docs.symbiont.dev)
+[![YouTube](https://img.shields.io/badge/YouTube-%40ThirdKeyAI-FF0000?logo=youtube&logoColor=white)](https://www.youtube.com/@ThirdKeyAI)
+
+[![OATS Reference Implementation](https://img.shields.io/badge/OATS-Reference%20Implementation-1f6feb)](https://openagenttruststack.org)
+[![DOI Typestate Loops](https://zenodo.org/badge/DOI/10.5281/zenodo.19896446.svg)](https://doi.org/10.5281/zenodo.19896446)
+[![DOI ToolClad](https://zenodo.org/badge/DOI/10.5281/zenodo.19957596.svg)](https://doi.org/10.5281/zenodo.19957596)
+[![DOI Empirical Eval](https://zenodo.org/badge/DOI/10.5281/zenodo.20043247.svg)](https://doi.org/10.5281/zenodo.20043247)
 
 ---
 
 **面向生产环境的策略治理智能体运行时。**
 *同一个智能体。安全的运行时。*
+
+![A Cedar policy denies a live agent's privileged tool call](https://raw.githubusercontent.com/ThirdKeyAI/Symbiont/main/docs/media/cedar-demo.gif)
+
+> **你看到的是：** 一个真实模型（`claude-haiku-4.5`）请求列出智能体集群。一条 Cedar `forbid` 规则在**每次重试**时都拒绝该调用 —— 无需更改代码，只需策略。[用一条命令复现 ↓](#观看策略门拒绝工具调用--一条命令无需配置) · [▶ 完整演示](https://www.youtube.com/watch?v=RPyKpqKz5ik)
 
 Symbiont 是一个 Rust 原生运行时，用于在显式策略、身份和审计控制下执行 AI 智能体和工具。
 
@@ -28,31 +38,93 @@ AI 智能体易于演示，却难以信任。
 * **工具验证** 使执行不再是盲目信任 — [SchemaPin](https://github.com/ThirdKeyAI/SchemaPin) 对 MCP 工具的密码学验证
 * **工具契约** 规范工具的执行方式 — [ToolClad](https://github.com/ThirdKeyAI/ToolClad) 声明式参数校验、作用域强制和注入防护
 * **智能体身份** 使你了解谁在执行操作 — [AgentPin](https://github.com/ThirdKeyAI/AgentPin) 域锚定 ES256 身份
-* **沙箱隔离** 用于高风险工作负载 — 带资源限制的 Docker 隔离
+* **沙箱隔离** 用于高风险工作负载 — 可按智能体选择 Docker、gVisor (`runsc`) 或 Firecracker microVM
 * **审计追踪** 记录发生了什么以及原因 — 密码学防篡改日志
 * **审批门控** 用于敏感操作 — 策略要求时需经人工审批后方可执行
 
 Symbiont 正是为这一层而构建的。
 
+### Open Agent Trust Stack (OATS) — 参考实现
+
+Symbiont 是 **[Open Agent Trust Stack (OATS)](https://openagenttruststack.org) 的参考实现** —— 一份开放规范（CC BY 4.0），通过结构性强制而非事后拦截来保障 AI 智能体执行的安全（"定义允许的行为，使其余一切在结构上无法表达"）。OATS 规范根植于 Symbiont 的生产运维经验，Symbiont 的设计也直接对应 OATS 的各层：
+
+| OATS 层级 | Symbiont 映射 |
+|---|---|
+| **Layer 1 — ORGA Loop**（类型状态强制的 Observe-Reason-Gate-Act） | `crates/runtime/src/reasoning/` —— 类型状态强制的阶段；策略门在编译期不可跳过。参见 [Wanger 2026 / DOI 10.5281/zenodo.19896446](https://doi.org/10.5281/zenodo.19896446)。 |
+| **Layer 2 — Tool Contracts** | [ToolClad](https://github.com/ThirdKeyAI/ToolClad) 声明式 `.clad.toml` 清单 + `crates/runtime/src/toolclad/` 中的 `agent_summary` 类型状态屏障。参见 [Wanger 2026 / DOI 10.5281/zenodo.19957596](https://doi.org/10.5281/zenodo.19957596)。 |
+| **Layer 3 — Identity** | 面向 MCP 工具的 [SchemaPin](https://github.com/ThirdKeyAI/SchemaPin) + [AgentPin](https://github.com/ThirdKeyAI/AgentPin) ES256 域锚定智能体身份。 |
+| **Layer 4 — Policy Engine** | Cedar 策略门（`crates/runtime/src/reasoning/cedar_gate.rs`）+ 用于智能体间调用的 `CommunicationPolicyGate`；两者自 v1.14.0 起默认失败即关闭。 |
+| **Layer 5 — Audit Journal** | 推理循环中的哈希链接、Ed25519 签名的 `BufferedJournal`；`crates/runtime/src/logging.rs` 中加密的模型 I/O 日志。 |
+
+Symbiont 符合 **OATS Extended**（C1–C7 + E1–E8）。为该规范提供依据的结构性强制运行时实证比较见 [Wanger 2026 / DOI 10.5281/zenodo.20043247](https://doi.org/10.5281/zenodo.20043247)。
+
 ---
 
 ## 快速开始
+
+### 观看策略门拒绝工具调用 —— 一条命令，无需配置
+
+一条 Cedar `forbid` 阻止特权工具，而安全工具则放行。直接对已发布镜像复制粘贴运行（无需克隆、无需构建）：
+
+```bash
+docker run --rm --entrypoint sh ghcr.io/thirdkeyai/symbi:latest -c '
+mkdir -p /tmp/p && cat > /tmp/p/policy.cedar <<EOF
+forbid(principal, action == Symbi::Action::"tool_call::list_agents",   resource);
+permit(principal, action == Symbi::Action::"tool_call::system_health", resource);
+EOF
+echo "{\"tool_name\":\"list_agents\"}"   | symbi policy evaluate --stdin --policies /tmp/p --json
+echo "{\"tool_name\":\"system_health\"}" | symbi policy evaluate --stdin --policies /tmp/p --json'
+```
+
+```json
+{"decision":"deny","reason":"deny policies matched: policy_0","tool":"list_agents", ...}
+{"decision":"allow","reason":"allow policies matched: policy_1","tool":"system_health", ...}
+```
+
+这正是运行时接入实时推理循环的同一个 Cedar 策略门 —— 与上方演示中展示的拒绝完全一致。
+
+### 安装 CLI
+
+```bash
+# Linux / macOS — installs the `symbi` binary to /usr/local/bin
+curl -fsSL https://symbiont.dev/install.sh | bash
+symbi --help
+```
+
+安装程序会为你的平台获取预构建的发布二进制文件。可用 `bash -s -- --version v1.15.2` 固定版本，或用 `--dir` 更改目标路径。更喜欢 Docker 或[从源代码构建](#从源代码构建)？两者都在下方。
 
 ### 前提条件
 
 * Docker（推荐）或 Rust 1.82+
 
-### 使用 Docker 运行
+### 搭建并运行项目（Docker，约 60 秒）
 
 ```bash
-# 启动运行时（API 端口 :8080，HTTP 输入端口 :8081）
+# 1. Create the project in the current directory.
+#    Generates symbiont.toml, agents/, policies/, docker-compose.yml, and
+#    a .env with a freshly generated SYMBIONT_MASTER_KEY.
+docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest \
+  init --profile assistant --no-interact --dir /workspace
+
+# 2. Start the runtime. Reads .env automatically.
+docker compose up
+```
+
+就这样 —— 运行时 API 位于 `http://localhost:8080`，HTTP 输入位于 `http://localhost:8081`。
+使用 `symbi init --catalog list`（或对应的 Docker 命令）浏览预构建的智能体。
+
+### 其他 Docker 用法
+
+```bash
+# Ad-hoc runtime without a project (ephemeral, no master key)
 docker run --rm -p 8080:8080 -p 8081:8081 ghcr.io/thirdkeyai/symbi:latest up
 
-# 仅运行 MCP 服务器
+# MCP server only
 docker run --rm -p 8080:8080 ghcr.io/thirdkeyai/symbi:latest mcp
 
-# 解析智能体 DSL 文件
-docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest dsl parse /workspace/agent.dsl
+# Parse an agent definition (`.symbi`; legacy `.dsl` also accepted)
+docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest \
+  dsl -f /workspace/agent.symbi
 ```
 
 ### 从源代码构建
@@ -61,11 +133,9 @@ docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest dsl parse /
 cargo build --release
 ./target/release/symbi --help
 
-# 运行运行时
-cargo run -- up
-
-# 交互式 REPL
-cargo run -- repl
+# Scaffold a project locally, then start the runtime
+./target/release/symbi init --profile assistant --no-interact
+./target/release/symbi up
 ```
 
 > 对于生产部署，请在启用不可信工具执行之前查阅 `SECURITY.md` 和[部署指南](https://docs.symbiont.dev/getting-started)。
@@ -115,6 +185,8 @@ agent secure_analyst(input: DataSet) -> Result {
 
 参见 [DSL 指南](https://docs.symbiont.dev/dsl-guide)了解完整语法，包括 `metadata`、`schedule`、`webhook` 和 `channel` 块。
 
+> **文件扩展名：** Symbiont 智能体定义使用 `.symbi` 作为其规范扩展名（例如 `agents/assistant.symbi`）。出于向后兼容考虑，旧的 `.dsl` 扩展名将无限期继续被解析，但通过 `symbi init` 搭建的新项目以及本仓库中的所有示例均使用 `.symbi`。
+
 ---
 
 ## 核心能力
@@ -126,7 +198,7 @@ agent secure_analyst(input: DataSet) -> Result {
 | **工具契约** | [ToolClad](https://github.com/ThirdKeyAI/ToolClad) 声明式契约，提供参数校验、作用域强制和 Cedar 策略生成 |
 | **智能体身份** | [AgentPin](https://github.com/ThirdKeyAI/AgentPin) 面向智能体和计划任务的域锚定 ES256 身份 |
 | **推理循环** | 类型状态强制的 Observe-Reason-Gate-Act 循环，带策略门和熔断器 |
-| **沙箱隔离** | 基于 Docker 的隔离，带资源限制，用于不可信工作负载 |
+| **沙箱隔离** | Docker、gVisor (`runsc`) 或 Firecracker microVM —— 通过 DSL `with { sandbox = ... }` 块按智能体选择 |
 | **审计日志** | 防篡改日志，为每个策略决策提供结构化记录 |
 | **密钥管理** | Vault/OpenBao 集成，AES-256-GCM 加密存储，按智能体命名空间隔离 |
 | **MCP 集成** | 原生 Model Context Protocol 支持，带治理工具访问 |
@@ -146,7 +218,7 @@ Symbiont 围绕一个简单原则设计：**模型输出永远不应被信任为
 * **零信任** — 所有智能体输入默认不可信
 * **策略检查** — 每次工具调用和资源访问前进行 Cedar 授权
 * **工具验证** — SchemaPin 对工具 schema 的密码学验证
-* **沙箱边界** — 基于 Docker 的不可信执行隔离
+* **沙箱边界** — 按智能体选择隔离级别：Docker（默认）、gVisor（`runsc` 系统调用过滤器）或 Firecracker（microVM）
 * **操作员审批** — 敏感操作的人工审批门
 * **密钥控制** — Vault/OpenBao 后端、加密本地存储、智能体命名空间
 * **审计日志** — 每个决策的密码学防篡改记录
@@ -165,6 +237,7 @@ Symbiont 围绕一个简单原则设计：**模型输出永远不应被信任为
 | `symbi-channel-adapter` | Slack/Teams/Mattermost 适配器 |
 | `repl-core` / `repl-proto` / `repl-cli` | 交互式 REPL 和 JSON-RPC 服务器 |
 | `repl-lsp` | Language Server Protocol 支持 |
+| `symbi-shell` | 用于编写、编排和远程附加的交互式 TUI（Beta） |
 | `symbi-a2ui` | 管理仪表板（Lit/TypeScript，alpha 阶段） |
 
 治理插件：[`symbi-claude-code`](https://github.com/thirdkeyai/symbi-claude-code) | [`symbi-gemini-cli`](https://github.com/thirdkeyai/symbi-gemini-cli)
@@ -193,12 +266,14 @@ Symbiont 围绕一个简单原则设计：**模型输出永远不应被信任为
 | **JavaScript/TypeScript** | [symbiont-sdk-js](https://www.npmjs.com/package/symbiont-sdk-js) | [GitHub](https://github.com/ThirdKeyAI/symbiont-sdk-js) |
 | **Python** | [symbiont-sdk](https://pypi.org/project/symbiont-sdk/) | [GitHub](https://github.com/ThirdKeyAI/symbiont-sdk-python) |
 
+> **生产建议：** JS 和 Python SDK 是面向应用集成与原型开发的 HTTP 客户端。对于生产环境的智能体工作负载，我们建议直接基于 **Rust 实现** 构建，以充分利用 Symbiont 完整的类型状态驱动安全保证 —— 能力授权、策略执行和生命周期不变量都在编译期而非运行期得到强制。动态语言客户端只能在请求越过运行时边界之后才能验证这些属性。
+
 ---
 
 ## 许可证
 
 * **社区版**（Apache 2.0）：核心运行时、DSL、策略引擎、工具验证、沙箱隔离、智能体记忆、调度、MCP 集成、RAG、审计日志，以及所有 CLI/REPL 工具。
-* **企业版**（商业许可证）：高级沙箱后端、合规审计导出、AI 驱动的工具审查、加密多智能体协作、监控仪表板和专属支持。
+* **企业版**（商业许可证）：合规审计导出、AI 驱动的工具审查、加密多智能体协作、监控仪表板和专属支持。（三种沙箱后端 —— Docker、gVisor 和 Firecracker —— 均为 OSS。）
 
 联系 [ThirdKey](https://thirdkey.ai) 获取企业许可。
 

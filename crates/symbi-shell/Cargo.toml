@@ -1,6 +1,6 @@
 [package]
 name = "symbi-shell"
-version = "1.10.0"
+version = "1.21.1"
 edition = "2021"
 authors = ["Jascha Wanger / ThirdKey.ai"]
 description = "Interactive agent orchestration shell for the Symbi platform"
@@ -16,19 +16,19 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 crossterm = "0.28"
-ratatui = "0.29"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-dsl = { path = "../dsl", version = "1.10.0", package = "symbi-dsl" }
-tree-sitter = "0.20"
-repl-core = { path = "../repl-core", version = "1.10.0" }
+dsl = { path = "../dsl", version = "1.21.1", package = "symbi-dsl" }
+tree-sitter = "0.26"
+repl-core = { path = "../repl-core", version = "1.21.1" }
 uuid = { version = "1.0", features = ["v4", "serde"] }
-symbi-runtime = { path = "../runtime", version = "1.10.0", features = ["http-input", "cloud-llm"] }
+symbi-runtime = { path = "../runtime", version = "1.21.1", features = ["http-input", "cloud-llm"] }
 pulldown-cmark = "0.12"
-throbber-widgets-tui = "0.8"
+throbber-widgets-tui = "0.11"
 toml = "0.8"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -39,6 +39,10 @@ base64 = "0.22"
 dirs = "5"
 tempfile = "3"
 similar = "2"
+
+[features]
+# Experimental: multiparty session-type protocol monitor (off by default).
+session = ["repl-core/session"]
 
 [dev-dependencies]
 serial_test = "3"

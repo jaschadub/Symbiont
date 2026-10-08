@@ -2,6 +2,16 @@
 
 ## Overview
 
+The [governed execution guide](scheduled-execution.md) describes this branch's
+runtime behavior: registration stores configuration without executing an agent;
+API, manual and timer invocations get distinct run IDs and real terminal results.
+History reaches `succeeded` after execution and cleanup, and includes output,
+errors and protected audit references. Managed CLI scheduling, routed models,
+and external-agent transport remain unavailable on the default service. The
+selected command boundary can use [Firecracker](firecracker-setup.md) for oneshot
+tools, parsers, MCP stdio and PTY sessions when matching guest artifacts are provisioned. See the [branch guide](containment-branch-guide.md) for
+operator-visible differences and remaining coverage.
+
 Symbiont's scheduling system provides production-grade cron-based task execution for AI agents. The system supports:
 
 - **Cron schedules**: Traditional cron syntax for recurring tasks
@@ -848,38 +858,13 @@ enable_metrics = true
 default_max_retries = 3
 shutdown_timeout_seconds = 60
 
-[scheduler.delivery]
-# Webhook settings
-webhook_timeout_seconds = 30
-webhook_retry_attempts = 3
-
-# Slack settings
-slack_api_token = "${SLACK_API_TOKEN}"
-slack_default_channel = "#ops"
-
-# Email settings
-smtp_host = "smtp.example.com"
-smtp_port = 587
-smtp_username = "${SMTP_USER}"
-smtp_password = "${SMTP_PASS}"
-email_from = "symbiont@example.com"
 ```
 
-### Environment Variables
+### Delivery channels
 
-```bash
-# Scheduler settings
-SYMBI_SCHEDULER_MAX_JITTER=30
-SYMBI_SCHEDULER_MAX_CONCURRENT=20
+Delivery channels (`stdout`, `log_file`, `webhook`, `slack`, `email`, …) are configured **per schedule** in that schedule's `delivery` block (see the examples above), not via a global `[scheduler.delivery]` config section.
 
-# Delivery settings
-SYMBI_SLACK_TOKEN=xoxb-...
-SYMBI_WEBHOOK_AUTH_HEADER="Bearer secret-token"
-
-# AgentPin verification
-SYMBI_AGENTPIN_REQUIRED=true
-SYMBI_AGENTPIN_DOMAIN=agent.example.com
-```
+> **`log_file` delivery requires `SYMBIONT_LOG_DIR`.** The destination path is confined to that allowlisted directory — paths that escape it via `..`, absolute paths, or symlinks are rejected, and log-file delivery is fail-closed (disabled) when `SYMBIONT_LOG_DIR` is unset.
 
 ## Observability
 
@@ -920,11 +905,13 @@ pub enum SecurityEventType {
 }
 ```
 
-Query audit log:
+Query the audit log from the interactive shell:
 
-```bash
-symbi audit query --type CronJobFailed --since "2026-02-01" --limit 50
+```text
+/audit CronJobFailed
 ```
+
+Or programmatically via the runtime HTTP API — see [API Reference](/api-reference) for the `/api/v1/audit` endpoints.
 
 ## Best Practices
 

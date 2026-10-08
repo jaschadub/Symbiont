@@ -17,10 +17,16 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use symbi_runtime::http_input::llm_client::LlmClient;
+use symbi_runtime::integrations::mcp::project::ProjectReader;
 use symbi_runtime::integrations::schemapin::{
     native_client::{NativeSchemaPinClient, SchemaPinClient},
     types::VerifyArgs,
+};
+use symbi_runtime::reasoning::{
+    inference::InferenceProvider,
+    policy_bridge::ReasoningPolicyGate,
+    providers::cloud::CloudInferenceProvider,
+    response_run::{run_response, ResponseRequest},
 };
 
 // ---------------------------------------------------------------------------
@@ -29,17 +35,17 @@ use symbi_runtime::integrations::schemapin::{
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct InvokeAgentParams {
-    /// Agent name (matches .dsl filename without extension in agents/ directory)
+    /// Agent name (matches `.symbi` filename without extension in agents/ directory; `.dsl` also accepted)
     pub agent: String,
     /// The prompt or input to send to the agent
     pub prompt: String,
-    /// Optional custom system prompt to prepend to the agent's DSL context
+    /// Optional caller instructions; these cannot override runtime policy or source identity
     pub system_prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ParseDslParams {
-    /// Path to a .dsl file to parse
+    /// Path to a `.symbi` (or legacy `.dsl`) file to parse
     pub file: Option<String>,
     /// Inline DSL content to parse (used if file is not provided)
     pub content: Option<String>,
@@ -47,7 +53,7 @@ pub struct ParseDslParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetAgentDslParams {
-    /// Agent name (filename without .dsl extension)
+    /// Agent name (filename without `.symbi` / `.dsl` extension)
     pub agent: String,
 }
 
@@ -65,9 +71,14 @@ pub struct VerifySchemaParams {
 
 #[derive(Clone)]
 pub struct SymbiMcpServer {
-    llm_client: Option<Arc<LlmClient>>,
+    provider: Option<Arc<dyn InferenceProvider>>,
+    project: Result<Arc<ProjectReader>, String>,
+    response_gate: Arc<tokio::sync::OnceCell<Arc<dyn ReasoningPolicyGate>>>,
     agent_dsl_sources: Arc<Vec<(String, String)>>,
     schema_pin: Arc<NativeSchemaPinClient>,
+    // Used by `#[tool_handler]`-generated code via `self.tool_router.call(...)`.
+    // The dead-code pass cannot see the macro-expanded reference.
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
@@ -78,89 +89,101 @@ pub struct SymbiMcpServer {
 #[tool_router]
 impl SymbiMcpServer {
     pub fn new() -> Self {
-        let llm_client = LlmClient::from_env().map(Arc::new);
-        let agent_dsl_sources = Arc::new(scan_agent_dsl_files());
+        let provider = CloudInferenceProvider::from_env()
+            .map(|provider| Arc::new(provider) as Arc<dyn InferenceProvider>);
+        let project = std::env::current_dir()
+            .map_err(|error| error.to_string())
+            .and_then(|path| ProjectReader::open(&path))
+            .map(Arc::new);
+        let agent_dsl_sources = Arc::new(
+            project
+                .as_ref()
+                .map(|reader| scan_agent_dsl_files(reader))
+                .unwrap_or_default(),
+        );
         let schema_pin = Arc::new(NativeSchemaPinClient::new());
         Self {
-            llm_client,
+            provider,
+            project,
+            response_gate: Arc::new(tokio::sync::OnceCell::new()),
             agent_dsl_sources,
             schema_pin,
             tool_router: Self::tool_router(),
         }
     }
 
+    fn read_project_file(&self, path: &str, limit: usize) -> Result<String, String> {
+        self.project
+            .as_ref()
+            .map_err(Clone::clone)?
+            .read_text(std::path::Path::new(path), limit)
+    }
+
     #[tool(
-        description = "Invoke a Symbiont agent with a prompt. Sends the prompt to the named agent, which uses LLM-backed reasoning governed by its DSL definition."
+        description = "Request one policy-checked text response from a registered conversational agent. Requires protected audit storage; returns its audit reference. Tools and executable DSL statements are unavailable on this route."
     )]
     async fn invoke_agent(
         &self,
         Parameters(params): Parameters<InvokeAgentParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let llm = match &self.llm_client {
-            Some(c) => c.clone(),
-            None => {
-                return Ok(CallToolResult::success(vec![Content::text(
-                    "No LLM provider configured. Set one of: OPENROUTER_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY.",
-                )]));
+        let invoke = async {
+            let project = self.project.as_ref().map_err(Clone::clone)?;
+            let candidates: Vec<_> = self
+                .agent_dsl_sources
+                .iter()
+                .filter(|(filename, _)| {
+                    dsl::strip_symbi_extension(filename).unwrap_or(filename) == params.agent
+                })
+                .collect();
+            if candidates.len() != 1 {
+                return Err("agent name must identify one registered source file".to_string());
             }
-        };
-
-        // Find DSL sources matching the requested agent
-        let agent_sources: Vec<&(String, String)> = self
-            .agent_dsl_sources
-            .iter()
-            .filter(|(filename, _)| {
-                let stem = filename.strip_suffix(".dsl").unwrap_or(filename);
-                stem == params.agent
+            let (_, source) = candidates[0];
+            let settings = dsl::resolve_execution_settings(source, &params.agent)?;
+            let agent = dsl::ConversationalAgent::parse(source, &settings.agent_name)?;
+            let provider = self.provider.clone().ok_or("No LLM provider configured")?;
+            let gate = self
+                .response_gate
+                .get_or_init(|| async {
+                    symbi_runtime::reasoning::governed_gate(symbi_runtime::reasoning::GateOptions {
+                        policies_dir: project.path().join("policies"),
+                        surface: Some("mcp-server".into()),
+                        insecure_allow_all: false,
+                        escalation: None,
+                    })
+                    .await
+                })
+                .await
+                .clone();
+            let mut instructions = Vec::new();
+            if let Some(context) = load_agents_md_context(project) {
+                instructions.push(format!("Project guidance (caller input):\n{context}"));
+            }
+            if let Some(custom) = params.system_prompt {
+                instructions.push(custom);
+            }
+            let outcome = run_response(ResponseRequest {
+                project: project.path().to_owned(),
+                agent,
+                surface: "mcp-server".into(),
+                input: params.prompt,
+                caller_instructions: (!instructions.is_empty()).then(|| instructions.join("\n\n")),
+                provider,
+                gate,
+                cancellation: context.ct.child_token(),
             })
-            .collect();
-
-        // Build system prompt from DSL context
-        let mut system_parts: Vec<String> = Vec::new();
-
-        if !agent_sources.is_empty() {
-            system_parts.push(
-                "You are an AI agent operating within the Symbiont runtime. \
-                 Your behavior is governed by the following agent definitions:"
-                    .to_string(),
-            );
-            for (filename, content) in &agent_sources {
-                system_parts.push(format!("\n--- {} ---\n{}", filename, content));
-            }
-            system_parts.push(
-                "\nFollow the capabilities and policies defined above. \
-                 Provide thorough, professional analysis."
-                    .to_string(),
-            );
-        } else {
-            system_parts.push(
-                "You are an AI agent operating within the Symbiont runtime. \
-                 Provide thorough, professional analysis based on the input provided."
-                    .to_string(),
-            );
+            .await;
+            let mut result = match outcome.result {
+                Ok(response) => CallToolResult::success(vec![Content::text(response)]),
+                Err(error) => CallToolResult::error(vec![Content::text(error)]),
+            };
+            result.structured_content =
+                Some(serde_json::json!({"agent_id":outcome.agent_id,"audit":outcome.audit}));
+            Ok::<_, String>(result)
         }
-
-        // Inject auto-generated AGENTS.md context (safe: only parser-derived content)
-        if let Some(context) = load_agents_md_context() {
-            system_parts.push(format!(
-                "\n<project-context>\n{}\n</project-context>",
-                context
-            ));
-        }
-
-        if let Some(custom) = &params.system_prompt {
-            system_parts.push(format!("\n{}", custom));
-        }
-
-        let system_prompt = system_parts.join("\n");
-
-        match llm.chat_completion(&system_prompt, &params.prompt).await {
-            Ok(response) => Ok(CallToolResult::success(vec![Content::text(response)])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "LLM invocation failed: {}",
-                e
-            ))])),
-        }
+        .await;
+        Ok(invoke.unwrap_or_else(|error| CallToolResult::error(vec![Content::text(error)])))
     }
 
     #[tool(description = "List available Symbiont agents found in the agents/ directory.")]
@@ -169,7 +192,7 @@ impl SymbiMcpServer {
             .agent_dsl_sources
             .iter()
             .map(|(filename, content)| {
-                let name = filename.strip_suffix(".dsl").unwrap_or(filename);
+                let name = dsl::strip_symbi_extension(filename).unwrap_or(filename);
 
                 // Quick check for schedule/channel blocks
                 let has_schedules = content.contains("schedule ");
@@ -207,12 +230,12 @@ impl SymbiMcpServer {
                     "File path must be relative and cannot contain '..' components.",
                 )]));
             }
-            if path.extension().and_then(|e| e.to_str()) != Some("dsl") {
+            if !dsl::is_symbi_file(path) {
                 return Ok(CallToolResult::error(vec![Content::text(
-                    "Only .dsl files can be parsed.",
+                    "Only .symbi (or legacy .dsl) files can be parsed.",
                 )]));
             }
-            match tokio::fs::read_to_string(file).await {
+            match self.read_project_file(file, 1024 * 1024) {
                 Ok(content) => (content, file.clone()),
                 Err(e) => {
                     return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -222,6 +245,11 @@ impl SymbiMcpServer {
                 }
             }
         } else if let Some(ref content) = params.content {
+            if content.len() > 1024 * 1024 {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "DSL content exceeds 1 MiB",
+                )]));
+            }
             (content.clone(), "<inline>".to_string())
         } else {
             return Ok(CallToolResult::error(vec![Content::text(
@@ -311,7 +339,7 @@ impl SymbiMcpServer {
     ) -> Result<CallToolResult, McpError> {
         // First check pre-scanned sources
         for (filename, content) in self.agent_dsl_sources.iter() {
-            let stem = filename.strip_suffix(".dsl").unwrap_or(filename);
+            let stem = dsl::strip_symbi_extension(filename).unwrap_or(filename);
             if stem == params.agent {
                 return Ok(CallToolResult::success(vec![Content::text(
                     content.clone(),
@@ -329,22 +357,25 @@ impl SymbiMcpServer {
                 "Agent name must contain only alphanumeric characters, hyphens, and underscores.",
             )]));
         }
-        // Fall back to reading from disk (in case agents were added after startup)
-        let path = format!("agents/{}.dsl", params.agent);
-        match tokio::fs::read_to_string(&path).await {
-            Ok(content) => Ok(CallToolResult::success(vec![Content::text(content)])),
-            Err(_) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Agent '{}' not found. Use list_agents to see available agents.",
-                params.agent
-            ))])),
+        // Fall back to reading from disk (in case agents were added after startup).
+        // Try `.symbi` first (canonical), then `.dsl` (legacy).
+        for ext in [dsl::SYMBI_EXTENSION, dsl::LEGACY_DSL_EXTENSION] {
+            let path = format!("agents/{}.{}", params.agent, ext);
+            if let Ok(content) = self.read_project_file(&path, 1024 * 1024) {
+                return Ok(CallToolResult::success(vec![Content::text(content)]));
+            }
         }
+        Ok(CallToolResult::error(vec![Content::text(format!(
+            "Agent '{}' not found. Use list_agents to see available agents.",
+            params.agent
+        ))]))
     }
 
     #[tool(
         description = "Get the project's AGENTS.md file content. Returns the full AGENTS.md from the working directory, which describes available agents, their capabilities, schedules, channels, and invocation methods."
     )]
     async fn get_agents_md(&self) -> Result<CallToolResult, McpError> {
-        match tokio::fs::read_to_string("AGENTS.md").await {
+        match self.read_project_file("AGENTS.md", 64*1024) {
             Ok(content) => Ok(CallToolResult::success(vec![Content::text(content)])),
             Err(_) => Ok(CallToolResult::error(vec![Content::text(
                 "No AGENTS.md found in the working directory. Run 'symbi agents-md generate' to create one.",
@@ -359,6 +390,11 @@ impl SymbiMcpServer {
         &self,
         Parameters(params): Parameters<VerifySchemaParams>,
     ) -> Result<CallToolResult, McpError> {
+        if params.schema.len() > 1024 * 1024 || params.public_key_url.len() > 8192 {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Schema or key URL exceeds its byte limit",
+            )]));
+        }
         // Write schema content to a temp file for the native client
         let tmp = match tempfile::NamedTempFile::new() {
             Ok(t) => t,
@@ -413,18 +449,20 @@ impl SymbiMcpServer {
 #[tool_handler]
 impl ServerHandler for SymbiMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "Symbiont AI Agent Runtime — invoke agents, parse DSL, \
-                 manage agent definitions, verify schemas via SchemaPin"
-                    .to_string(),
-            ),
-            capabilities: ServerCapabilities::builder()
-                .enable_tools()
-                .enable_resources()
-                .build(),
-            ..Default::default()
-        }
+        // ServerInfo (alias for InitializeResult) became #[non_exhaustive]
+        // in rmcp 1.x; out-of-crate code can no longer use struct literal
+        // syntax even with `..Default::default()`. Build via mutation.
+        let mut info = ServerInfo::default();
+        info.instructions = Some(
+            "Symbiont AI Agent Runtime — invoke agents, parse DSL, \
+             manage agent definitions, verify schemas via SchemaPin"
+                .to_string(),
+        );
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .build();
+        info
     }
 
     fn list_resources(
@@ -432,7 +470,7 @@ impl ServerHandler for SymbiMcpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
-        let resources = if std::path::Path::new("AGENTS.md").exists() {
+        let resources = if self.read_project_file("AGENTS.md", 64 * 1024).is_ok() {
             vec![Resource {
                 raw: RawResource {
                     uri: "file:///AGENTS.md".to_string(),
@@ -461,10 +499,11 @@ impl ServerHandler for SymbiMcpServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         if request.uri == "file:///AGENTS.md" {
-            match tokio::fs::read_to_string("AGENTS.md").await {
-                Ok(content) => Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::text(content, "file:///AGENTS.md")],
-                }),
+            match self.read_project_file("AGENTS.md", 64 * 1024) {
+                Ok(content) => Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    content,
+                    "file:///AGENTS.md",
+                )])),
                 Err(_) => Err(McpError::new(
                     ErrorCode::INVALID_PARAMS,
                     "AGENTS.md not found",
@@ -485,47 +524,44 @@ impl ServerHandler for SymbiMcpServer {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Scan the agents/ directory for .dsl files and return (filename, content) pairs.
-fn scan_agent_dsl_files() -> Vec<(String, String)> {
-    let agents_dir = std::path::Path::new("agents");
+/// Scan the agents/ directory for `.symbi` (or legacy `.dsl`) files and
+/// return (filename, content) pairs.
+fn scan_agent_dsl_files(project: &ProjectReader) -> Vec<(String, String)> {
     let mut sources = Vec::new();
-
-    if !agents_dir.exists() || !agents_dir.is_dir() {
-        return sources;
-    }
-
-    if let Ok(entries) = std::fs::read_dir(agents_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "dsl") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    let filename = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    sources.push((filename, content));
+    let mut bytes = 0;
+    if let Ok(entries) = std::fs::read_dir(project.path().join("agents")) {
+        for entry in entries.take(1024).flatten() {
+            let path = std::path::Path::new("agents").join(entry.file_name());
+            if dsl::is_symbi_file(&path) {
+                if let Ok(content) = project.read_text(&path, 1024 * 1024) {
+                    bytes += content.len();
+                    if bytes > 16 * 1024 * 1024 {
+                        break;
+                    }
+                    sources.push((entry.file_name().to_string_lossy().into_owned(), content));
                 }
             }
         }
     }
-
     sources
 }
 
-/// Load the auto-generated section from AGENTS.md for safe context injection.
+/// Load bounded project guidance as caller input, never runtime authority.
 ///
 /// Only returns content between `<!-- agents-md:auto-start -->` and
 /// `<!-- agents-md:auto-end -->` markers — this is DSL-parser-derived content,
-/// not arbitrary user markdown, which eliminates prompt injection risk.
+/// but it remains untrusted project text and cannot grant runtime permissions.
 /// Truncates to 2000 chars to avoid blowing context windows.
-fn load_agents_md_context() -> Option<String> {
-    let content = std::fs::read_to_string("AGENTS.md").ok()?;
+fn load_agents_md_context(project: &ProjectReader) -> Option<String> {
+    let content = project
+        .read_text(std::path::Path::new("AGENTS.md"), 64 * 1024)
+        .ok()?;
     let section = crate::commands::agents_md::extract_auto_section(&content)?;
     if section.is_empty() {
         return None;
     }
     let truncated = if section.len() > 2000 {
-        format!("{}...", &section[..2000])
+        format!("{}...", section.chars().take(2000).collect::<String>())
     } else {
         section.to_string()
     };

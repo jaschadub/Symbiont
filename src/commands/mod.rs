@@ -1,10 +1,17 @@
 pub mod agents_md;
+mod approval;
+pub mod audit;
 pub mod chat;
 pub mod cron;
 pub mod doctor;
 pub mod dsl;
+pub mod fmt;
+pub mod improvement;
 pub mod init;
+pub mod invocation;
 pub mod logs;
+#[cfg(feature = "cli-executor")]
+pub mod managed_cli;
 pub mod new;
 pub mod policy;
 pub mod run;

@@ -4,7 +4,7 @@
 //! director-critic interaction, enabling tamper-evident review trails.
 
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -114,9 +114,10 @@ impl AuditChain {
         let chain_input = format!("{}{}", self.last_chain_hash, entry_data);
         let chain_hash = sha256_hex(chain_input.as_bytes());
 
-        // Sign the chain hash with Ed25519
-        let signature_bytes = self.signing_key.sign(chain_hash.as_bytes());
-        let signature = hex::encode(signature_bytes.to_bytes());
+        // Sign the chain hash with Ed25519 (via the swappable crypto provider)
+        let signature_bytes =
+            crate::crypto_provider::ed25519_sign(&self.signing_key, chain_hash.as_bytes());
+        let signature = hex::encode(signature_bytes);
 
         let entry = CriticAuditEntry {
             entry_id,
@@ -211,19 +212,48 @@ pub fn verify_chain(
                     message: "signature must be 64 bytes".into(),
                 })?;
 
-        let signature = Signature::from_bytes(&sig_array);
-
-        verifying_key
-            .verify(entry.chain_hash.as_bytes(), &signature)
-            .map_err(|e| AuditError::InvalidSignature {
-                entry_index: i,
-                message: e.to_string(),
-            })?;
+        crate::crypto_provider::ed25519_verify(
+            &verifying_key.to_bytes(),
+            entry.chain_hash.as_bytes(),
+            &sig_array,
+        )
+        .map_err(|e| AuditError::InvalidSignature {
+            entry_index: i,
+            message: e.to_string(),
+        })?;
 
         expected_prev_hash = entry.chain_hash.clone();
     }
 
     Ok(())
+}
+
+/// Verify a chain AND that it has not been tail-truncated, against an external
+/// anchor (the expected entry count + head chain-hash, published/checkpointed
+/// out-of-band). Closes the D-05 tail-truncation residual: a truncated prefix is
+/// itself a valid chain, so `verify_chain` alone accepts it — the anchor catches
+/// the dropped tail. `expected_len` / `expected_head` come from a trusted source
+/// (e.g. the runtime's persisted `latest_sequence` + last chain_hash).
+pub fn verify_chain_anchored(
+    entries: &[CriticAuditEntry],
+    verifying_key: &VerifyingKey,
+    expected_len: usize,
+    expected_head: &str,
+) -> Result<(), AuditError> {
+    verify_chain(entries, verifying_key)?;
+    if entries.len() != expected_len {
+        return Err(AuditError::Truncated {
+            expected: expected_len,
+            found: entries.len(),
+        });
+    }
+    match entries.last() {
+        Some(e) if e.chain_hash == expected_head => Ok(()),
+        _ => Err(AuditError::Truncated {
+            expected: expected_len,
+            found: entries.len(),
+        }),
+    }
 }
 
 /// Compute SHA-256 and return hex-encoded string.
@@ -247,6 +277,9 @@ pub enum AuditError {
 
     #[error("Invalid signature at entry {entry_index}: {message}")]
     InvalidSignature { entry_index: usize, message: String },
+
+    #[error("Chain truncated: expected {expected} entries, found {found}")]
+    Truncated { expected: usize, found: usize },
 }
 
 #[cfg(test)]
@@ -310,6 +343,46 @@ mod tests {
 
         assert_eq!(chain.len(), 5);
         assert!(chain.verify(&chain.verifying_key()).is_ok());
+    }
+
+    #[test]
+    fn test_verify_chain_anchored_accepts_full_and_rejects_truncation() {
+        // D-05: a tail-truncated prefix is itself a valid chain, so verify_chain
+        // alone accepts it. The external anchor (expected len + head hash) is what
+        // catches the dropped tail.
+        let key = test_signing_key();
+        let verifying_key = key.verifying_key();
+        let mut chain = AuditChain::new(key);
+        for i in 0..3 {
+            chain.record(RecordParams {
+                director_output: &format!("out {}", i),
+                critic_assessment: &format!("review {}", i),
+                verdict: AuditVerdict::Approved,
+                dimension_scores: HashMap::new(),
+                score: 0.9,
+                critic_identity: AuditIdentity::Llm {
+                    model_id: "test".into(),
+                },
+                iteration: i as u32 + 1,
+            });
+        }
+        let entries = chain.entries().to_vec();
+        let head = entries.last().unwrap().chain_hash.clone();
+
+        // Full chain against the true anchor verifies.
+        assert!(verify_chain_anchored(&entries, &verifying_key, 3, &head).is_ok());
+
+        // A truncated prefix still passes plain verify_chain...
+        let truncated = &entries[..2];
+        assert!(verify_chain(truncated, &verifying_key).is_ok());
+        // ...but the anchor rejects it as truncated.
+        assert!(matches!(
+            verify_chain_anchored(truncated, &verifying_key, 3, &head),
+            Err(AuditError::Truncated {
+                expected: 3,
+                found: 2
+            })
+        ));
     }
 
     #[test]

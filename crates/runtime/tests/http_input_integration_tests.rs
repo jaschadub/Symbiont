@@ -34,7 +34,9 @@ fn create_test_config(port: u16) -> HttpInputConfig {
         routing_rules: None,
         response_control: None,
         forward_headers: vec![],
-        cors_origins: vec!["*".to_string()],
+        // Explicit origin (wildcard "*" is now refused at startup — see
+        // SECURITY_AUDIT.md M1). Use the loopback origin the test clients hit.
+        cors_origins: vec![format!("http://127.0.0.1:{}", port)],
         audit_enabled: true,
         webhook_verify: None,
     }
@@ -107,6 +109,7 @@ async fn test_valid_request_is_accepted_and_processed() {
         Duration::from_secs(5),
         client
             .post(format!("{}/webhook", base_url))
+            .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
             .header("Authorization", "Bearer test-token-123")
             .header("Content-Type", "application/json")
             .json(&payload)
@@ -157,6 +160,7 @@ async fn test_invalid_token_returns_401_unauthorized() {
         Duration::from_secs(5),
         client
             .post(format!("{}/webhook", base_url))
+            .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
             .header("Authorization", "Bearer wrong-token")
             .header("Content-Type", "application/json")
             .json(&payload)
@@ -184,6 +188,7 @@ async fn test_missing_token_returns_401_unauthorized() {
         Duration::from_secs(5),
         client
             .post(format!("{}/webhook", base_url))
+            .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
             .header("Content-Type", "application/json")
             .json(&payload)
             .send(),
@@ -213,6 +218,7 @@ async fn test_payload_too_large_returns_413() {
         Duration::from_secs(5),
         client
             .post(format!("{}/webhook", base_url))
+            .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
             .header("Authorization", "Bearer test-token-123")
             .header("Content-Type", "application/json")
             .json(&payload)
@@ -239,6 +245,7 @@ async fn test_malformed_json_returns_400_bad_request() {
         Duration::from_secs(5),
         client
             .post(format!("{}/webhook", base_url))
+            .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
             .header("Authorization", "Bearer test-token-123")
             .header("Content-Type", "application/json")
             .body(malformed_json)
@@ -269,6 +276,7 @@ async fn test_agent_interaction_and_invocation() {
         Duration::from_secs(5),
         client
             .post(format!("{}/webhook", base_url))
+            .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
             .header("Authorization", "Bearer test-token-123")
             .header("Content-Type", "application/json")
             .json(&payload)
@@ -310,15 +318,19 @@ async fn test_agent_interaction_and_invocation() {
 #[cfg(feature = "http-input")]
 #[tokio::test]
 async fn test_cors_headers_when_enabled() {
-    let (_handle, base_url, _port) = start_test_server().await;
+    let (_handle, base_url, port) = start_test_server().await;
     let client = reqwest::Client::new();
 
-    // Send an OPTIONS request to check CORS headers
+    // Send an OPTIONS request from the configured allowed origin (the loopback
+    // URL the test fixture seeds into cors_origins). Wildcard "*" is no longer
+    // accepted (SECURITY_AUDIT.md M1) so the request Origin must match the
+    // allowlist for the response to carry Access-Control-Allow-Origin.
+    let allowed_origin = format!("http://127.0.0.1:{}", port);
     let response = timeout(
         Duration::from_secs(5),
         client
             .request(reqwest::Method::OPTIONS, format!("{}/webhook", base_url))
-            .header("Origin", "https://example.com")
+            .header("Origin", &allowed_origin)
             .header("Access-Control-Request-Method", "POST")
             .send(),
     )
@@ -348,6 +360,7 @@ async fn test_content_type_enforcement() {
         Duration::from_secs(5),
         client
             .post(format!("{}/webhook", base_url))
+            .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
             .header("Authorization", "Bearer test-token-123")
             .body(r#"{"message": "test"}"#)
             // Deliberately omit Content-Type header
@@ -393,6 +406,7 @@ async fn test_concurrent_requests_within_limits() {
                 Duration::from_secs(5),
                 client
                     .post(&url)
+                    .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
                     .header("Authorization", "Bearer test-token-123")
                     .header("Content-Type", "application/json")
                     .json(&payload)

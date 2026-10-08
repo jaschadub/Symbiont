@@ -1,8 +1,8 @@
 ---
 name: symbiont
 title: Symbiont
-description: AI-native agent runtime with typestate-enforced ORGA reasoning loop, Cedar policy authorization, CommunicationPolicyGate for inter-agent governance, ToolClad declarative tool contracts, knowledge bridge, zero-trust security, multi-tier sandboxing, webhook verification, markdown memory, skill scanning, metrics, scheduling, symbi init/run/up CLI, and a declarative DSL
-version: 1.10.0
+description: AI-native agent runtime with typestate-enforced ORGA reasoning loop, Cedar policy authorization, CommunicationPolicyGate for inter-agent governance, ToolClad declarative tool contracts, knowledge bridge, zero-trust security, multi-tier sandboxing including a daemon-free Landlock tier, governed workflow improvements, webhook verification, markdown memory, skill scanning, metrics, scheduling, symbi init/run/up/shell/repl CLI, interactive TUI (Beta), cross-instance agent messaging, human approval relay, and a declarative DSL
+version: 1.21.0
 ---
 
 # Symbiont Agent Development Skills Guide
@@ -19,7 +19,11 @@ version: 1.10.0
 - **Durable Journal**: All 7 loop event types recorded for crash recovery and replay without re-calling the LLM
 - **Zero-Trust Security**: All inputs untrusted by default, explicit policies required
 - **Policy-as-Code**: Declarative security rules enforced at runtime
-- **Multi-Tier Sandboxing**: Docker → gVisor → Firecracker isolation
+- **Multi-Tier Sandboxing**: Landlock → Docker → gVisor → Firecracker isolation, all OSS. Per-agent selection via `with { sandbox = "tier1"|"gvisor"|"firecracker" }`; project default in `[sandbox] tier = "..."`. E2B is a separate hosted backend (`with { sandbox = "e2b" }`, opt-in only) that maps to `SecurityTier::Hosted` and sorts below Tier 1
+- **Daemon-Free Landlock Tier**: Named `landlock`, not numbered. Isolates one-shot commands, output parsers and the managed CLI child using kernel Landlock + seccomp with no daemon, image or helper binary. Requires Linux Landlock ABI 6+ and fails closed where the kernel cannot enforce the declared profile. Not available for registered agents — no `SecurityTier` names it.
+- **Governed Workflow Improvements**: Opt-in lifecycle for versioned instruction artifacts — frozen acceptance suites, offline evaluation of signed trial evidence, exact operator approvals, guarded activation, rollback and signed exports. Managed with `symbi improvement`; ORGA runs opt in via `--improvement`.
+- **Per-Operation File Grants**: One-shot tools, MCP workers and terminal sessions see only their declared inputs plus a bounded ceiling for new outputs. Git source queries read through bounded repository snapshots rather than the working tree.
+- **Canonical `.symbi` extension**: Agent files use `.symbi`; legacy `.dsl` is recognized indefinitely for backward compatibility. Use `dsl::is_symbi_file` / `dsl::strip_symbi_extension` for discovery
 - **Enterprise Compliance**: HIPAA, SOC2, GDPR patterns built-in
 - **Cryptographic Verification**: SchemaPin for MCP tools, AgentPin for agent identity, Ed25519 signatures
 - **Webhook DX**: Signature verification middleware with GitHub/Stripe/Slack presets
@@ -28,12 +32,36 @@ version: 1.10.0
 - **Agent Registry & Lifecycle**: Persistent agent metadata with delete and re-execute lifecycle support
 - **AGENTS.md Support**: Full bidirectional agent manifest files for ecosystem interoperability
 - **Inter-Agent Communication Governance**: CommunicationPolicyGate enforces Cedar-style rules on `ask`, `delegate`, `send_to`, `parallel`, `race` builtins. Ed25519 signed, AES-256-GCM encrypted messages.
-- **ToolClad Integration**: Declarative `.clad.toml` manifests in `tools/` auto-discovered at startup. Typed argument validation, command template construction, evidence envelopes. `symbi tools list/validate/test/schema` CLI.
-- **CLI Workflow**: `symbi init` (interactive project scaffolding with profiles), `symbi run` (single agent execution), `symbi up` (full runtime). DSL supports both `//` and `#` comments.
+- **ToolClad Integration**: Declarative `.clad.toml` manifests in `tools/` auto-discovered at startup. Typed argument validation, command template construction, evidence envelopes. `symbi tools list/validate/test/schema` CLI. An `[mcp]` block routes a tool to an upstream MCP server over stdio (`mcp-client` feature), SchemaPin-verified fail-closed; this backs real tool execution in `symbi run` and the DSL `reason()`/`tool_call()` builtins (see `docs/mcp-tools.md`).
+- **CLI Workflow**: `symbi init` (interactive project scaffolding with profiles, including `--sandbox tier3` with `--firecracker-kernel`/`--firecracker-rootfs` for microVM setup — paths are validated before scaffolding), `symbi run` (single agent execution), `symbi up` (full runtime). DSL supports both `//` and `#` comments. Agent files use `.symbi` (legacy `.dsl` accepted).
 - **Scope Enforcement**: Validates `scope_target` args against `scope/scope.toml` (IP/CIDR range checking, domain matching)
 - **AI Assistant Plugins**: Governance plugins for [Claude Code](https://github.com/thirdkeyai/symbi-claude-code) and [Gemini CLI](https://github.com/thirdkeyai/symbi-gemini-cli)
 
 ---
+
+## Running without a cloud key
+
+Two paths need no API key, which makes them the fastest way to see what the
+runtime enforces:
+
+```bash
+symbi tools init greet && symbi tools validate && symbi tools test greet --arg target=example
+symbi policy evaluate --stdin --policies ./policies --json <<< '{"tool_name":"list_agents"}'
+```
+
+To run an actual agent, point at a local OpenAI-compatible server instead of a
+cloud provider:
+
+```bash
+export OPENAI_API_KEY=ollama
+export OPENAI_BASE_URL=http://localhost:11434/v1
+export CHAT_MODEL=llama3.1
+symbi run assistant --input '{"query":"hello"}'
+```
+
+Validate a `.symbi` file with `symbi dsl --check -f <file>` — one line per file
+and an exit code. The bare `symbi dsl -f` prints the full parse tree, which is
+for debugging.
 
 ## Quick Start Template
 
@@ -189,6 +217,21 @@ gate.add_policy(CedarPolicy {
 Action mapping: `tool_call::<name>`, `respond`, `delegate::<target>`, `terminate`.
 
 Cedar semantics enforced: forbid overrides permit, default deny, skip-on-error.
+
+A policy file under `policies/` may be raw Cedar source or a JSON array of
+`{name, active, source}` entries; both are loaded, and an active entry whose
+source does not parse is reported at startup rather than denying every action
+later.
+
+### Three things named "delegate"
+
+They are separate mechanisms with different guarantees — check which one you mean:
+
+| Name | What it is | Governance |
+|------|-----------|------------|
+| `delegate` tool (chat coordinator) | Runs a `./agents` agent as a bounded in-process sub-loop (`SubLoopDelegationExecutor`), depth-limited with cycle detection, result returned as a correlated tool result | Policy-evaluated as `delegate::<target>`; participates in `SYMBIONT_REQUIRE_APPROVAL_TOOLS`. The sub-agent is offered the coordinator's read-only monitoring tools and runs under an id derived from the target name; its internal steps are not journaled to the operator, and it cannot reach ToolClad/MCP tools |
+| `delegate` DSL builtin | Single completion against the target's prompt via `RuntimeBridge::delegate` → `governed_ask` | CommunicationPolicyGate |
+| `delegate` shell tool | symbi-shell's fleet delegation, implemented in its own executor | CommunicationPolicyGate |
 
 ### Knowledge Bridge (Optional)
 
@@ -452,20 +495,60 @@ for agent in agents {
 
 ---
 
+## Managed CLI agents (Mode B)
+
+An agent whose metadata declares `executor = "claude_code"` runs as a **governed
+subprocess** instead of the ORGA reasoning loop: Symbiont spawns the external AI
+CLI (Claude Code) through `CliExecutor`, gated and bounded by the runtime. The
+reference agent is `agents/code_reviewer.symbi`.
+
+```bash
+# Allow the spawn at the policy Gate (Cedar policy, or dev-only env), then:
+SYMBI_INSECURE_ALLOW_ALL=1 symbi run code_reviewer --target /path/to/repo \
+  --max-turns 12 --budget-timeout 15m
+```
+
+On each run Symbiont evaluates the spawn through the policy **Gate**, injects the
+`SYMBIONT_MANAGED` env handshake (the [symbi-claude-code](https://github.com/thirdkeyai/symbi-claude-code)
+plugin then defers its hooks to the outer Gate), loads the plugin via
+`--plugin-dir`, and wires the stdio `symbi mcp` back-channel. `--max-turns` is the
+primary cooperative bound; `--budget-timeout` is a hard wall-clock backstop
+(graceful SIGTERM → SIGKILL). Requires the `cli-executor` feature (on by default).
+
+**The Gate decision covers the spawn, not the session.** One `Allow` at the Gate
+authorizes the *entire* subprocess run — Symbiont cannot evaluate the child's
+individual tool calls once it starts, since the child runs
+`--permission-mode dontAsk` for its whole lifetime and per-action gating would
+require it to call back into Symbiont's gate (a trust-boundary redesign, out of
+scope). The only in-session restriction is the child's own `--allowedTools`
+allowlist, sourced from the agent's DSL `metadata { allowed_tools = "Tool1,Tool2,..." }`
+— that is the child's allowlist, not Symbiont's gate. Because of that,
+`allowed_tools` is **required**: `symbi run` refuses to spawn an agent whose
+metadata omits it rather than silently handing over a session with the child's
+own unrestricted defaults. See `agents/code_reviewer.symbi` for the syntax.
+
+---
+
 ## Sandbox Tier Selection Guide
+
+The host-isolation tiers form a monotonically increasing ladder. **Hosted** (E2B) is a separate backend, not a tier — it runs on third-party infrastructure and maps to `SecurityTier::Hosted`, which sorts **below** Tier 1.
 
 | Tier | Technology | Use Case | Performance | Security | Overhead |
 |------|------------|----------|-------------|----------|----------|
+| **Landlock** | Kernel LSM + seccomp (no daemon) | Workstations, dev loops, no container runtime | Fastest isolated | Good | Minimal |
 | **Tier1** | Docker | General workloads | Fast | Good | Low (~100ms) |
-| **Tier2** | gVisor | Untrusted code | Medium | High | Medium (~500ms) |
-| **Tier3** | Firecracker | Multi-tenant isolation | Slower | Maximum | High (~2s) |
+| **Tier2** | gVisor (`runsc`) | Untrusted code | Medium | High | Medium (~500ms) |
+| **Tier3** | Firecracker microVM | Multi-tenant isolation, regulated data | Slower | Maximum | High (~2s) |
+| **Hosted** | E2B (third-party cloud) | Quick-start demos, no on-host setup | Network-bound | **No on-host isolation** | Network RTT |
 | **Native** | Process only | Development ONLY | Fastest | None | Minimal |
 
 **Selection Guide**:
-- **Tier1 (Docker)**: Default choice for most agents
-- **Tier2 (gVisor)**: Processing external data, user-provided code
-- **Tier3 (Firecracker)**: Highly sensitive, regulatory compliance
-- **Native**: NEVER use in production (development/testing only)
+- **Landlock**: One-shot commands, parsers and the managed CLI child on a Linux host with no container runtime. Requires Landlock ABI 6+; refuses to run where the kernel cannot enforce the profile. Select with `[sandbox] tier = "landlock"` or `symbi init --sandbox landlock`.
+- **Tier1 (Docker)**: Default choice for most agents.
+- **Tier2 (gVisor)**: Processing external data, user-provided code. Requires `runsc` registered as a Docker runtime.
+- **Tier3 (Firecracker)**: Highly sensitive, regulatory compliance. Operator-supplied kernel + rootfs required — see [`docs/firecracker-setup.md`](https://github.com/thirdkeyai/symbiont/blob/main/docs/firecracker-setup.md). Scaffold with `symbi init --sandbox tier3 --firecracker-kernel /path/to/vmlinux --firecracker-rootfs /path/to/rootfs.ext4`.
+- **Hosted (E2B)**: Opt-in only via DSL (`with { sandbox = "e2b" }` + `E2B_API_KEY`). No `--sandbox e2b` flag — different trust model than the on-host tiers. Not for workloads with privacy or compliance requirements.
+- **Native**: NEVER use in production. Requires `SYMBIONT_ALLOW_UNISOLATED=1` to bypass production guard.
 
 ---
 
@@ -1434,6 +1517,34 @@ agent robust_agent(url: String) -> String {
 }
 ```
 
+### ❌ Anti-Pattern 9: Free-Text Feeding a Privileged Decision
+
+When one agent's output drives a privileged decision (routing, escalation, tool authorization), never make that decision over the upstream agent's free text. A free-text "summary" spliced into a downstream prompt is an injection surface — a held-out red-team evaluation showed a marker/keyword fence reduces orchestrator-injection escape only ~28% → ~26%, while a typed + grounded decision reaches 0%.
+
+```toml
+# BAD: a free-text summary feeds the routing/escalation decision
+[args.summary]
+type = "string"
+feeds_decision = true   # ToolClad manifest validation flags this
+```
+
+✅ **Fix**: type the decision as an `enum` and ground it in trusted context via a Cedar policy; treat the lower-trust agent's output as advisory, not authoritative. The `agent_summary` sanitizer stays as defense-in-depth only, never the load-bearing control.
+
+```toml
+# GOOD: typed enum decision args; the privileged decision is a Cedar policy
+# grounded in trusted facts (see tools/submit_triage.clad.toml,
+# examples/policies/triage_routing.cedar, crates/runtime/src/toolclad/decision.rs)
+[args.category]
+type = "enum"
+allowed = ["ui", "billing", "infra", "account", "other"]
+feeds_decision = true
+
+[args.severity]
+type = "enum"
+allowed = ["low", "medium", "high", "critical"]
+feeds_decision = true
+```
+
 ---
 
 ## Validation Checklist
@@ -1447,6 +1558,7 @@ Before deploying an agent, verify:
 - [ ] **Secrets** referenced via Vault (never hardcoded)
 - [ ] **Input validation** present for all user inputs
 - [ ] **Output sanitization** prevents injection attacks
+- [ ] **Privileged decisions** (routing/escalation/authorization) made over typed `enum` args + Cedar grounding, not free text (`feeds_decision` lint clean)
 - [ ] **No sensitive data** in audit logs
 
 ### Resource Management

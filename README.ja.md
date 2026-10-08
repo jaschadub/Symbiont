@@ -6,11 +6,21 @@
 [![Crates.io](https://img.shields.io/crates/v/symbi)](https://crates.io/crates/symbi)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-online-brightgreen)](https://docs.symbiont.dev)
+[![YouTube](https://img.shields.io/badge/YouTube-%40ThirdKeyAI-FF0000?logo=youtube&logoColor=white)](https://www.youtube.com/@ThirdKeyAI)
+
+[![OATS Reference Implementation](https://img.shields.io/badge/OATS-Reference%20Implementation-1f6feb)](https://openagenttruststack.org)
+[![DOI Typestate Loops](https://zenodo.org/badge/DOI/10.5281/zenodo.19896446.svg)](https://doi.org/10.5281/zenodo.19896446)
+[![DOI ToolClad](https://zenodo.org/badge/DOI/10.5281/zenodo.19957596.svg)](https://doi.org/10.5281/zenodo.19957596)
+[![DOI Empirical Eval](https://zenodo.org/badge/DOI/10.5281/zenodo.20043247.svg)](https://doi.org/10.5281/zenodo.20043247)
 
 ---
 
 **本番環境向けポリシー制御エージェントランタイム。**
 *同じエージェント。安全なランタイム。*
+
+![A Cedar policy denies a live agent's privileged tool call](https://raw.githubusercontent.com/ThirdKeyAI/Symbiont/main/docs/media/cedar-demo.gif)
+
+> **ここで見えているもの：** 実際のモデル (`claude-haiku-4.5`) がエージェントフリートの一覧表示を要求します。Cedar の `forbid` ルールが**毎回のリトライで**その呼び出しを拒否します — コード変更は不要、ポリシーだけです。[コマンド1つで再現する ↓](#ポリシーゲートがツールを拒否する様子を見る--セットアップ不要コマンド1つ) · [▶ 完全なウォークスルー](https://www.youtube.com/watch?v=RPyKpqKz5ik)
 
 Symbiont は、明示的なポリシー、アイデンティティ、監査制御の下で AI エージェントとツールを実行するための Rust ネイティブランタイムです。
 
@@ -28,31 +38,93 @@ AI エージェントはデモは簡単ですが、信頼を得るのは難し�
 * **ツール検証** — 盲目的な信頼に頼らない実行 — [SchemaPin](https://github.com/ThirdKeyAI/SchemaPin) による MCP ツールの暗号化検証
 * **ツール契約** — ツールの実行方法を規定 — [ToolClad](https://github.com/ThirdKeyAI/ToolClad) による宣言的な引数検証、スコープ強制、インジェクション防止
 * **エージェントアイデンティティ** — 誰が操作しているかの把握 — [AgentPin](https://github.com/ThirdKeyAI/AgentPin) ドメイン固定 ES256 アイデンティティ
-* **サンドボックス化** — リスクの高いワークロードの隔離 — リソース制限付き Docker 隔離
+* **サンドボックス化** — リスクの高いワークロードの隔離 — Docker、gVisor (`runsc`)、または Firecracker microVM をエージェントごとに選択
 * **監査証跡** — 何が起こり、なぜ起こったかの記録 — 暗号化的に改ざん防止されたログ
 * **承認ゲート** — 機密アクションへの対応 — ポリシーが要求する場合の実行前の人間によるレビュー
 
 Symbiont はそのレイヤーのために構築されています。
 
+### Open Agent Trust Stack (OATS) — リファレンス実装
+
+Symbiont は **[Open Agent Trust Stack (OATS)](https://openagenttruststack.org) のリファレンス実装**です — 事後的なインターセプトではなく、構造的な強制を通じて AI エージェントの実行を保護するためのオープン仕様（CC BY 4.0）です（「許可されるものを定義し、それ以外はすべて構造的に表現不能にする」）。OATS 仕様は Symbiont の本番運用経験に根ざしており、Symbiont の設計は OATS のレイヤーを直接トレースしています：
+
+| OATS Layer | Symbiont mapping |
+|---|---|
+| **Layer 1 — ORGA Loop**（typestate で強制された Observe-Reason-Gate-Act） | `crates/runtime/src/reasoning/` — typestate で強制されたフェーズ。ポリシーゲートはコンパイル時にスキップ不能です。[Wanger 2026 / DOI 10.5281/zenodo.19896446](https://doi.org/10.5281/zenodo.19896446) を参照。 |
+| **Layer 2 — Tool Contracts** | [ToolClad](https://github.com/ThirdKeyAI/ToolClad) の宣言的な `.clad.toml` マニフェスト + `crates/runtime/src/toolclad/` 内の `agent_summary` typestate フェンス。[Wanger 2026 / DOI 10.5281/zenodo.19957596](https://doi.org/10.5281/zenodo.19957596) を参照。 |
+| **Layer 3 — Identity** | MCP ツール向けの [SchemaPin](https://github.com/ThirdKeyAI/SchemaPin) + [AgentPin](https://github.com/ThirdKeyAI/AgentPin) ES256 ドメイン固定エージェントアイデンティティ。 |
+| **Layer 4 — Policy Engine** | Cedar ポリシーゲート（`crates/runtime/src/reasoning/cedar_gate.rs`）+ エージェント間呼び出し向けの `CommunicationPolicyGate`。両者とも v1.14.0 以降デフォルトでフェイルクローズです。 |
+| **Layer 5 — Audit Journal** | 推論ループ内のハッシュチェーン化された Ed25519 署名付き `BufferedJournal`。`crates/runtime/src/logging.rs` 内の暗号化されたモデル I/O ログ。 |
+
+Symbiont は **OATS Extended**（C1–C7 + E1–E8）に準拠しています。仕様の基礎となる構造的強制ランタイムの実証的比較は [Wanger 2026 / DOI 10.5281/zenodo.20043247](https://doi.org/10.5281/zenodo.20043247) を参照してください。
+
 ---
 
 ## クイックスタート
+
+### ポリシーゲートがツールを拒否する様子を見る — セットアップ不要、コマンド1つ
+
+Cedar の `forbid` が特権ツールをブロックする一方、安全なツールは通過します。公開イメージに対してこれをコピー＆ペーストしてください（クローン不要、ビルド不要）：
+
+```bash
+docker run --rm --entrypoint sh ghcr.io/thirdkeyai/symbi:latest -c '
+mkdir -p /tmp/p && cat > /tmp/p/policy.cedar <<EOF
+forbid(principal, action == Symbi::Action::"tool_call::list_agents",   resource);
+permit(principal, action == Symbi::Action::"tool_call::system_health", resource);
+EOF
+echo "{\"tool_name\":\"list_agents\"}"   | symbi policy evaluate --stdin --policies /tmp/p --json
+echo "{\"tool_name\":\"system_health\"}" | symbi policy evaluate --stdin --policies /tmp/p --json'
+```
+
+```json
+{"decision":"deny","reason":"deny policies matched: policy_0","tool":"list_agents", ...}
+{"decision":"allow","reason":"allow policies matched: policy_1","tool":"system_health", ...}
+```
+
+これは、ランタイムがライブの推論ループに組み込むのと同じ Cedar ゲートです — まさに上のデモで示された拒否そのものです。
+
+### CLI をインストール
+
+```bash
+# Linux / macOS — installs the `symbi` binary to /usr/local/bin
+curl -fsSL https://symbiont.dev/install.sh | bash
+symbi --help
+```
+
+インストーラーはお使いのプラットフォーム向けにビルド済みのリリースバイナリを取得します。`bash -s -- --version v1.15.2` でバージョンを固定したり、`--dir` でインストール先を変更したりできます。Docker または[ソースからのビルド](#ソースからビルド)をお好みですか？どちらも以下にあります。
 
 ### 前提条件
 
 * Docker（推奨）または Rust 1.82+
 
-### Docker で実行
+### プロジェクトをスキャフォールドして実行する（Docker、約 60 秒）
 
 ```bash
-# ランタイムを起動（API: :8080、HTTP 入力: :8081）
+# 1. 現在のディレクトリにプロジェクトを作成します。
+#    symbiont.toml、agents/、policies/、docker-compose.yml、および
+#    新たに生成された SYMBIONT_MASTER_KEY を含む .env を生成します。
+docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest \
+  init --profile assistant --no-interact --dir /workspace
+
+# 2. ランタイムを起動します。.env を自動的に読み込みます。
+docker compose up
+```
+
+これだけです — Runtime API は `http://localhost:8080`、HTTP Input は `http://localhost:8081` で動作します。
+ビルド済みエージェントを参照するには `symbi init --catalog list`（または Docker の同等コマンド）を使用してください。
+
+### その他の Docker レシピ
+
+```bash
+# プロジェクトなしのアドホックランタイム（一時的、マスターキーなし）
 docker run --rm -p 8080:8080 -p 8081:8081 ghcr.io/thirdkeyai/symbi:latest up
 
-# MCP サーバーのみ実行
+# MCP サーバーのみ
 docker run --rm -p 8080:8080 ghcr.io/thirdkeyai/symbi:latest mcp
 
-# エージェント DSL ファイルを解析
-docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest dsl parse /workspace/agent.dsl
+# エージェント定義を解析（`.symbi`。レガシーの `.dsl` も受け付けます）
+docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest \
+  dsl -f /workspace/agent.symbi
 ```
 
 ### ソースからビルド
@@ -61,11 +133,9 @@ docker run --rm -v $(pwd):/workspace ghcr.io/thirdkeyai/symbi:latest dsl parse /
 cargo build --release
 ./target/release/symbi --help
 
-# ランタイムを実行
-cargo run -- up
-
-# インタラクティブ REPL
-cargo run -- repl
+# ローカルでプロジェクトをスキャフォールドし、ランタイムを起動します
+./target/release/symbi init --profile assistant --no-interact
+./target/release/symbi up
 ```
 
 > 本番デプロイメントの場合は、信頼されていないツール実行を有効にする前に `SECURITY.md` と[デプロイメントガイド](https://docs.symbiont.dev/getting-started)を確認してください。
@@ -115,6 +185,8 @@ agent secure_analyst(input: DataSet) -> Result {
 
 完全な文法（`metadata`、`schedule`、`webhook`、`channel` ブロックを含む）については [DSL ガイド](https://docs.symbiont.dev/dsl-guide)を参照してください。
 
+> **ファイル拡張子：** Symbiont のエージェント定義は正規の拡張子として `.symbi` を使用します（例：`agents/assistant.symbi`）。レガシーの `.dsl` 拡張子は後方互換性のために今後も無期限に解析され続けますが、`symbi init` でスキャフォールドされる新しいプロジェクトおよびこのリポジトリ内のすべての例は `.symbi` を使用します。
+
 ---
 
 ## コア機能
@@ -126,7 +198,7 @@ agent secure_analyst(input: DataSet) -> Result {
 | **ツール契約** | [ToolClad](https://github.com/ThirdKeyAI/ToolClad) 宣言的契約による引数検証、スコープ強制、Cedar ポリシー生成 |
 | **エージェントアイデンティティ** | エージェントおよびスケジュールタスク向けの [AgentPin](https://github.com/ThirdKeyAI/AgentPin) ドメイン固定 ES256 アイデンティティ |
 | **推論ループ** | ポリシーゲートとサーキットブレーカーを備えた型状態強制の Observe-Reason-Gate-Act サイクル |
-| **サンドボックス化** | 信頼されていないワークロード向けのリソース制限付き Docker ベース隔離 |
+| **サンドボックス化** | Docker、gVisor (`runsc`)、または Firecracker microVM — DSL の `with { sandbox = ... }` ブロックでエージェントごとに選択可能 |
 | **監査ログ** | すべてのポリシー決定に対する構造化レコード付き改ざん防止ログ |
 | **シークレット管理** | Vault/OpenBao 統合、AES-256-GCM 暗号化ストレージ、エージェントごとのスコープ |
 | **MCP 統合** | ガバナンス付きツールアクセスを備えたネイティブ Model Context Protocol サポート |
@@ -146,7 +218,7 @@ Symbiont はシンプルな原則に基づいて設計されています：**モ
 * **ゼロトラスト** — すべてのエージェント入力はデフォルトで信頼されない
 * **ポリシーチェック** — すべてのツール呼び出しとリソースアクセスの前に Cedar 認可
 * **ツール検証** — SchemaPin によるツールスキーマの暗号化検証
-* **サンドボックス境界** — 信頼されていない実行のための Docker 隔離
+* **サンドボックス境界** — エージェントごとに隔離レベルを選択：Docker（デフォルト）、gVisor（`runsc` syscall フィルター）、または Firecracker（microVM）
 * **オペレーター承認** — 機密アクションに対する人間によるレビューゲート
 * **シークレット制御** — Vault/OpenBao バックエンド、暗号化ローカルストレージ、エージェント名前空間
 * **監査ログ** — すべての決定の暗号化的改ざん防止レコード
@@ -165,6 +237,7 @@ Symbiont はシンプルな原則に基づいて設計されています：**モ
 | `symbi-channel-adapter` | Slack/Teams/Mattermost アダプター |
 | `repl-core` / `repl-proto` / `repl-cli` | インタラクティブ REPL および JSON-RPC サーバー |
 | `repl-lsp` | Language Server Protocol サポート |
+| `symbi-shell` | オーサリング、オーケストレーション、リモートアタッチのためのインタラクティブ TUI（Beta） |
 | `symbi-a2ui` | 管理ダッシュボード（Lit/TypeScript、アルファ版） |
 
 ガバナンスプラグイン: [`symbi-claude-code`](https://github.com/thirdkeyai/symbi-claude-code) | [`symbi-gemini-cli`](https://github.com/thirdkeyai/symbi-gemini-cli)
@@ -193,12 +266,14 @@ Symbiont はシンプルな原則に基づいて設計されています：**モ
 | **JavaScript/TypeScript** | [symbiont-sdk-js](https://www.npmjs.com/package/symbiont-sdk-js) | [GitHub](https://github.com/ThirdKeyAI/symbiont-sdk-js) |
 | **Python** | [symbiont-sdk](https://pypi.org/project/symbiont-sdk/) | [GitHub](https://github.com/ThirdKeyAI/symbiont-sdk-python) |
 
+> **本番環境での推奨：** JS および Python の SDK は、アプリケーション統合やプロトタイピングを目的とした HTTP クライアントです。本番環境のエージェントワークロードには、Symbiont の完全な typestate ベースの安全性保証 — 機能認可、ポリシー適用、ライフサイクル不変条件がランタイムではなくコンパイル時に強制される — を活用するため、**Rust 実装**の上に直接構築することを推奨します。動的言語のクライアントは、リクエストがランタイム境界を越えた後にしかこれらのプロパティを検証できません。
+
 ---
 
 ## ライセンス
 
 * **Community エディション**（Apache 2.0）：コアランタイム、DSL、ポリシーエンジン、ツール検証、サンドボックス化、エージェントメモリ、スケジューリング、MCP 統合、RAG、監査ログ、すべての CLI/REPL ツール。
-* **Enterprise エディション**（商用ライセンス）：高度なサンドボックスバックエンド、コンプライアンス監査エクスポート、AI 駆動ツールレビュー、暗号化マルチエージェント協調、監視ダッシュボード、専用サポート。
+* **Enterprise エディション**（商用ライセンス）：コンプライアンス監査エクスポート、AI 駆動ツールレビュー、暗号化マルチエージェント協調、監視ダッシュボード、専用サポート。（3 つのサンドボックスバックエンド — Docker、gVisor、Firecracker — はすべて OSS です。）
 
 エンタープライズライセンスについては [ThirdKey](https://thirdkey.ai) にお問い合わせください。
 

@@ -2,6 +2,7 @@ import { LitElement, html, css } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { unsafeHTML } from 'lit/directives/unsafe-html.js';
 import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 
 export interface ToolTrace {
   call_id: string;
@@ -17,7 +18,10 @@ export interface PolicyTrace {
   reason: string;
 }
 
+import type { RunAuditReference } from '../../../api/run-audit.js';
+
 export interface ChatMessageData {
+  audit?: RunAuditReference;
   id: string;
   role: 'user' | 'assistant';
   content: string;
@@ -246,7 +250,12 @@ export class ChatMessage extends LitElement {
   }
 
   private _renderMarkdown(text: string): string {
-    return marked.parse(text, { async: false }) as string;
+    // Chat content is agent/coordinator/tool output — untrusted. `marked` does
+    // NOT sanitize, and the result is fed to `unsafeHTML`, so sanitize the
+    // generated HTML (strips <script>, on* handlers, javascript: URIs, etc.)
+    // before it reaches the DOM.
+    const rawHtml = marked.parse(text, { async: false }) as string;
+    return DOMPurify.sanitize(rawHtml);
   }
 
   render() {
@@ -260,6 +269,7 @@ export class ChatMessage extends LitElement {
 
     return html`
       <div class="assistant-row">
+        ${this.data.audit ? html`<audit-reference .reference=${this.data.audit}></audit-reference>` : ''}
         ${this.data.policyTraces?.map(
           (p) => html`
             <span class="policy-badge ${p.decision === 'allow' ? 'policy-allow' : 'policy-deny'}">

@@ -22,7 +22,7 @@ http://127.0.0.1:8080/api/v1
 
 ### 認証
 
-エージェント管理エンドポイントはBearerトークンによる認証が必要です。環境変数 `API_AUTH_TOKEN` を設定し、Authorizationヘッダーにトークンを含めてください：
+ヘルスチェック以外のランタイム経路には Bearer 認証が必要です。非公開の API キーファイル、または従来の運用者トークン `SYMBIONT_API_TOKEN` を設定してください。
 
 ```
 Authorization: Bearer <your-token>
@@ -30,7 +30,7 @@ Authorization: Bearer <your-token>
 
 **保護されたエンドポイント：**
 - `/api/v1/agents/*` のすべてのエンドポイントは認証が必要
-- `/api/v1/health`、`/api/v1/workflows/execute`、`/api/v1/metrics` エンドポイントは認証不要
+- 公開されるのはヘルスチェックのみです。ワークフローの送信とメトリクスの取得には管理者権限が必要です。
 
 ### 利用可能なエンドポイント
 
@@ -67,21 +67,25 @@ GET /api/v1/health
 POST /api/v1/workflows/execute
 ```
 
-指定されたパラメータでワークフローを実行します。
+管理者は `workflow_id` に DSL ソースを送信し、`parameters` は実行入力になります。`agent_id` を指定すると登録を作成または置換し、省略すると新しい ID を割り当てます。エージェントに限定されたキーは `403 ADMIN_REQUIRED` となり、登録済みソースを `/agents/{id}/execute` から実行できます。`queued` は受付を示します。`/agents/{id}/history` の `execution_id` で実際の結果を確認してください。[詳細な仕様](../../crates/runtime/API_REFERENCE.md#execute-workflow)を参照してください。
 
 **リクエストボディ：**
 ```json
 {
-  "workflow_id": "string",
+  "workflow_id": "agent report() { with sandbox = \"docker\" {} }",
   "parameters": {},
-  "agent_id": "optional-agent-id"
+  "agent_id": null
 }
 ```
 
 **レスポンス（200 OK）：**
 ```json
 {
-  "result": "workflow execution result"
+  "status": "queued",
+  "workflow_id": "agent report() { with sandbox = \"docker\" {} }",
+  "agent_id": "19b183f7-97c4-4e42-9c62-5e9c940bfae3",
+  "execution_id": "c7022f13-7140-4a09-8e30-b1941e0cbb32",
+  "metadata": {}
 }
 ```
 
@@ -112,28 +116,24 @@ GET /api/v1/agents/{id}/status
 Authorization: Bearer <your-token>
 ```
 
-リアルタイム実行メトリクスを含む特定のエージェントの詳細なステータス情報を取得します。
+特定のエージェントのスケジューラー上のステータスを取得します。CPU とメモリは null になり得ます。現在のスケジューラーにはエージェント単位のサンプラーがないため、内部エージェントと外部エージェントのいずれについても `null` を返します。クライアントはこれらの値を使用量ゼロとして提示してはなりません。
 
 **レスポンス（200 OK）：**
 ```json
 {
   "agent_id": "uuid",
-  "state": "running|ready|waiting|failed|completed|terminated",
+  "state": "Running",
   "last_activity": "2024-01-15T10:30:00Z",
-  "scheduled_at": "2024-01-15T10:00:00Z",
   "resource_usage": {
-    "memory_usage": 268435456,
-    "cpu_usage": 15.5,
+    "memory_bytes": null,
+    "cpu_percent": null,
     "active_tasks": 1
   },
-  "execution_context": {
-    "execution_mode": "ephemeral|persistent|scheduled|event_driven",
-    "process_id": 12345,
-    "uptime": "00:15:30",
-    "health_status": "healthy|unhealthy"
-  }
+  "execution_mode": "Ephemeral"
 }
 ```
+
+`active_tasks` はスケジューラーが所有するタスクの数です。`last_activity` はリソースをサンプリングした時刻ではありません。Fleet Overview は、CPU とメモリが欠落している場合に **Not sampled** と表示します。個別にサンプリングされたワーカーの使用量と予約済み容量は、[ワーカー容量](/worker-capacity)で提供されます。これらのワーカーの値は、エージェント単位の合計ではありません。
 
 **新しいエージェント状態：**
 - `running`: エージェントが実行中のプロセスでアクティブに実行中
@@ -210,10 +210,11 @@ Authorization: Bearer <your-token>
 ##### エージェント実行
 ```http
 POST /api/v1/agents/{id}/execute
+Idempotency-Key: <UUID retained for retries>
 Authorization: Bearer <your-token>
 ```
 
-特定のエージェントの実行をトリガーします。
+選択したエージェントの呼び出しを 1 件送信します。同じ UUID とリクエストを再利用すると、保存済みの完了結果、または active / unresolved / reconciled / conflict のいずれかの明示的な結果を取得できます。[スケジューラーの再試行状態](/scheduler-idempotency)を参照してください。
 
 **リクエストボディ：**
 ```json
@@ -224,7 +225,7 @@ Authorization: Bearer <your-token>
 ```json
 {
   "execution_id": "uuid",
-  "status": "execution_started"
+  "status": "queued"
 }
 ```
 
@@ -432,22 +433,24 @@ cargo build --features cloud-llm
 **環境変数：**
 - `OPENROUTER_API_KEY` -- OpenRouter APIキー（必須）
 - `OPENROUTER_MODEL` -- 使用するモデル（デフォルト：`google/gemini-2.0-flash-001`）
+- `OPENROUTER_REFERER` -- 任意。OpenRouterリクエストの `HTTP-Referer` ヘッダーを設定（アプリ帰属）。未設定の場合は帰属なしのトラフィックとして扱われます。
+- `OPENROUTER_TITLE` -- 任意。`X-Title` ヘッダーを設定します。[OpenRouter app attribution](https://openrouter.ai/docs/app-attribution) を参照してください。
 
 クラウドLLMプロバイダーは推論ループの `execute_actions()` パイプラインと統合されます。ストリーミングレスポンス、指数バックオフによる自動リトライ、トークン使用追跡をサポートしています。
 
 #### スタンドアロンエージェントモード (`standalone-agent`)
 
-クラウドネイティブエージェントのためにクラウドLLM推論とComposioツールアクセスを組み合わせます：
+クラウドネイティブエージェントのためにクラウドLLM推論を有効化するメタフィーチャー：
 
 ```bash
 cargo build --features standalone-agent
-# 有効化: cloud-llm + composio
+# 有効化: cloud-llm
 ```
 
 **環境変数：**
 - `OPENROUTER_API_KEY` -- OpenRouter APIキー
-- `COMPOSIO_API_KEY` -- Composio APIキー
-- `COMPOSIO_MCP_URL` -- Composio MCPサーバーURL
+
+> **Note:** Composio MCP and SymbiBot integration were removed in this version due to security concerns — see SECURITY_AUDIT.md C3 for context.
 
 #### Cedarポリシーエンジン (`cedar`)
 
@@ -676,7 +679,10 @@ POST /api/v1/schedules/{id}/pause
 POST /api/v1/schedules/{id}/resume
 POST /api/v1/schedules/{id}/trigger
 Authorization: Bearer <your-token>
+Idempotency-Key: <invocation-uuid>
 ```
+
+手動実行には管理者トークンと `Idempotency-Key` ヘッダーの UUID が必要です。`queued`、保存済みの結果、または `in_progress` / `unresolved` / `reconciled` / `conflict` を返します。再試行では同じ UUID を使用してください。一時停止と再開は以下の応答形式を維持します。未解決の実行がある場合は再開できません。[cron の復旧](/cron-recovery)を参照してください。
 
 **レスポンス（200 OK）：**
 ```json
@@ -1224,33 +1230,80 @@ APIは標準的なHTTPステータスコードを使用し、詳細なエラー�
 
 ---
 
+## CLI サブコマンド
+
+長時間稼働する HTTP サーフェスに加えて、`symbi` はワンショット操作用の CLI 専用サブコマンドをいくつか公開しています。完全なカタログは `symbi --help` にあります。統合およびポリシー実施に最も関連するものは以下のとおりです：
+
+### `symbi schemapin`
+
+MCP サーバー設定に対する TOFU（Trust-On-First-Use）整合性ピン留め。SessionStart フックから呼び出されるように設計されており、オペレーターが承認しない限り、MCP サーバーの設定ハッシュがセッション間で知らないうちに変わることがないようにします。
+
+```bash
+# Verify the pinned hash for one or all MCP servers in .mcp.json
+symbi schemapin verify [--mcp-server <NAME>] [--config <PATH>]
+
+# Pin the current config hash for a server
+symbi schemapin pin --mcp-server <NAME> [--config <PATH>] [--force]
+
+# List every pinned server under ~/.symbiont/schemapin/mcp/
+symbi schemapin list
+
+# Remove a pin record
+symbi schemapin unpin --mcp-server <NAME>
+```
+
+ピンは `~/.symbiont/schemapin/mcp/` 配下に JSON レコードとして保存されます。`verify` は一致すれば 0、不一致またはピンが見つからない場合は非ゼロで終了します — 事前セッションスクリプトでの使用に適しています。
+
+### `symbi policy`
+
+ツール呼び出しイベントに対する Cedar ポリシー評価。単一のイベントを JSON として読み取り、ポリシーディレクトリに対して `allow` / `deny` を判定し、スクリプトに適した終了ステータスコードで終了します。
+
+```bash
+# Evaluate an event read from stdin
+echo '{"principal":"Agent::\"dev\"", "action":"write", "resource":{...}}' \
+  | symbi policy evaluate --stdin --policies ./policies
+
+# Evaluate an event read from a file
+symbi policy evaluate --input event.json --policies ./policies
+
+# Emit structured JSON only (suitable for programmatic use)
+symbi policy evaluate --stdin --policies ./policies --json
+```
+
+デフォルトの出力は stdout への判定のみで、構造化された詳細は stderr に出力されます。`--json` を渡すとすべてが stdout JSON に集約されます。これはランタイムがインラインで使用しているのと同じ Cedar 決定ロジックであり、CI でのシフトレフトポリシーテストや、稼働中のランタイム外での拒否のデバッグに役立ちます。
+
+### `symbi agents-md`
+
+現在の `agents/*.symbi` ファイルから `AGENTS.md` を再生成します（後方互換のため `.dsl` も認識されます）。`symbi init` の実行中に自動的に実行されます。エージェント定義を追加または編集した後に手動で呼び出してください。
+
+```bash
+symbi agents-md generate --dir . --output AGENTS.md
+```
+
 ## はじめに
 
 ### ランタイムHTTP API
 
-1. ランタイムが `http-api` featureでビルドされていることを確認：
+1. `symbi` バイナリをビルドします（バイナリクレートでは `http-api` featureがデフォルトで有効です）：
    ```bash
-   cargo build --features http-api
+   cargo build --release
    ```
 
-2. エージェントエンドポイント用の認証トークンを設定：
+2. ランタイムを起動します -- APIは `:8080`、HTTP Inputは `:8081` でリッスンします：
    ```bash
-   export API_AUTH_TOKEN="<your-token>"
+   ./target/release/symbi up --http-bind 0.0.0.0
    ```
 
-3. ランタイムサーバーを起動：
-   ```bash
-   ./target/debug/symbiont-runtime --http-api
-   ```
+   スキャフォールドされたプロジェクトと推奨のDockerフローについては、[Getting Started](/getting-started) を参照してください。
 
-4. サーバーが実行中であることを確認：
+3. サーバーが実行中であることを確認：
    ```bash
    curl http://127.0.0.1:8080/api/v1/health
    ```
 
-5. 認証済みエージェントエンドポイントをテスト：
+4. 認証済みエンドポイントをテスト -- `symbi up` は起動時に生成されたベアラートークンを出力します（または `--http.token` で明示的に設定できます）：
    ```bash
-   curl -H "Authorization: Bearer $API_AUTH_TOKEN" \
+   curl -H "Authorization: Bearer $SYMBI_HTTP_TOKEN" \
         http://127.0.0.1:8080/api/v1/agents
    ```
 
@@ -1264,6 +1317,8 @@ APIは標準的なHTTPステータスコードを使用し、詳細なエラー�
 ## サポート
 
 APIサポートと質問については：
-- [ランタイムアーキテクチャドキュメント](runtime-architecture.md)を確認
-- [セキュリティモデルドキュメント](security-model.md)をチェック
+- [ランタイムアーキテクチャドキュメント](/runtime-architecture)を確認
+- [セキュリティモデルドキュメント](/security-model)をチェック
 - プロジェクトのGitHubリポジトリで問題を報告
+
+突き合わせ済み（reconciled）の呼び出しは HTTP 409 と、個別に署名された運用者の `resolution` を返します。ランタイムの完了結果を捏造して返すことはありません。cron の履歴には `Reconciled` ステータス、元のエラーと監査情報、および resolution オブジェクトが保持されます。ジョブは明示的に再開されるまで一時停止のままです。[運用者による突き合わせ](/invocation-reconciliation)を参照してください。

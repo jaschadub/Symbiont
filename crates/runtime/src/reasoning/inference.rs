@@ -43,6 +43,10 @@ pub enum FinishReason {
     MaxTokens,
     /// Generation was truncated due to content filter.
     ContentFilter,
+    /// The model declined the request (e.g. Anthropic `stop_reason: "refusal"`).
+    /// Distinct from [`FinishReason::Stop`] so callers can retry or fail over
+    /// instead of reading a refused turn as an empty, successful completion.
+    Refusal,
 }
 
 /// Desired response format from the model.
@@ -67,7 +71,7 @@ pub enum ResponseFormat {
 }
 
 /// Token usage information.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     /// Tokens in the prompt/input.
     pub prompt_tokens: u32,
@@ -75,6 +79,30 @@ pub struct Usage {
     pub completion_tokens: u32,
     /// Total tokens used.
     pub total_tokens: u32,
+}
+
+/// Controls whether the model is required to call a tool on this turn.
+///
+/// Default is `Auto`, which preserves the historic behavior of letting
+/// the model decide whether to respond with a tool_use block or with
+/// plain text. Callers that drive an iterate-until-done workflow
+/// (research agents, code-execution agents, multi-step planners) should
+/// set `Any` so the model is forced into tool_use mode and the loop
+/// terminates on a sentinel tool rather than on a stray text response.
+///
+/// `Tool { name }` constrains the model to a specific named tool; useful
+/// when the next action is unambiguous (e.g., always start by calling
+/// `read_threat_model`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoice {
+    /// Model decides whether to call a tool (provider default).
+    #[default]
+    Auto,
+    /// Model MUST call some tool — any one of the available definitions.
+    Any,
+    /// Model MUST call this specific named tool.
+    Tool { name: String },
 }
 
 /// Options for an inference call.
@@ -89,6 +117,11 @@ pub struct InferenceOptions {
     /// Tool definitions available for this call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_definitions: Vec<ToolDefinition>,
+    /// Constraint on whether the model must call a tool this turn.
+    /// `None` defers to the provider default (Anthropic + OpenAI both
+    /// default to "auto"). Set to `Some(Any)` to force tool_use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
     /// Desired response format.
     #[serde(default = "default_response_format")]
     pub response_format: ResponseFormat,
@@ -118,6 +151,7 @@ impl Default for InferenceOptions {
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             tool_definitions: Vec::new(),
+            tool_choice: None,
             response_format: ResponseFormat::Text,
             model: None,
             extra: HashMap::new(),
@@ -181,6 +215,27 @@ pub enum InferenceError {
 /// - Token usage tracking
 #[async_trait]
 pub trait InferenceProvider: Send + Sync {
+    /// Stable, non-secret configuration identity for opt-in evaluated releases.
+    /// Unimplemented providers remain usable for ordinary runs.
+    fn configuration_identity(&self) -> Option<String> {
+        None
+    }
+    /// Input allowance reserved before dispatch, including tools and framing.
+    /// The default conservatively budgets serialized UTF-8 bytes plus framing
+    /// overhead for text providers. It is not an exact tokenizer or billing
+    /// guarantee: providers with additional hidden input must override it.
+    /// Reported usage above the reservation closes the shared budget before
+    /// response-driven actions. Implementations may supply an exact count.
+    fn input_token_reservation(
+        &self,
+        conversation: &Conversation,
+        options: &InferenceOptions,
+    ) -> Result<u32, InferenceError> {
+        let bytes = serde_json::to_vec(&(conversation, options))
+            .map_err(|error| InferenceError::InvalidRequest(error.to_string()))?;
+        input_reservation_from_bytes(bytes.len())
+    }
+
     /// Run inference on a conversation with the given options.
     async fn complete(
         &self,
@@ -199,6 +254,15 @@ pub trait InferenceProvider: Send + Sync {
 
     /// Check if this provider supports structured output natively.
     fn supports_structured_output(&self) -> bool;
+}
+
+pub(crate) fn input_reservation_from_bytes(bytes: usize) -> Result<u32, InferenceError> {
+    bytes
+        .checked_add(1024)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            InferenceError::InvalidRequest("input reservation exceeds token range".into())
+        })
 }
 
 #[cfg(test)]

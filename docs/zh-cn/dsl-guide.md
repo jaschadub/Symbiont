@@ -72,10 +72,10 @@ metadata {
     description: "Healthcare data analysis agent with HIPAA compliance"
     license: "Proprietary"
     tags: ["healthcare", "hipaa", "analysis"]
-    min_runtime_version: "1.0.0"
-    dependencies: ["medical_nlp", "privacy_tools"]
 }
 ```
+
+元数据键值对可使用 `=` 或 `:` 作为分隔符。
 
 ### 元数据字段
 
@@ -86,8 +86,41 @@ metadata {
 | `description` | String | 是 | 智能体功能的简要描述 |
 | `license` | String | 否 | 许可证标识符 |
 | `tags` | Array[String] | 否 | 分类标签 |
-| `min_runtime_version` | String | 否 | 所需的最低运行时版本 |
-| `dependencies` | Array[String] | 否 | 外部依赖项 |
+
+托管 CLI 智能体（Mode B）还能识别以下额外的元数据键，由 `symbi run` 读取以启动一个受治理的 Claude Code 子进程（参见 `agents/code_reviewer.symbi`）：
+
+| 字段 | 类型 | 描述 |
+|-------|------|-------------|
+| `executor` | String | 设为 `"claude_code"` 可将智能体作为受治理的 Claude Code 子进程运行，而非使用推理循环 |
+| `model` | String | 传递给子进程的模型（例如 `"claude-sonnet-4-5"`） |
+| `allowed_tools` | String | 子进程的逗号分隔工具允许列表（例如 `"Read,Grep,Glob"`）。**必填** —— 未声明该字段的智能体会被拒绝，而不会以不受限制的方式启动 |
+| `system_prompt` | String | 为子进程追加的额外系统提示 |
+| `permission_mode` | String | 可选。作为 `--permission-mode` 透传。未设置时将省略该标志，子进程保留自身默认值；该默认值对 `allowed_tools` 之外的任何操作仍会请求确认。需要无人值守运行的智能体请设为 `"dontAsk"` |
+
+启动会作为 `tool_call::claude_code` 经过策略门控，该决策读取自
+`policies/managed-cli/` —— **而非** `policies/run/`。启动子进程
+与进程内推理循环的影响范围不同，因此这两个界面不共享策略目录。最小的 permit 如下：
+
+```cedar
+// policies/managed-cli/claude_code.cedar
+permit(principal, action == Action::"tool_call::claude_code", resource);
+```
+
+启动决策并不是唯一的决策。子进程运行在所选的 Docker、gVisor 或 Firecracker
+工作进程内，只有临时暂存存储以及私有的推理和工具通道 —— 没有源码挂载，没有
+外部网络，没有主机登录状态，也没有主机凭据。CLI 内置工具以及项目/插件的自动
+发现均被禁用，`--plugin-dir` 会被拒绝。对源码的访问由一组已注册的 ToolClad
+工具提供，并且**子进程发起的每一次工具调用都会经由运行时代为中转**：准备与
+规范化调用、取得任何强制性的精确审批、评估 Cedar、持久化必需的作用前记录、
+派发，然后记录结果。`allowed_tools` 指定的是已注册工具的一个精确子集；通配符
+权限表达式和 CLI 内置工具名不会被接受为注册项。
+
+这正是 `allowed_tools` 为必填、而 `permission_mode` 采用选择加入的原因：
+它们限定子进程可以*请求*什么，而实际发生什么则由运行时决定，而不是由子进程
+决定。每个托管 CLI 会话都保留自己的签名日志。镜像、挂载、策略和
+`[managed_cli.inference]` 的配置参见[托管 CLI 收容](/managed-cli-containment)，
+中转契约参见[受治理工具中转器](/governed-tool-broker)。
+
 
 ---
 

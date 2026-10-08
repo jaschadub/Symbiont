@@ -353,3 +353,9 @@ data/vector_db/
 !.claude/CLAUDE.md
 !.claude/RELEASE_RUNBOOK.md
 .clauderc
+# Subagent-driven-development scratch (ledgers, briefs, reports)
+.superpowers/
+.symbi/
+
+# Private execution journals and signing keys at any project depth
+**/.symbiont/governed/

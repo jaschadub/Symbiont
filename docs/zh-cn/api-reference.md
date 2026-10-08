@@ -22,7 +22,7 @@ http://127.0.0.1:8080/api/v1
 
 ### 身份验证
 
-智能体管理端点需要 Bearer 令牌认证。请设置 `API_AUTH_TOKEN` 环境变量，并在 Authorization 头中包含令牌：
+除健康检查外，运行时路由都需要 Bearer 认证。请配置私有 API 密钥文件，或使用旧版运维令牌 `SYMBIONT_API_TOKEN`。
 
 ```
 Authorization: Bearer <your-token>
@@ -30,7 +30,7 @@ Authorization: Bearer <your-token>
 
 **受保护端点：**
 - 所有 `/api/v1/agents/*` 端点需要认证
-- `/api/v1/health`、`/api/v1/workflows/execute` 和 `/api/v1/metrics` 端点不需要认证
+- 只有健康检查公开访问。提交工作流和读取指标需要管理员权限。
 
 ### 可用端点
 
@@ -67,21 +67,25 @@ GET /api/v1/health
 POST /api/v1/workflows/execute
 ```
 
-使用指定参数执行工作流。
+管理员在 `workflow_id` 中提交 DSL 源码，`parameters` 作为执行输入。指定 `agent_id` 会创建或替换注册；省略时会分配新 ID。限定代理范围的密钥会收到 `403 ADMIN_REQUIRED`，可通过 `/agents/{id}/execute` 执行已注册的源码。`queued` 仅表示已入队，请在 `/agents/{id}/history` 中按 `execution_id` 查询实际结果。参阅[完整接口约定](../../crates/runtime/API_REFERENCE.md#execute-workflow)。
 
 **请求体：**
 ```json
 {
-  "workflow_id": "string",
+  "workflow_id": "agent report() { with sandbox = \"docker\" {} }",
   "parameters": {},
-  "agent_id": "optional-agent-id"
+  "agent_id": null
 }
 ```
 
 **响应（200 OK）：**
 ```json
 {
-  "result": "workflow execution result"
+  "status": "queued",
+  "workflow_id": "agent report() { with sandbox = \"docker\" {} }",
+  "agent_id": "19b183f7-97c4-4e42-9c62-5e9c940bfae3",
+  "execution_id": "c7022f13-7140-4a09-8e30-b1941e0cbb32",
+  "metadata": {}
 }
 ```
 
@@ -112,28 +116,27 @@ GET /api/v1/agents/{id}/status
 Authorization: Bearer <your-token>
 ```
 
-获取特定智能体的详细状态信息，包括实时执行指标。
+获取特定智能体的调度器状态。CPU 和内存字段可为 null；当前调度器没有按智能体
+采样的机制，对内部和外部智能体都返回 `null`。客户端不得把这些值呈现为零占用。
 
 **响应（200 OK）：**
 ```json
 {
   "agent_id": "uuid",
-  "state": "running|ready|waiting|failed|completed|terminated",
+  "state": "Running",
   "last_activity": "2024-01-15T10:30:00Z",
-  "scheduled_at": "2024-01-15T10:00:00Z",
   "resource_usage": {
-    "memory_usage": 268435456,
-    "cpu_usage": 15.5,
+    "memory_bytes": null,
+    "cpu_percent": null,
     "active_tasks": 1
   },
-  "execution_context": {
-    "execution_mode": "ephemeral|persistent|scheduled|event_driven",
-    "process_id": 12345,
-    "uptime": "00:15:30",
-    "health_status": "healthy|unhealthy"
-  }
+  "execution_mode": "Ephemeral"
 }
 ```
+
+`active_tasks` 统计的是调度器拥有的任务。`last_activity` 不是资源采样的时间戳。
+Fleet Overview 对缺失的 CPU 和内存显示 **Not sampled**；[工作进程容量](/worker-capacity)
+提供单独采样的工作进程占用和预留容量。这些工作进程数值不是按智能体汇总的结果。
 
 **新的智能体状态：**
 - `running`：智能体正在活跃执行，有运行中的进程
@@ -210,10 +213,12 @@ Authorization: Bearer <your-token>
 ##### 执行智能体
 ```http
 POST /api/v1/agents/{id}/execute
+Idempotency-Key: <UUID retained for retries>
 Authorization: Bearer <your-token>
 ```
 
-触发特定智能体的执行。
+提交所选智能体的一次调用。复用同一 UUID 和同一请求可取回已保存的完成结果，
+或得到明确的 active/unresolved/reconciled/conflict 状态。参见[调度器重试状态](/scheduler-idempotency)。
 
 **请求体：**
 ```json
@@ -224,7 +229,7 @@ Authorization: Bearer <your-token>
 ```json
 {
   "execution_id": "uuid",
-  "status": "execution_started"
+  "status": "queued"
 }
 ```
 
@@ -432,22 +437,24 @@ cargo build --features cloud-llm
 **环境变量：**
 - `OPENROUTER_API_KEY` — 您的 OpenRouter API 密钥（必需）
 - `OPENROUTER_MODEL` — 使用的模型（默认：`google/gemini-2.0-flash-001`）
+- `OPENROUTER_REFERER` — 可选。为 OpenRouter 请求设置 `HTTP-Referer` 头（应用归属）。若希望流量不带归属，则不设置此项。
+- `OPENROUTER_TITLE` — 可选。设置 `X-Title` 头。请参阅 [OpenRouter 应用归属](https://openrouter.ai/docs/app-attribution)。
 
 云端 LLM 提供商与推理循环的 `execute_actions()` 管线集成。它支持流式响应、指数退避自动重试和 token 使用量跟踪。
 
 #### 独立智能体模式（`standalone-agent`）
 
-将云端 LLM 推理与 Composio 工具访问结合，用于云原生智能体：
+启用云端 LLM 推理的元特性，用于云原生智能体：
 
 ```bash
 cargo build --features standalone-agent
-# 启用：cloud-llm + composio
+# 启用：cloud-llm
 ```
 
 **环境变量：**
 - `OPENROUTER_API_KEY` — OpenRouter API 密钥
-- `COMPOSIO_API_KEY` — Composio API 密钥
-- `COMPOSIO_MCP_URL` — Composio MCP 服务器 URL
+
+> **Note:** Composio MCP and SymbiBot integration were removed in this version due to security concerns — see SECURITY_AUDIT.md C3 for context.
 
 #### Cedar 策略引擎（`cedar`）
 
@@ -676,7 +683,10 @@ POST /api/v1/schedules/{id}/pause
 POST /api/v1/schedules/{id}/resume
 POST /api/v1/schedules/{id}/trigger
 Authorization: Bearer <your-token>
+Idempotency-Key: <invocation-uuid>
 ```
+
+手动触发需要管理员令牌和 `Idempotency-Key` 标头中的 UUID。返回 `queued`、已保存的结果，或明确的 `in_progress` / `unresolved` / `reconciled` / `conflict` 状态。重试时应复用同一 UUID。暂停和恢复仍使用以下响应格式；存在未解决的执行时无法恢复。参见 [cron 恢复](/cron-recovery)。
 
 **响应（200 OK）：**
 ```json
@@ -1224,33 +1234,80 @@ API 使用标准 HTTP 状态码并返回详细的错误信息：
 
 ---
 
+## CLI 子命令
+
+除了长期运行的 HTTP 接口之外，`symbi` 还提供若干仅限 CLI 的子命令用于一次性操作。完整目录见 `symbi --help`；与集成和策略执行最相关的命令如下：
+
+### `symbi schemapin`
+
+用于 MCP 服务器配置的 TOFU（首次使用即信任）完整性固定。设计用于从 SessionStart 钩子调用，以便 MCP 服务器的配置哈希在会话之间不会在运维人员未批准的情况下静默变化。
+
+```bash
+# 校验 .mcp.json 中一个或全部 MCP 服务器的已固定哈希
+symbi schemapin verify [--mcp-server <NAME>] [--config <PATH>]
+
+# 固定某个服务器当前的配置哈希
+symbi schemapin pin --mcp-server <NAME> [--config <PATH>] [--force]
+
+# 列出 ~/.symbiont/schemapin/mcp/ 下所有已固定的服务器
+symbi schemapin list
+
+# 移除某条固定记录
+symbi schemapin unpin --mcp-server <NAME>
+```
+
+固定记录以 JSON 形式存储在 `~/.symbiont/schemapin/mcp/` 下。`verify` 在匹配时以 0 退出，不匹配或缺失固定时以非零退出 —— 适合在会话前置脚本中使用。
+
+### `symbi policy`
+
+针对工具调用事件执行 Cedar 策略评估。以 JSON 形式读取单个事件，针对策略目录作出 `allow` / `deny` 决定，并以适合脚本化使用的状态码退出。
+
+```bash
+# 评估从标准输入读取的事件
+echo '{"principal":"Agent::\"dev\"", "action":"write", "resource":{...}}' \
+  | symbi policy evaluate --stdin --policies ./policies
+
+# 评估从文件读取的事件
+symbi policy evaluate --input event.json --policies ./policies
+
+# 仅输出结构化 JSON（适合程序化使用）
+symbi policy evaluate --stdin --policies ./policies --json
+```
+
+默认输出为 stdout 上的裸结论，结构化详情输出到 stderr；传入 `--json` 可将全部内容折叠到 stdout JSON。这与运行时内联使用的 Cedar 决策逻辑相同 —— 适用于在 CI 中左移策略测试，以及在运行时之外调试拒绝决定。
+
+### `symbi agents-md`
+
+从当前的 `agents/*.symbi` 文件重新生成 `AGENTS.md`（同时也会读取旧后缀 `.dsl`）。在 `symbi init` 期间会自动运行；在添加或编辑智能体定义后可手动调用。
+
+```bash
+symbi agents-md generate --dir . --output AGENTS.md
+```
+
 ## 入门指南
 
 ### 运行时 HTTP API
 
-1. 确保运行时是使用 `http-api` 特性构建的：
+1. 构建 `symbi` 二进制（`http-api` 特性在二进制 crate 中默认开启）：
    ```bash
-   cargo build --features http-api
+   cargo build --release
    ```
 
-2. 设置智能体端点的认证令牌：
+2. 启动运行时 —— API 监听在 `:8080`，HTTP Input 监听在 `:8081`：
    ```bash
-   export API_AUTH_TOKEN="<your-token>"
+   ./target/release/symbi up --http-bind 0.0.0.0
    ```
 
-3. 启动运行时服务器：
-   ```bash
-   ./target/debug/symbiont-runtime --http-api
-   ```
+   如需一个已搭好的项目以及推荐的 Docker 流程，请参阅 [入门指南](/getting-started)。
 
-4. 验证服务器正在运行：
+3. 验证服务器正在运行：
    ```bash
    curl http://127.0.0.1:8080/api/v1/health
    ```
 
-5. 测试已认证的智能体端点：
+4. 测试一个已认证的端点 —— `symbi up` 会在启动时打印出生成的 Bearer 令牌（也可以通过 `--http.token` 显式指定一个）：
    ```bash
-   curl -H "Authorization: Bearer $API_AUTH_TOKEN" \
+   curl -H "Authorization: Bearer $SYMBI_HTTP_TOKEN" \
         http://127.0.0.1:8080/api/v1/agents
    ```
 
@@ -1267,3 +1324,8 @@ API 使用标准 HTTP 状态码并返回详细的错误信息：
 - 查看[运行时架构文档](runtime-architecture.md)
 - 查看[安全模型文档](security-model.md)
 - 在项目的 GitHub 仓库中提交问题
+
+已核销（reconciled）的调用会返回 HTTP 409 及其单独签名的运维 `resolution`；它
+绝不会返回伪造的运行时完成结果。cron 历史会保留 `Reconciled` 状态、原始错误和
+审计记录，以及该 resolution 对象。在显式恢复之前，该作业将保持暂停。参见
+[运维核销](/invocation-reconciliation)。

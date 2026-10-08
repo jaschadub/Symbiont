@@ -22,7 +22,7 @@ http://127.0.0.1:8080/api/v1
 
 ### Autenticacion
 
-Los endpoints de gestion de agentes requieren autenticacion con token Bearer. Configure la variable de entorno `API_AUTH_TOKEN` e incluya el token en el encabezado Authorization:
+Las rutas del runtime, salvo las comprobaciones de salud, requieren autenticación Bearer. Configure un archivo privado de claves API o el token de operador heredado `SYMBIONT_API_TOKEN`.
 
 ```
 Authorization: Bearer <your-token>
@@ -30,7 +30,7 @@ Authorization: Bearer <your-token>
 
 **Endpoints Protegidos:**
 - Todos los endpoints `/api/v1/agents/*` requieren autenticacion
-- Los endpoints `/api/v1/health`, `/api/v1/workflows/execute` y `/api/v1/metrics` no requieren autenticacion
+- Solo las comprobaciones de salud son públicas. Los flujos de trabajo y las métricas requieren permisos de administrador.
 
 ### Endpoints Disponibles
 
@@ -67,21 +67,25 @@ Devuelve el estado actual de salud del sistema e informacion basica del runtime.
 POST /api/v1/workflows/execute
 ```
 
-Ejecuta un flujo de trabajo con parametros especificados.
+Un administrador envía código DSL en `workflow_id`; `parameters` es la entrada de la ejecución. `agent_id` permite crear o reemplazar un registro; si se omite, se asigna uno nuevo. Las claves limitadas a un agente reciben `403 ADMIN_REQUIRED` y pueden ejecutar su código registrado mediante `/agents/{id}/execute`. `queued` confirma la admisión; consulte `/agents/{id}/history` por `execution_id` para ver el resultado. Véase el [contrato completo](../../crates/runtime/API_REFERENCE.md#execute-workflow).
 
 **Cuerpo de Solicitud:**
 ```json
 {
-  "workflow_id": "string",
+  "workflow_id": "agent report() { with sandbox = \"docker\" {} }",
   "parameters": {},
-  "agent_id": "optional-agent-id"
+  "agent_id": null
 }
 ```
 
 **Respuesta (200 OK):**
 ```json
 {
-  "result": "workflow execution result"
+  "status": "queued",
+  "workflow_id": "agent report() { with sandbox = \"docker\" {} }",
+  "agent_id": "19b183f7-97c4-4e42-9c62-5e9c940bfae3",
+  "execution_id": "c7022f13-7140-4a09-8e30-b1941e0cbb32",
+  "metadata": {}
 }
 ```
 
@@ -112,28 +116,31 @@ GET /api/v1/agents/{id}/status
 Authorization: Bearer <your-token>
 ```
 
-Obtiene informacion detallada del estado para un agente especifico incluyendo metricas de ejecucion en tiempo real.
+Obtiene el estado del planificador para un agente especifico. La CPU y la memoria
+admiten valores nulos; el planificador actual no muestrea por agente y devuelve
+`null` tanto para agentes internos como externos. Los clientes no deben presentar
+esos valores como un uso de cero.
 
 **Respuesta (200 OK):**
 ```json
 {
   "agent_id": "uuid",
-  "state": "running|ready|waiting|failed|completed|terminated",
+  "state": "Running",
   "last_activity": "2024-01-15T10:30:00Z",
-  "scheduled_at": "2024-01-15T10:00:00Z",
   "resource_usage": {
-    "memory_usage": 268435456,
-    "cpu_usage": 15.5,
+    "memory_bytes": null,
+    "cpu_percent": null,
     "active_tasks": 1
   },
-  "execution_context": {
-    "execution_mode": "ephemeral|persistent|scheduled|event_driven",
-    "process_id": 12345,
-    "uptime": "00:15:30",
-    "health_status": "healthy|unhealthy"
-  }
+  "execution_mode": "Ephemeral"
 }
 ```
+
+`active_tasks` cuenta las tareas que pertenecen al planificador. `last_activity`
+no es la marca de tiempo de una muestra de recursos. Fleet Overview muestra **Not
+sampled** cuando faltan la CPU y la memoria; [Capacidad de los workers](/worker-capacity)
+proporciona el uso de los workers y la capacidad reservada, muestreados por
+separado. Esos valores de los workers no son totales por agente.
 
 **Nuevos Estados del Agente:**
 - `running`: El agente esta ejecutando activamente con un proceso en ejecucion
@@ -210,10 +217,14 @@ Elimina un agente existente del runtime.
 ##### Ejecutar Agente
 ```http
 POST /api/v1/agents/{id}/execute
+Idempotency-Key: <UUID retained for retries>
 Authorization: Bearer <your-token>
 ```
 
-Activa la ejecucion de un agente especifico.
+Envia una invocacion del agente seleccionado. Reutiliza el mismo UUID y la misma
+peticion para recuperar una finalizacion guardada o un resultado explicito de tipo
+activo / sin resolver / reconciliado / en conflicto. Consulte los
+[estados de reintento del planificador](/scheduler-idempotency).
 
 **Cuerpo de Solicitud:**
 ```json
@@ -224,7 +235,7 @@ Activa la ejecucion de un agente especifico.
 ```json
 {
   "execution_id": "uuid",
-  "status": "execution_started"
+  "status": "queued"
 }
 ```
 
@@ -432,22 +443,24 @@ cargo build --features cloud-llm
 **Variables de Entorno:**
 - `OPENROUTER_API_KEY` — Tu clave de API de OpenRouter (requerida)
 - `OPENROUTER_MODEL` — Modelo a usar (por defecto: `google/gemini-2.0-flash-001`)
+- `OPENROUTER_REFERER` — Opcional. Establece la cabecera `HTTP-Referer` en las solicitudes a OpenRouter (atribucion de aplicacion). Dejala sin definir para trafico no atribuido.
+- `OPENROUTER_TITLE` — Opcional. Establece la cabecera `X-Title`. Consulta [atribucion de aplicaciones en OpenRouter](https://openrouter.ai/docs/app-attribution).
 
 El proveedor de LLM en la nube se integra con el pipeline `execute_actions()` del bucle de razonamiento. Soporta respuestas en streaming, reintentos automaticos con retroceso exponencial y seguimiento de uso de tokens.
 
 #### Modo Agente Autonomo (`standalone-agent`)
 
-Combina inferencia LLM en la nube con acceso a herramientas Composio para agentes nativos de la nube:
+Meta-feature que habilita la inferencia LLM en la nube para agentes nativos de la nube:
 
 ```bash
 cargo build --features standalone-agent
-# Enables: cloud-llm + composio
+# Enables: cloud-llm
 ```
 
 **Variables de Entorno:**
 - `OPENROUTER_API_KEY` — Clave de API de OpenRouter
-- `COMPOSIO_API_KEY` — Clave de API de Composio
-- `COMPOSIO_MCP_URL` — URL del servidor MCP de Composio
+
+> **Note:** Composio MCP and SymbiBot integration were removed in this version due to security concerns — see SECURITY_AUDIT.md C3 for context.
 
 #### Motor de Politicas Cedar (`cedar`)
 
@@ -676,7 +689,10 @@ POST /api/v1/schedules/{id}/pause
 POST /api/v1/schedules/{id}/resume
 POST /api/v1/schedules/{id}/trigger
 Authorization: Bearer <your-token>
+Idempotency-Key: <invocation-uuid>
 ```
+
+La activacion manual requiere un token administrativo y un UUID en `Idempotency-Key`. Devuelve `queued`, un resultado guardado o un estado explicito `in_progress` / `unresolved` / `reconciled` / `conflict`. Reutilice el UUID al reintentar. Pausar y reanudar conservan la respuesta siguiente; una ejecucion no resuelta impide reanudar. Consulte la [recuperacion de cron](/cron-recovery).
 
 **Respuesta (200 OK):**
 ```json
@@ -1224,33 +1240,80 @@ La API utiliza codigos de estado HTTP estandar y devuelve informacion detallada 
 
 ---
 
+## Subcomandos de CLI
+
+Mas alla de la superficie HTTP de larga duracion, `symbi` expone varios subcomandos exclusivos de CLI para operaciones puntuales. El catalogo completo esta en `symbi --help`; los mas relevantes para la integracion y la aplicacion de politicas son:
+
+### `symbi schemapin`
+
+Fijacion de integridad TOFU (Trust-On-First-Use) para configuraciones de servidores MCP. Esta diseñado para invocarse desde hooks SessionStart de modo que el hash de configuracion de un servidor MCP no pueda cambiar silenciosamente entre sesiones sin que el operador lo apruebe.
+
+```bash
+# Verificar el hash fijado para uno o todos los servidores MCP en .mcp.json
+symbi schemapin verify [--mcp-server <NAME>] [--config <PATH>]
+
+# Fijar el hash de configuracion actual para un servidor
+symbi schemapin pin --mcp-server <NAME> [--config <PATH>] [--force]
+
+# Listar cada servidor fijado bajo ~/.symbiont/schemapin/mcp/
+symbi schemapin list
+
+# Eliminar un registro de fijacion
+symbi schemapin unpin --mcp-server <NAME>
+```
+
+Las fijaciones se almacenan bajo `~/.symbiont/schemapin/mcp/` como registros JSON. `verify` sale con 0 si coincide, distinto de cero si no coincide o falta la fijacion — adecuado para usarse en scripts previos a la sesion.
+
+### `symbi policy`
+
+Evaluacion de politicas Cedar contra eventos de llamada a herramientas. Lee un solo evento como JSON, decide `allow` / `deny` contra un directorio de politicas y sale con un codigo de estado adecuado para scripting.
+
+```bash
+# Evaluar un evento leido desde stdin
+echo '{"principal":"Agent::\"dev\"", "action":"write", "resource":{...}}' \
+  | symbi policy evaluate --stdin --policies ./policies
+
+# Evaluar un evento leido desde un archivo
+symbi policy evaluate --input event.json --policies ./policies
+
+# Emitir solo JSON estructurado (adecuado para uso programatico)
+symbi policy evaluate --stdin --policies ./policies --json
+```
+
+La salida predeterminada es el veredicto escueto en stdout con detalle estructurado en stderr; pase `--json` para colapsar todo a JSON en stdout. Esta es la misma logica de decision Cedar que el runtime usa en linea — util para pruebas de politicas en CI (shift-left) y para depurar denegaciones fuera de un runtime en ejecucion.
+
+### `symbi agents-md`
+
+Regenera `AGENTS.md` a partir de los archivos `agents/*.symbi` actuales (los `.dsl` heredados tambien se reconocen). Se ejecuta automaticamente durante `symbi init`; invoquelo manualmente despues de agregar o editar definiciones de agentes.
+
+```bash
+symbi agents-md generate --dir . --output AGENTS.md
+```
+
 ## Primeros Pasos
 
 ### API HTTP del Runtime
 
-1. Asegurate de que el runtime este construido con la caracteristica `http-api`:
+1. Compila el binario `symbi` (la feature `http-api` esta activa por defecto en el crate del binario):
    ```bash
-   cargo build --features http-api
+   cargo build --release
    ```
 
-2. Configura el token de autenticacion para endpoints de agentes:
+2. Inicia el runtime — la API escucha en `:8080` y HTTP Input en `:8081`:
    ```bash
-   export API_AUTH_TOKEN="<your-token>"
+   ./target/release/symbi up --http-bind 0.0.0.0
    ```
 
-3. Inicia el servidor del runtime:
-   ```bash
-   ./target/debug/symbiont-runtime --http-api
-   ```
+   Para un proyecto con esqueleto generado y el flujo Docker recomendado, consulta [Primeros Pasos](/getting-started).
 
-4. Verifica que el servidor este ejecutandose:
+3. Verifica que el servidor este ejecutandose:
    ```bash
    curl http://127.0.0.1:8080/api/v1/health
    ```
 
-5. Prueba un endpoint autenticado de agentes:
+4. Prueba un endpoint autenticado — `symbi up` imprime el bearer token generado al iniciar (o configura uno explicitamente con `--http.token`):
    ```bash
-   curl -H "Authorization: Bearer $API_AUTH_TOKEN" \
+   curl -H "Authorization: Bearer $SYMBI_HTTP_TOKEN" \
         http://127.0.0.1:8080/api/v1/agents
    ```
 
@@ -1267,3 +1330,9 @@ Para soporte de API y preguntas:
 - Revisa la [documentacion de Arquitectura del Runtime](runtime-architecture.md)
 - Consulta la [documentacion del Modelo de Seguridad](security-model.md)
 - Presenta issues en el repositorio GitHub del proyecto
+
+Una invocacion reconciliada devuelve HTTP 409 y su `resolution` de operador firmada
+por separado; nunca devuelve una finalizacion de runtime fabricada. El historial de
+cron conserva el estado `Reconciled`, el error y la auditoria originales y el objeto
+de resolucion. El trabajo permanece pausado hasta que se reanude explicitamente.
+Consulte la [reconciliacion por el operador](/invocation-reconciliation).
